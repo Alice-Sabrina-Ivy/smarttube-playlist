@@ -1,0 +1,25 @@
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+.env
+data/
+*.pem
+config.json
+lounge.json
+tools/
+_keytest/
+.claude/
+CLAUDE.md
+tests/
+pytest.ini
+requirements-dev.txt
+.DS_Store
+.pytest_cache/
+htmlcov/
+.coverage
+
+# Editor / IDE
+.vscode/
+.idea/

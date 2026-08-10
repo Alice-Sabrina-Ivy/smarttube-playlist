@@ -1,0 +1,86 @@
+services:
+  smarttube-playlist:
+    # Prebuilt multi-arch image (linux/amd64 + linux/arm64).
+    # The path is lowercase because GHCR rejects uppercase image names, even
+    # though the GitHub account itself is Alice-Sabrina-Ivy.
+    image: ghcr.io/alice-sabrina-ivy/smarttube-playlist:latest
+
+    # Building from source instead? Comment out `image:` above, uncomment
+    # `build: .` below, and run `docker compose up -d --build` from the repo
+    # root. See "Build from source" in the README.
+    # build: .
+
+    container_name: smarttube-playlist
+    restart: unless-stopped
+
+    ports:
+      # host:container. Change only the left number if 38420 is taken.
+      #
+      # This binds to every interface (0.0.0.0). That is what makes the page
+      # reachable from phones on your LAN — and it is fine on a home network.
+      # But the service has NO authentication by design, so if this host has
+      # any interface reachable from the internet, pin the bind to your LAN
+      # address instead, e.g.:
+      #   - "192.168.1.50:38420:8000"
+      - "38420:8000"
+
+    volumes:
+      # Pairing certificate, TV address, and Lounge token persist here.
+      # Relative to this file, so `./data` is created next to docker-compose.yml.
+      # Back this up and you never have to re-pair.
+      - ./data:/data
+
+    environment:
+      # ---------------------------------------------------------------
+      # All optional. Defaults suit most setups.
+      # ---------------------------------------------------------------
+
+      # CLIENT_NAME: "SmartTube Playlist"            # name shown on the TV during pairing
+      # SMARTTUBE_PACKAGE: "org.smarttube.stable"    # use org.smarttube.beta for the beta build
+      # LOG_LEVEL: "INFO"                            # DEBUG when diagnosing a problem
+      # RATE_LIMIT_SECONDS: "10"                     # per-IP cool-down between queue submissions
+
+      # --- Waking a sleeping TV ---
+      # WAKE_DELAY: "15.0"                           # minimum seconds to wait after POWER before
+      #                                              # sending launch intents. Instant-on TVs report
+      #                                              # "on" within ~1s while the OS is still booting,
+      #                                              # so this is a floor, not a timeout. Raise it if
+      #                                              # the TV wakes but the video doesn't start.
+      # WAKE_TIMEOUT: "30.0"                         # give up waiting for the TV to report on
+      # WAKE_POLL: "0.5"                             # how often to re-check while waking
+
+      # --- Screensaver handling ---
+      # SCREENSAVER_PACKAGES: "com.google.android.apps.tv.dreamx,com.google.android.backdrop"
+      #                                              # comma-list of packages treated as screensavers.
+      #                                              # When one is foreground at add time, we send
+      #                                              # SCREENSAVER_DISMISS_KEY to dismiss it (the
+      #                                              # screensaver silently drops launch intents).
+      # SCREENSAVER_DISMISS_KEY: "HOME"              # keycode that dismisses the screensaver.
+      #                                              # HOME is most reliable; BACK also works.
+      #                                              # DPAD_CENTER and WAKEUP are NOT supported —
+      #                                              # they work via ADB but get silently dropped
+      #                                              # by the Android TV Remote protocol layer.
+
+      # --- What the TV shows when the queue runs dry ---
+      # IDLE_KEYCODE: "HOME,BACK"                    # comma-list, sent when /api/skip empties
+      #                                              # the queue. Default mirrors the physical
+      #                                              # remote's HOME-then-BACK to land on the
+      #                                              # Google TV ambient/wallpaper screensaver.
+      #                                              # Single-key alternatives (most TVs filter
+      #                                              # power/sleep keys from the remote protocol):
+      #                                              #   "POWER" → display fully off (toggles)
+      #                                              #   "HOME"  → just the launcher
+      #                                              #   ""      → disabled
+      # IDLE_KEYCODE_DELAY: "0.6"                    # seconds between keys in the IDLE_KEYCODE
+      #                                              # sequence — TV needs time to react to HOME
+      #                                              # before BACK lands on the screensaver.
+
+      # --- Metadata scraping ---
+      # DEFAULT_DURATION_S: "600"                    # assumed length when the scrape fails
+      # METADATA_TIMEOUT_S: "5.0"                    # YouTube watch-page fetch timeout
+
+      # --- Optional volume control via a Denon/Marantz AVR ---
+      # Google TV devices don't expose usable volume over the remote protocol
+      # (the physical remote's volume rides HDMI-CEC straight to the amp), so
+      # point this at your receiver's LAN IP to get volume buttons in the UI.
+      # DENON_HOST: "192.168.1.60"

@@ -1,0 +1,1511 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>SmartTube Playlist</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@300;400;500;600&family=VT323&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --bg-0: #0a0806;
+    --bg-1: #15110c;
+    --phos: #ffb300;
+    --phos-dim: #b87a00;
+    --phos-bright: #ffd54a;
+    --warn: #ff5c3a;
+    --ok: #6cd64a;
+    --ink: #1a1410;
+    --grid: rgba(255, 179, 0, 0.06);
+  }
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0; padding: 0; min-height: 100%;
+    background: var(--bg-0);
+    color: var(--phos);
+    font-family: "IBM Plex Mono", "Courier New", monospace;
+    font-weight: 400;
+    overflow-x: hidden;
+  }
+  /* CRT scanlines + vignette */
+  body::before {
+    content: ""; position: fixed; inset: 0; pointer-events: none; z-index: 100;
+    background:
+      repeating-linear-gradient(
+        to bottom,
+        rgba(0,0,0,0) 0px,
+        rgba(0,0,0,0) 2px,
+        rgba(0,0,0,0.18) 3px,
+        rgba(0,0,0,0) 4px
+      );
+    mix-blend-mode: multiply;
+  }
+  body::after {
+    content: ""; position: fixed; inset: 0; pointer-events: none; z-index: 99;
+    background: radial-gradient(ellipse at center,
+      transparent 40%,
+      rgba(0,0,0,0.55) 100%);
+  }
+
+  .frame {
+    /* Always fills ~95% of the viewport on phones / misreported "desktop-mode"
+       phones, capped at 720px so a real desktop monitor doesn't render
+       absurdly wide line lengths. */
+    width: min(95vw, 720px);
+    margin: 0 auto;
+    padding: clamp(0.75rem, 3vw, 2rem) clamp(0.5rem, 2vw, 1.25rem) 4rem;
+    position: relative;
+    z-index: 1;
+  }
+
+  header {
+    border: 1px solid var(--phos-dim);
+    padding: 0.6rem 0.85rem;
+    margin-bottom: 1.5rem;
+    position: relative;
+    background: linear-gradient(180deg, rgba(255,179,0,0.04), rgba(0,0,0,0));
+  }
+  header::before {
+    content: "";
+    position: absolute;
+    top: -1px; left: -1px; right: -1px;
+    height: 4px;
+    background: var(--phos);
+    box-shadow: 0 0 12px var(--phos);
+  }
+  .brand {
+    font-family: "VT323", monospace;
+    font-size: clamp(1.6rem, 6vw, 2.4rem);
+    line-height: 1;
+    letter-spacing: 0.04em;
+    color: var(--phos-bright);
+    text-shadow: 0 0 8px rgba(255, 213, 74, 0.55);
+    margin: 0;
+  }
+  .tag {
+    font-size: 0.72rem;
+    color: var(--phos-dim);
+    letter-spacing: 0.18em;
+    text-transform: uppercase;
+    margin-top: 0.1rem;
+  }
+  .pulse {
+    display: inline-block;
+    width: 0.55rem; height: 0.55rem;
+    background: var(--phos);
+    border-radius: 50%;
+    margin-right: 0.45rem;
+    box-shadow: 0 0 8px var(--phos);
+    animation: blink 1.6s ease-in-out infinite;
+    vertical-align: middle;
+  }
+  .pulse.off { background: var(--phos-dim); box-shadow: none; animation: none; }
+  .pulse.warn { background: var(--warn); box-shadow: 0 0 8px var(--warn); }
+  @keyframes blink { 0%, 100% { opacity: 1; } 50% { opacity: 0.35; } }
+
+  .card {
+    border: 1px solid var(--phos-dim);
+    padding: clamp(0.85rem, 3vw, 1.25rem);
+    margin-bottom: clamp(0.85rem, 2.5vw, 1.25rem);
+    background:
+      linear-gradient(180deg, rgba(255,179,0,0.025), rgba(0,0,0,0)),
+      repeating-linear-gradient(0deg, var(--grid) 0 1px, transparent 1px 24px),
+      repeating-linear-gradient(90deg, var(--grid) 0 1px, transparent 1px 24px);
+    position: relative;
+  }
+  .card-title {
+    font-family: "VT323", monospace;
+    font-size: clamp(1.2rem, 4.5vw, 1.6rem);
+    margin: 0 0 0.25rem;
+    color: var(--phos-bright);
+  }
+  .card-sub {
+    font-size: 0.78rem;
+    color: var(--phos-dim);
+    margin: 0 0 1rem;
+    letter-spacing: 0.05em;
+  }
+
+  label {
+    display: block;
+    font-size: 0.7rem;
+    letter-spacing: 0.18em;
+    text-transform: uppercase;
+    color: var(--phos-dim);
+    margin: 0.85rem 0 0.35rem;
+  }
+  input[type="text"], input[type="url"] {
+    width: 100%;
+    background: var(--ink);
+    border: 1px solid var(--phos-dim);
+    color: var(--phos-bright);
+    font-family: "IBM Plex Mono", monospace;
+    font-size: 16px; /* >=16px so iOS Safari doesn't auto-zoom on focus */
+    padding: 0.75rem 0.85rem;
+    outline: none;
+    border-radius: 0;
+    caret-color: var(--phos);
+    transition: border-color 120ms ease, box-shadow 120ms ease;
+  }
+  input[type="text"]:focus, input[type="url"]:focus {
+    border-color: var(--phos);
+    box-shadow: 0 0 0 1px var(--phos), 0 0 12px rgba(255,179,0,0.25);
+  }
+  input::placeholder { color: rgba(184, 122, 0, 0.55); }
+
+  button {
+    width: 100%;
+    margin-top: 1rem;
+    padding: clamp(0.85rem, 3vw, 1rem) 1rem;
+    background: var(--phos);
+    color: var(--ink);
+    border: 0;
+    font-family: "VT323", monospace;
+    font-size: clamp(1.25rem, 4.5vw, 1.55rem);
+    letter-spacing: 0.08em;
+    cursor: pointer;
+    text-transform: uppercase;
+    position: relative;
+    transition: transform 60ms ease, box-shadow 120ms ease, background 120ms ease;
+    box-shadow: 0 0 0 0 var(--phos);
+    min-height: 44px;
+  }
+  button:hover:not(:disabled) {
+    background: var(--phos-bright);
+    box-shadow: 0 0 18px rgba(255, 179, 0, 0.5);
+  }
+  button:active:not(:disabled) { transform: translateY(1px); }
+  button:disabled {
+    background: var(--phos-dim);
+    color: rgba(0,0,0,0.6);
+    cursor: not-allowed;
+    opacity: 0.6;
+  }
+  button.secondary {
+    background: transparent;
+    color: var(--phos-dim);
+    border: 1px solid var(--phos-dim);
+    font-size: 0.85rem;
+    font-family: "IBM Plex Mono", monospace;
+    letter-spacing: 0.16em;
+    text-transform: uppercase;
+    padding: 0.6rem 1rem;
+    margin-top: 0.5rem;
+  }
+  button.secondary:hover:not(:disabled) {
+    color: var(--phos);
+    border-color: var(--phos);
+    background: rgba(255, 179, 0, 0.05);
+    box-shadow: none;
+  }
+
+  .toast {
+    margin-top: 1rem;
+    padding: 0.75rem 0.9rem;
+    border-left: 3px solid var(--phos-dim);
+    background: rgba(255, 179, 0, 0.04);
+    font-size: 0.85rem;
+    color: var(--phos);
+    display: none;
+    animation: slidein 200ms ease;
+  }
+  .toast.ok    { border-color: var(--ok);   color: var(--ok); background: rgba(108, 214, 74, 0.06); }
+  .toast.err   { border-color: var(--warn); color: var(--warn); background: rgba(255, 92, 58, 0.06); }
+  .toast.show  { display: block; }
+  @keyframes slidein { from { opacity: 0; transform: translateY(-4px); } to { opacity: 1; transform: translateY(0); } }
+
+  .code-input {
+    text-align: center;
+    font-size: 1.6rem;
+    letter-spacing: 0.4em;
+    font-family: "VT323", monospace;
+    text-transform: uppercase;
+  }
+
+  .meta {
+    display: grid; grid-template-columns: 1fr 1fr; gap: 0.4rem 1rem;
+    font-size: 0.78rem; margin-top: 0.5rem;
+  }
+  .meta dt { color: var(--phos-dim); letter-spacing: 0.12em; text-transform: uppercase; }
+  .meta dd { margin: 0; color: var(--phos-bright); word-break: break-all; }
+
+  [hidden] { display: none !important; }
+
+  footer {
+    text-align: center;
+    margin-top: 2rem;
+    font-size: 0.7rem;
+    color: var(--phos-dim);
+    letter-spacing: 0.18em;
+    text-transform: uppercase;
+  }
+  /* Tighter font + tracking on narrow phones so the footer fits on one line. */
+  @media (max-width: 520px) {
+    footer {
+      font-size: 0.6rem;
+      letter-spacing: 0.06em;
+    }
+  }
+  footer a {
+    color: var(--phos-dim);
+    text-decoration: none;
+    border-bottom: 1px dotted var(--phos-dim);
+    transition: color 120ms ease, border-color 120ms ease, text-shadow 120ms ease;
+  }
+  footer a:hover {
+    color: var(--phos-bright);
+    border-bottom-color: var(--phos);
+    text-shadow: 0 0 6px rgba(255, 213, 74, 0.45);
+  }
+
+  .frame > * { animation: boot 240ms ease both; }
+  .frame > *:nth-child(2) { animation-delay: 80ms; }
+  .frame > *:nth-child(3) { animation-delay: 160ms; }
+  @keyframes boot {
+    from { opacity: 0; transform: translateY(6px) scaleY(0.98); }
+    to   { opacity: 1; transform: translateY(0) scaleY(1); }
+  }
+
+  /* ── queue UI ───────────────────────────────────────────────────────── */
+
+  .now-playing {
+    display: grid;
+    grid-template-columns: clamp(120px, 35vw, 160px) 1fr;
+    gap: clamp(0.6rem, 2.5vw, 0.85rem);
+    align-items: start;
+  }
+  .now-playing .thumb {
+    width: 100%;
+    aspect-ratio: 16 / 9;
+    background: var(--ink);
+    border: 1px solid var(--phos-dim);
+    overflow: hidden;
+    position: relative;
+    /* Placeholder when no image src: centered ▶ glyph in dim phosphor */
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-family: "VT323", monospace;
+    font-size: clamp(1.6rem, 7vw, 2.4rem);
+    color: var(--phos-dim);
+  }
+  .now-playing .thumb::before {
+    content: "▶";
+    opacity: 0.6;
+  }
+  .now-playing .thumb img {
+    width: 100%; height: 100%; object-fit: cover; display: block;
+    position: absolute; top: 0; left: 0;
+    background: var(--ink);  /* covers the ▶ placeholder */
+  }
+  .now-playing .thumb::after {
+    /* scanline overlay to fit theme */
+    content: ""; position: absolute; inset: 0; pointer-events: none;
+    background: repeating-linear-gradient(to bottom,
+      rgba(0,0,0,0) 0 1px, rgba(0,0,0,0.22) 1px 2px);
+    mix-blend-mode: multiply;
+  }
+  .now-playing .body { min-width: 0; }
+  .now-playing .np-title {
+    font-family: "VT323", monospace;
+    font-size: 1.3rem;
+    color: var(--phos-bright);
+    line-height: 1.1;
+    margin: 0 0 0.2rem;
+    overflow: hidden;
+    display: -webkit-box;
+    -webkit-line-clamp: 2;
+    -webkit-box-orient: vertical;
+    word-break: break-word;
+  }
+  .now-playing .np-channel {
+    font-size: 0.78rem;
+    color: var(--phos-dim);
+    letter-spacing: 0.05em;
+    margin-bottom: 0.45rem;
+  }
+  .progress {
+    width: 100%; height: 8px;
+    background: var(--ink);
+    border: 1px solid var(--phos-dim);
+    position: relative;
+    overflow: hidden;
+  }
+  .progress .bar {
+    position: absolute; top: 0; left: 0; bottom: 0;
+    background: var(--phos);
+    box-shadow: 0 0 8px var(--phos), 0 0 16px rgba(255,179,0,0.4);
+    width: 0%;
+    transition: width 500ms linear;
+  }
+  .progress.live .bar {
+    width: 100%;
+    background: var(--warn);
+    box-shadow: 0 0 8px var(--warn);
+    animation: livepulse 1.6s ease-in-out infinite;
+  }
+  @keyframes livepulse { 0%, 100% { opacity: 0.85; } 50% { opacity: 0.45; } }
+  .progress-meta {
+    display: flex; justify-content: space-between;
+    font-size: 0.7rem; color: var(--phos-dim);
+    letter-spacing: 0.1em; margin-top: 0.3rem;
+  }
+  .live-badge {
+    color: var(--warn);
+    border: 1px solid var(--warn);
+    padding: 0.05rem 0.4rem;
+    font-size: 0.65rem;
+    letter-spacing: 0.18em;
+  }
+  .waking-badge {
+    color: var(--phos-bright);
+    border: 1px solid var(--phos-dim);
+    padding: 0.05rem 0.4rem;
+    font-size: 0.65rem;
+    letter-spacing: 0.18em;
+    animation: blink 1.6s ease-in-out infinite;
+  }
+  .progress.waking .bar {
+    width: 0%;
+    background: var(--phos-dim);
+  }
+
+  .controls {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 0.4rem;
+    margin-top: 1rem;
+  }
+  /* Stack 2x2 on narrow phones so each button stays tappable */
+  @media (max-width: 480px) {
+    .controls { grid-template-columns: 1fr 1fr; }
+  }
+  .controls button {
+    margin-top: 0;
+    padding: 0.65rem 0.4rem;
+    font-size: clamp(0.95rem, 3.5vw, 1.1rem);
+    min-height: 44px;
+  }
+  .controls button.muted {
+    background: transparent;
+    color: var(--phos);
+    border: 1px solid var(--phos-dim);
+  }
+  .controls button.muted:hover:not(:disabled) {
+    border-color: var(--phos);
+    background: rgba(255, 179, 0, 0.05);
+    box-shadow: 0 0 8px rgba(255, 179, 0, 0.25);
+  }
+  .controls button.muted:disabled {
+    background: transparent;
+    color: var(--phos-dim);
+    opacity: 0.4;
+    border-color: rgba(184, 122, 0, 0.3);
+  }
+
+  .empty {
+    color: var(--phos-dim);
+    font-size: 0.85rem;
+    text-align: center;
+    padding: 1.2rem 0.5rem;
+    letter-spacing: 0.05em;
+  }
+
+  /* ── modal (seek dialog) ──────────────────────────────────────── */
+  .modal-backdrop {
+    position: fixed;
+    inset: 0;
+    background: rgba(0, 0, 0, 0.88);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    z-index: 100;
+    padding: 1rem;
+  }
+  .modal {
+    /* Solid panel background (var(--bg) was a typo — only --bg-0/--bg-1
+       are defined, so the popup was rendering transparent). */
+    background: var(--bg-1);
+    border: 1px solid var(--phos-bright);
+    padding: clamp(1.1rem, 3vw, 1.6rem);
+    width: 100%;
+    max-width: 30rem;
+    box-shadow: 0 0 24px rgba(255, 179, 0, 0.3);
+    position: relative;
+  }
+  .modal .seek-current {
+    color: var(--phos);
+    font-family: "VT323", monospace;
+    font-size: 1.4rem;
+    letter-spacing: 0.06em;
+    margin: 0.4rem 0 1.1rem;
+    text-align: center;
+  }
+  /* Seek input row: input grows, Go button stays its content width. The
+     global `button { width: 100% }` rule would otherwise let Go consume
+     the entire flex line and squish the input to a sliver. */
+  .modal .seek-input-row {
+    display: grid;
+    grid-template-columns: 1fr auto;
+    gap: 0.5rem;
+    align-items: stretch;
+    margin-top: 0.4rem;
+  }
+  .modal .seek-input-row input {
+    margin: 0;
+    /* override the global input width: 100% which causes overflow inside the grid */
+    min-width: 0;
+  }
+  .modal .seek-input-row button {
+    width: auto;
+    margin: 0;
+    padding: 0.7rem 1.4rem;
+    white-space: nowrap;
+  }
+  /* Override the global `.controls` 4-column grid for the relative
+     seek buttons — they should fill the row evenly. */
+  .modal .controls {
+    margin-top: 0.6rem;
+    gap: 0.5rem;
+  }
+  .modal .seek-quick button { white-space: nowrap; }
+  .modal .seek-close-row {
+    display: flex;
+    justify-content: flex-end;
+    margin-top: 1.2rem;
+  }
+  .modal .seek-close-row button {
+    width: auto;
+    margin: 0;
+    padding: 0.6rem 1.6rem;
+  }
+  .modal label {
+    display: block;
+    margin-top: 1rem;
+    font-size: 0.8rem;
+    letter-spacing: 0.08em;
+    color: var(--phos);
+  }
+
+  .qlist { list-style: none; padding: 0; margin: 0; }
+  .qitem {
+    display: grid;
+    grid-template-columns: 80px 1fr auto;
+    gap: 0.7rem;
+    padding: 0.6rem 0;
+    border-bottom: 1px dashed rgba(184, 122, 0, 0.3);
+    align-items: center;
+  }
+  .qitem:last-child { border-bottom: 0; }
+  .qitem .thumb {
+    width: 80px; height: 45px;
+    background: var(--ink);
+    border: 1px solid var(--phos-dim);
+    overflow: hidden;
+    position: relative;
+  }
+  .qitem .thumb img { width: 100%; height: 100%; object-fit: cover; display: block; }
+  .qitem .thumb::after {
+    content: ""; position: absolute; inset: 0; pointer-events: none;
+    background: repeating-linear-gradient(to bottom,
+      rgba(0,0,0,0) 0 1px, rgba(0,0,0,0.22) 1px 2px);
+    mix-blend-mode: multiply;
+  }
+  .qitem .qbody { min-width: 0; }
+  .qitem .qtitle {
+    font-size: 0.9rem; color: var(--phos-bright);
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .qitem .qsub {
+    font-size: 0.72rem; color: var(--phos-dim);
+    letter-spacing: 0.04em; margin-top: 0.1rem;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .qitem .qdur {
+    font-size: 0.72rem; color: var(--phos-dim);
+    margin-right: 0.25rem;
+    font-variant-numeric: tabular-nums;
+  }
+  .qitem .qrm {
+    width: auto;
+    margin: 0;
+    padding: 0.5rem 0.7rem;
+    background: transparent;
+    color: var(--phos-dim);
+    border: 1px solid var(--phos-dim);
+    font-family: "IBM Plex Mono", monospace;
+    font-size: 0.95rem;
+    letter-spacing: 0;
+    min-width: 36px;
+    min-height: 36px;
+  }
+  .qitem .qrm:hover {
+    color: var(--warn); border-color: var(--warn);
+    background: rgba(255, 92, 58, 0.06);
+    box-shadow: none;
+  }
+
+  .qhead {
+    display: flex; justify-content: space-between; align-items: baseline;
+    margin: 0 0 0.5rem;
+  }
+  .qcount {
+    font-size: 0.7rem; color: var(--phos-dim);
+    letter-spacing: 0.18em; text-transform: uppercase;
+  }
+</style>
+</head>
+<body>
+<div class="frame">
+
+  <header>
+    <h1 class="brand">▶ SmartTube Playlist</h1>
+    <div class="tag"><span id="status-pulse" class="pulse off"></span><span id="status-line">CHECKING SIGNAL…</span></div>
+  </header>
+
+  <!-- ── Pair: enter host ─────────────────────────────────────────────── -->
+  <section id="card-pair-host" class="card" hidden>
+    <h2 class="card-title">▌ Pair a TV</h2>
+    <p class="card-sub">First-time setup. Enter the IP address of your Google TV / Android TV device.</p>
+    <label for="host">Device IP</label>
+    <input id="host" type="text" inputmode="decimal" placeholder="192.168.1.69" autocomplete="off">
+    <button id="btn-pair-start">Start pairing</button>
+    <div id="toast-host" class="toast"></div>
+  </section>
+
+  <!-- ── Pair: enter code ─────────────────────────────────────────────── -->
+  <section id="card-pair-code" class="card" hidden>
+    <h2 class="card-title">▌ Enter code</h2>
+    <p class="card-sub">A 6-character code is now showing on your TV. Type it below.</p>
+    <input id="code" class="code-input" type="text" maxlength="6" autocomplete="off" placeholder="······">
+    <button id="btn-pair-finish">Confirm</button>
+    <button id="btn-pair-cancel" class="secondary" type="button">Cancel</button>
+    <div id="toast-code" class="toast"></div>
+  </section>
+
+  <!-- ── Now playing ──────────────────────────────────────────────────── -->
+  <section id="card-now" class="card" hidden>
+    <h2 class="card-title">▌ Now playing</h2>
+    <div id="now-empty" class="empty">— Nothing playing —</div>
+    <div id="now-body" class="now-playing" hidden>
+      <div class="thumb"><img id="np-thumb" alt=""></div>
+      <div class="body">
+        <div id="np-title" class="np-title"></div>
+        <div id="np-channel" class="np-channel"></div>
+        <div id="np-progress" class="progress"><div class="bar"></div></div>
+        <div class="progress-meta">
+          <span id="np-elapsed">0:00</span>
+          <span id="np-remaining">—</span>
+        </div>
+      </div>
+    </div>
+    <div class="controls">
+      <button id="btn-play"     class="muted" title="Resume the video and the playlist">▶ Play</button>
+      <button id="btn-pause"    class="muted" title="Pause the video and the playlist">⏸ Pause</button>
+      <button id="btn-skip"     class="muted" title="Skip to next">⏭ Skip</button>
+      <button id="btn-clear"    class="muted" title="Clear queue (current keeps playing)">🗑 Clear</button>
+      <button id="btn-seek"     class="muted" title="Seek within the current video">🎯 Seek</button>
+      <button id="btn-vol-mute" class="muted vol-btn" title="Toggle mute" hidden>🔇 Mute</button>
+      <button id="btn-vol-up"   class="muted vol-btn" title="Volume up"   hidden>🔊 Vol+</button>
+      <button id="btn-vol-down" class="muted vol-btn" title="Volume down" hidden>🔉 Vol−</button>
+    </div>
+  </section>
+
+  <!-- ── Add ──────────────────────────────────────────────────────────── -->
+  <section id="card-add" class="card" hidden>
+    <h2 class="card-title">▌ Add a video</h2>
+    <p class="card-sub">Paste any YouTube URL or an 11-character video ID. Plays now if idle, otherwise queued.</p>
+    <label for="url">Video</label>
+    <input id="url" type="url" placeholder="https://youtu.be/dQw4w9WgXcQ" autocomplete="off">
+    <button id="btn-add">▶ Add to queue</button>
+    <div id="toast-add" class="toast"></div>
+  </section>
+
+  <!-- ── Queue list ───────────────────────────────────────────────────── -->
+  <section id="card-queue" class="card" hidden>
+    <div class="qhead">
+      <h2 class="card-title" style="margin:0">▌ Up next</h2>
+      <span id="qcount" class="qcount">0 ITEMS</span>
+    </div>
+    <div id="queue-empty" class="empty">— Queue empty —</div>
+    <ul id="queue-list" class="qlist" hidden></ul>
+  </section>
+
+  <!-- ── Lounge pair: only shown after TV-pair if Lounge isn't paired ──── -->
+  <section id="card-lounge" class="card" hidden>
+    <h2 class="card-title">▌ Pair YouTube Lounge</h2>
+    <p class="card-sub">For accurate playback sync (real position, real pause/play). On the TV, open SmartTube → Settings → "Link with TV code". Paste the 12-digit code below.</p>
+    <label for="lounge-code">12-digit code</label>
+    <input id="lounge-code" class="code-input" type="text" maxlength="14" autocomplete="off" placeholder="123 456 789 012">
+    <button id="btn-lounge-pair">Pair Lounge</button>
+    <div id="toast-lounge" class="toast"></div>
+  </section>
+
+  <!-- ── Status ──────────────────────────────────────────────────────── -->
+  <section id="card-meta" class="card" hidden>
+    <dl class="meta">
+      <dt>Connected to</dt><dd id="meta-host">—</dd>
+      <dt>TV power</dt><dd id="meta-power">—</dd>
+      <dt>Playback sync</dt><dd id="meta-lounge">—</dd>
+    </dl>
+  </section>
+
+  <footer>SmartTube Playlist · v1.0 · <a href="https://opensource.org/licenses/MIT" target="_blank" rel="noopener noreferrer">MIT</a> · <a href="https://github.com/Alice-Sabrina-Ivy" target="_blank" rel="noopener noreferrer">Alice Sabrina Ivy</a></footer>
+</div>
+
+<!-- ── Seek modal (opens via the "Seek" button on the now-playing card) ── -->
+<div id="modal-seek" class="modal-backdrop" hidden>
+  <div class="modal" role="dialog" aria-labelledby="seek-title" aria-modal="true">
+    <h2 id="seek-title" class="card-title">▌ Seek</h2>
+    <div id="seek-current" class="seek-current">— / —</div>
+    <div class="controls seek-quick">
+      <button data-seek-by="-30" type="button" class="muted">⏪ 30s</button>
+      <button data-seek-by="-10" type="button" class="muted">⏪ 10s</button>
+      <button data-seek-by="10"  type="button" class="muted">10s ⏩</button>
+      <button data-seek-by="30"  type="button" class="muted">30s ⏩</button>
+    </div>
+    <label for="seek-input">Jump to:</label>
+    <div class="seek-input-row">
+      <input id="seek-input" type="text" inputmode="text"
+             placeholder="1:23 · 1:23:45 · 90 · 1h30m" autocomplete="off" />
+      <button id="btn-seek-go" type="button">Go</button>
+    </div>
+    <div id="toast-seek" class="toast"></div>
+    <div class="seek-close-row">
+      <button id="btn-seek-close" type="button" class="muted">Close</button>
+    </div>
+  </div>
+</div>
+
+<script>
+(() => {
+  const $ = id => document.getElementById(id);
+  const cards = {
+    host:   $("card-pair-host"),
+    code:   $("card-pair-code"),
+    now:    $("card-now"),
+    add:    $("card-add"),
+    queue:  $("card-queue"),
+    lounge: $("card-lounge"),
+    meta:   $("card-meta"),
+  };
+
+  // queue cards (now/add/queue/meta) all show together when paired.
+  // The lounge-pair card is shown only when configured but not lounge-paired.
+  function showPaired(loungePaired) {
+    cards.host.hidden = true; cards.code.hidden = true;
+    cards.now.hidden = false; cards.add.hidden = false;
+    cards.queue.hidden = false; cards.meta.hidden = false;
+    cards.lounge.hidden = !!loungePaired;
+  }
+  function showCard(key) {
+    Object.entries(cards).forEach(([k, el]) => el.hidden = (k !== key));
+  }
+
+  function toast(el, msg, kind = "") {
+    el.className = "toast show " + kind;
+    el.textContent = msg;
+    if (kind === "ok") setTimeout(() => el.classList.remove("show"), 4000);
+  }
+
+  async function api(path, opts = {}) {
+    const res = await fetch(path, {
+      method: opts.method || "GET",
+      headers: opts.body ? { "Content-Type": "application/json" } : {},
+      body: opts.body ? JSON.stringify(opts.body) : undefined,
+    });
+    let data = null;
+    try { data = await res.json(); } catch {}
+    if (!res.ok) {
+      const detail = (data && data.detail) || `HTTP ${res.status}`;
+      const err = new Error(detail);
+      err.status = res.status;
+      throw err;
+    }
+    return data;
+  }
+
+  function fmtDuration(s) {
+    if (s == null) return "LIVE";
+    s = Math.max(0, Math.floor(s));
+    const h = Math.floor(s / 3600);
+    const m = Math.floor((s % 3600) / 60);
+    const sec = s % 60;
+    if (h > 0) return `${h}:${String(m).padStart(2,"0")}:${String(sec).padStart(2,"0")}`;
+    return `${m}:${String(sec).padStart(2,"0")}`;
+  }
+
+  // ── connection / status ─────────────────────────────────────────────────
+
+  function setStatus(s) {
+    const pulse = $("status-pulse");
+    const line  = $("status-line");
+    if (s.pairing_in_progress) {
+      pulse.className = "pulse warn";
+      line.textContent = "PAIRING…";
+    } else if (s.configured) {
+      pulse.className = "pulse";
+      // Lounge state suffix — only show when something looks off (paired
+      // but disconnected). When everything's fine, header stays clean.
+      let suffix = "";
+      if (s.lounge_paired === false) {
+        suffix = " · LOUNGE NOT PAIRED";
+      } else if (s.lounge_paired && !s.lounge_connected) {
+        suffix = " · LOUNGE OFFLINE";
+      }
+      line.textContent = `LINKED · ${s.host}${suffix}`;
+    } else {
+      pulse.className = "pulse off";
+      line.textContent = "NOT CONFIGURED";
+    }
+    $("meta-host").textContent  = s.host || "—";
+    $("meta-power").textContent =
+      s.tv_on === true  ? "ON"  :
+      s.tv_on === false ? "OFF (will wake)" :
+      "UNKNOWN";
+    $("meta-lounge").textContent =
+      !s.lounge_paired ? "NOT PAIRED" :
+      s.lounge_connected ? "PAIRED · CONNECTED" : "PAIRED · OFFLINE";
+    // Volume buttons render only when a volume backend is configured
+    // (currently: a Denon AVR set via DENON_HOST). Most Android TV /
+    // Google TV devices can't expose volume via the remote protocol —
+    // see the volume_info.max=0 note in app.py.
+    const showVol = !!s.volume_backend;
+    for (const b of document.querySelectorAll(".vol-btn")) {
+      b.hidden = !showVol;
+    }
+  }
+
+  async function refreshStatus() {
+    try {
+      const s = await api("/api/status");
+      lastStatus = s;
+      setStatus(s);
+      if (s.pairing_in_progress)      showCard("code");
+      else if (s.configured)          { showPaired(s.lounge_paired); ensureSSE(); }
+      else                            showCard("host");
+    } catch (e) {
+      $("status-line").textContent = "API UNREACHABLE";
+    }
+  }
+
+  // ── queue rendering (driven by SSE snapshots) ───────────────────────────
+
+  let progressTicker = null;
+  let currentSnapshot = null;
+  let lastStatus = null;
+  // Lounge position handoff for smoother local interpolation between events.
+  // Whenever a snapshot arrives with fresh Lounge position, stamp it here;
+  // tickProgress reads from this if present, else falls back to estimate.
+  let lastCastSync = null;  // { currentTime, duration, playerState, stampedAt }
+  let loadingFallbackTimer = null;  // setTimeout id for STARTING-grace re-render
+
+  // Frozen-Paused tracking — used to hide the now-playing card when
+  // SmartTube's player has been torn down (user pressed BACK to exit
+  // the player view) but Lounge keeps reporting the last-played video
+  // as state=Paused indefinitely. Lounge protocol can't distinguish
+  // "user backed out of player" from "user pressed pause on remote",
+  // so we use a time-based heuristic: if Lounge reports Paused with
+  // a frozen current_time for PAUSED_HIDE_SECONDS, hide the card.
+  //
+  // FRONTEND-ONLY fade: backend state.current stays populated. If the
+  // user pauses via TV remote and walks away >15s, the card disappears
+  // but pressing the UI's Resume button still works to relaunch.
+  const PAUSED_HIDE_SECONDS = 15;
+  let pausedExternallySince = null;  // wall-clock ms when Lounge first reported the current frozen Paused frame
+  let pausedExternallyCt = null;     // current_time we saw at that moment
+  let pausedFadeTimer = null;        // setTimeout id for fade-boundary re-render
+
+  function renderState(state) {
+    currentSnapshot = state;
+    syncLoungePosition(state);
+    renderNowPlaying(state);
+    renderQueue(state);
+    renderTransportButtons(state);
+    // Refresh the meta status display from the SSE snapshot's fresh
+    // fields rather than the 30-second-stale lastStatus. Most of
+    // setStatus's inputs (configured, host, lounge_paired, etc.) only
+    // change rarely and lastStatus is fine — but tv_on flips whenever
+    // the user powers the TV, and we get that change in SSE within a
+    // second or two of it happening. Without this merge, the meta's
+    // "TV power" line would lag up to 30s behind reality.
+    if (lastStatus) {
+      setStatus({...lastStatus, tv_on: state.tv_on});
+    }
+    // If the seek modal is open, keep its "current / duration" line
+    // in sync with incoming Lounge position updates.
+    const sm = document.getElementById("modal-seek");
+    if (sm && !sm.hidden) refreshSeekCurrent();
+  }
+
+  function syncLoungePosition(state) {
+    const lng = state.lounge || {};
+    if (lng.available && lng.current_time != null) {
+      // Decide whether to re-anchor `stampedAt` to "now" or preserve
+      // the prior anchor.
+      //
+      // Re-anchor when ANY of:
+      //   (1) No prior anchor (first sync after connection).
+      //   (2) Lounge actually pushed a fresh current_time.
+      //   (3) Backend's `state.paused` transitioned — on resume we
+      //       want drift to start counting from the moment of resume,
+      //       not from before the pause; on pause we want drift to
+      //       stop accumulating against the pre-pause baseline.
+      //
+      // Preserve `stampedAt` when Lounge keeps reporting the same
+      // current_time across periodic refreshes (which happens when
+      // SmartTube was started via deep-link Intent — its Lounge layer
+      // doesn't see the playback and never updates ct, even though
+      // the video is genuinely advancing on the TV). Without
+      // preservation, drift would cap at one polling interval (~3s)
+      // and the timer would appear frozen.
+      const wasPaused = lastCastSync ? !!lastCastSync._wasPaused : false;
+      const ctChanged = !lastCastSync || lastCastSync.currentTime !== lng.current_time;
+      const pauseChanged = wasPaused !== !!state.paused;
+      const reanchor = !lastCastSync || ctChanged || pauseChanged;
+      lastCastSync = {
+        currentTime: lng.current_time,
+        duration: lng.duration,
+        // Map Lounge's "Playing/Paused/..." to the Cast-shaped string the
+        // rest of the JS expects. Used in conjunction with state.paused —
+        // see tickProgress's `isPlaying` calculation.
+        playerState: lng.state === "Playing" ? "PLAYING"
+                   : lng.state === "Paused" ? "PAUSED"
+                   : "OTHER",
+        stampedAt: reanchor ? Date.now() : lastCastSync.stampedAt,
+        // Remember the paused state we observed at anchor time so we
+        // can detect a transition next sync.
+        _wasPaused: !!state.paused,
+      };
+    } else if (!lng.available) {
+      lastCastSync = null;
+    }
+
+    // Track frozen-Paused state for the BACK-out-of-player heuristic.
+    // We count it as "externally paused" (eligible to fade) when:
+    //   - Backend agrees the queue is paused (state.paused === true)
+    //   - Lounge sees Paused with a video_id
+    //   - EITHER pause_source !== 'ui' (Lounge-mirrored: TV remote
+    //     pause OR BACK-out-of-player)
+    //   - OR lng.current_time === null (player torn down — Lounge has
+    //     dropped ct/duration even though state.pause_source was "ui"
+    //     from an earlier UI pause; the user must have BACK'd out
+    //     after pausing, so the card should still fade).
+    // The state.paused === true gate keeps the fade off freshly-
+    // resumed cards while Lounge is still sticky at Paused.
+    const externalPause = lng.available && !!lng.video_id
+      && lng.state === "Paused" && state.paused === true
+      && (state.pause_source !== "ui" || lng.current_time === null);
+    if (externalPause) {
+      // If ct changed (player still active, just slow to update) reset
+      // the timer. Frozen ct means the player is dormant.
+      if (pausedExternallySince === null || lng.current_time !== pausedExternallyCt) {
+        pausedExternallySince = Date.now();
+        pausedExternallyCt = lng.current_time;
+      }
+    } else {
+      pausedExternallySince = null;
+      pausedExternallyCt = null;
+    }
+  }
+
+  function renderNowPlaying(state) {
+    const cur = state.current;
+    const lng = state.lounge || {};
+    // Lounge has active playback when it reports a video_id, a known
+    // playback state, AND the TV isn't powered off. (Lounge's connection
+    // outlives TV power cycles and can keep reporting stale "Paused"
+    // state after the TV shuts down.)
+    // Don't require a specific lng.state here — see the long comment on
+    // loungeConfirmsCurrent. We DO require a non-null current_time though:
+    // when a user navigates away from the player inside SmartTube, Lounge
+    // never fires a clean "video unloaded" event — it just keeps its last
+    // report (often state=Paused with current_time=null/duration=null).
+    // Without this gate that ghost leaves the now-playing card stuck on
+    // a video that isn't actually playing.
+    // loungeActive: only show externally-observed playback (i.e. not
+    // ours) when SmartTube is ACTIVELY playing — state == "Playing".
+    // Paused/Stopped/other states without our own current item mean
+    // either (a) the user backed out of the player but Lounge still
+    // reports a stale video, or (b) external playback the user just
+    // paused — either way, we shouldn't keep "now playing" pinned
+    // on a video that isn't actively running. (When state.current is
+    // set, we trust ours and render the queue item regardless of
+    // Lounge state — that's the queued-by-us path.)
+    const loungeActive = state.tv_on !== false
+      && lng.available && !!lng.video_id
+      && lng.current_time != null
+      && lng.state === "Playing";
+    const empty = $("now-empty");
+    const body = $("now-body");
+
+    // BACK-out-of-player fade: SmartTube doesn't give us a clean signal
+    // when the user exits the player view but stays in the app, so if
+    // Lounge has been reporting frozen-Paused for long enough we assume
+    // the player closed and hide the card. Backend state.current stays
+    // set — Resume button still works to relaunch.
+    const pausedFrozenMs = pausedExternallySince !== null
+      ? Date.now() - pausedExternallySince : 0;
+    const fadedExternalPause = pausedExternallySince !== null
+      && pausedFrozenMs >= PAUSED_HIDE_SECONDS * 1000;
+
+    if ((!cur && !loungeActive) || fadedExternalPause) {
+      empty.hidden = false;
+      body.hidden = true;
+      stopProgressTicker();
+      if (pausedFadeTimer) { clearTimeout(pausedFadeTimer); pausedFadeTimer = null; }
+      return;
+    }
+
+    // While we're counting toward the fade, schedule a re-render at the
+    // boundary so the card disappears even if no new SSE event arrives.
+    if (pausedExternallySince !== null) {
+      const remainingMs = Math.max(
+        0, PAUSED_HIDE_SECONDS * 1000 - pausedFrozenMs + 100,
+      );
+      if (pausedFadeTimer) clearTimeout(pausedFadeTimer);
+      pausedFadeTimer = setTimeout(() => {
+        pausedFadeTimer = null;
+        if (currentSnapshot) renderState(currentSnapshot);
+      }, remainingMs);
+    } else if (pausedFadeTimer) {
+      clearTimeout(pausedFadeTimer);
+      pausedFadeTimer = null;
+    }
+
+    empty.hidden = true;
+    body.hidden = false;
+
+    // Title/channel: queue item if we queued it, else the metadata app.py
+    // scraped for the externally-observed video_id (may take ~1s after the
+    // video first appears — until then, show the video_id as a placeholder).
+    const title = (cur && cur.title) || (loungeActive && lng.title) ||
+                  (loungeActive && lng.video_id) || "—";
+    const channel = (cur && cur.channel) || (loungeActive && lng.channel) || "";
+    $("np-title").textContent = title;
+    $("np-channel").textContent = channel;
+
+    // Thumbnail: prefer queue item's URL, then scraped Lounge thumbnail,
+    // else build the standard YouTube mqdefault URL from the video_id.
+    let thumbUrl = (cur && cur.thumbnail_url) || (loungeActive && lng.thumbnail_url) || null;
+    if (!thumbUrl && loungeActive && lng.video_id) {
+      thumbUrl = `https://i.ytimg.com/vi/${lng.video_id}/mqdefault.jpg`;
+    }
+    const thumb = $("np-thumb");
+    if (thumbUrl) {
+      thumb.src = thumbUrl;
+      thumb.style.display = "";
+    } else {
+      thumb.removeAttribute("src");
+      thumb.style.display = "none";
+    }
+
+    // When we queued the video ourselves, trust cur.is_live (scraped from
+    // the YouTube page, definitive). Only fall back to Lounge's
+    // duration==null heuristic for externally-started videos where we
+    // don't have our own metadata — Lounge can transiently report
+    // duration=null during reconnects, which would falsely tag a normal
+    // queued video as LIVE if we mixed signals here.
+    const isLive = cur
+      ? !!cur.is_live
+      : (loungeActive && (lng.duration == null || lng.duration === 0));
+    // WAKING means "the backend is in a cold-boot wake-from-off
+    // sequence right now (POWER sent, waiting for TV to finish
+    // booting)." Trust the backend's `waking` flag — it covers
+    // the whole wake window even on Quick Resume TVs that flip
+    // tv_on to True very fast. As a defensive fallback, also show
+    // WAKING when state.tv_on === false (older snapshot, or TVs
+    // that report power state honestly through the wake).
+    const isWaking = !!cur && (state.waking === true || state.tv_on === false);
+
+    // "Loading": TV is on but we don't yet have positive confirmation
+    // from Lounge that our video is actually playing. Freezing the
+    // display avoids tickProgress's wallclock fallback fake-advancing
+    // and snapping back when Lounge finally reports current_time≈0.
+    //
+    // Time-bound this state: the deep-link Intent path (used when
+    // SmartTube wasn't foreground or was idle) doesn't propagate to
+    // Lounge — SmartTube only reports Lounge state for Lounge-initiated
+    // playback. If we waited indefinitely we'd be stuck on "STARTING…"
+    // forever even though the video is playing on the TV. After
+    // STARTING_GRACE seconds, give up waiting for Lounge confirmation
+    // and let the wallclock-based progress ticker take over (or just
+    // show no progress data if duration is unknown).
+    const STARTING_GRACE_SECONDS = 10;
+    const loungeConfirmsCurrent = !!(cur && lng.available
+        && lng.video_id === cur.video_id
+        && lng.current_time != null);
+    const loungeIsExpected = !!(lastStatus && lastStatus.lounge_paired);
+    const startedAt = state.current_started_at
+        ? new Date(state.current_started_at).getTime() : 0;
+    const elapsedSinceStart = startedAt
+        ? Math.max(0, (Date.now() - startedAt) / 1000) : Infinity;
+    const isLoading = !isWaking && !!cur
+        && loungeIsExpected && !loungeConfirmsCurrent
+        && elapsedSinceStart < STARTING_GRACE_SECONDS;
+    const prog = $("np-progress");
+    if (isWaking || isLoading) {
+      stopProgressTicker();
+      prog.classList.remove("live");
+      // Use the dim "waking" bar styling for both cases — same visual
+      // (frozen low-saturation bar) but only show the explicit
+      // "WAKING TV…" badge when we're actually waking the TV from off.
+      prog.classList.add("waking");
+      // Freeze the displayed playback time at the queued start position
+      // (0:00 for normal adds, start_s for URLs with a &t= timestamp).
+      // The bar moves proportionally if we know the duration so the user
+      // can see roughly where in the video we'll start.
+      const startOffset = (cur && cur.start_s) || 0;
+      const total = cur && cur.duration_s;
+      const pct = (total && total > 0)
+        ? Math.min(100, (startOffset / total) * 100)
+        : 0;
+      prog.querySelector(".bar").style.width = pct + "%";
+      $("np-elapsed").textContent = fmtDuration(startOffset);
+      $("np-remaining").innerHTML = isWaking
+        ? '<span class="waking-badge">⏻ WAKING TV…</span>'
+        : '<span class="waking-badge">⏻ STARTING…</span>';
+      // Schedule a re-render at the grace-period boundary so the
+      // STARTING badge clears even without a new state event. The
+      // deep-link Intent path doesn't propagate to Lounge, so we
+      // can't rely on a Lounge update to trigger re-rendering.
+      if (isLoading && currentSnapshot && startedAt > 0) {
+        const remainingMs = Math.max(
+          0, STARTING_GRACE_SECONDS * 1000 - (Date.now() - startedAt) + 100,
+        );
+        if (loadingFallbackTimer) clearTimeout(loadingFallbackTimer);
+        loadingFallbackTimer = setTimeout(() => {
+          loadingFallbackTimer = null;
+          if (currentSnapshot) renderState(currentSnapshot);
+        }, remainingMs);
+      }
+    } else if (isLive) {
+      stopProgressTicker();
+      prog.classList.remove("waking");
+      prog.classList.add("live");
+      prog.querySelector(".bar").style.removeProperty("width");
+      $("np-elapsed").innerHTML = '<span class="live-badge">● LIVE</span>';
+      $("np-remaining").textContent = "—";
+    } else {
+      prog.classList.remove("live");
+      prog.classList.remove("waking");
+      startProgressTicker();
+    }
+  }
+
+  function tickProgress() {
+    if (!currentSnapshot) return;
+    const cur = currentSnapshot.current;
+    if (cur && cur.is_live) return;
+
+    let elapsed, total;
+    if (lastCastSync && lastCastSync.duration && lastCastSync.duration > 0) {
+      // Cast-driven: use real position, interpolate forward only when PLAYING.
+      // Works whether or not `cur` is set (handles externally-started videos).
+      // The backend's `state.paused` is authoritative — when the user clicks
+      // Pause we know they want it paused immediately, without waiting for
+      // Lounge to round-trip the state change back to us. Same on resume:
+      // state.paused goes False the moment the API call returns, so we
+      // resume drifting even if Lounge's playerState is still showing
+      // PAUSED for a tick.
+      total = lastCastSync.duration;
+      const isPlaying = !currentSnapshot.paused
+        && lastCastSync.playerState !== "OTHER";
+      const drift = isPlaying ? (Date.now() - lastCastSync.stampedAt) / 1000 : 0;
+      elapsed = Math.min(total, lastCastSync.currentTime + drift);
+    } else if (cur && cur.duration_s != null && currentSnapshot.current_started_at) {
+      // Fallback: started_at + scraped duration (the v1 behavior, drifts on
+      // pause/seek). Account for cur.start_s so videos added with a `&t=`
+      // offset show the correct estimated position, not wall-clock from add.
+      total = cur.duration_s;
+      const startOffset = cur.start_s || 0;
+      if (currentSnapshot.paused) {
+        // Don't drift the estimate forward while paused. We don't track the
+        // exact pause moment, so just hold the start offset — better to show
+        // a stable value than a fictional growing time.
+        elapsed = Math.min(total, startOffset);
+      } else {
+        const startedMs = Date.parse(currentSnapshot.current_started_at);
+        const wallElapsed = Math.max(0, (Date.now() - startedMs) / 1000);
+        elapsed = Math.min(total, wallElapsed + startOffset);
+      }
+    } else {
+      return;
+    }
+
+    const pct = Math.min(100, (elapsed / total) * 100);
+    $("np-progress").querySelector(".bar").style.width = pct + "%";
+    $("np-elapsed").textContent = fmtDuration(elapsed);
+    $("np-remaining").textContent = fmtDuration(Math.max(0, total - elapsed)) + " left";
+  }
+
+  function startProgressTicker() {
+    if (progressTicker) return;
+    tickProgress();
+    progressTicker = setInterval(tickProgress, 250);
+  }
+  function stopProgressTicker() {
+    if (progressTicker) { clearInterval(progressTicker); progressTicker = null; }
+    $("np-progress").querySelector(".bar").style.width = "0%";
+    $("np-elapsed").textContent = "0:00";
+    $("np-remaining").textContent = "—";
+  }
+
+  function renderQueue(state) {
+    const list = $("queue-list");
+    const empty = $("queue-empty");
+    const count = $("qcount");
+    count.textContent = `${state.queue.length} ITEM${state.queue.length === 1 ? "" : "S"}`;
+    if (state.queue.length === 0) {
+      list.hidden = true;
+      list.innerHTML = "";
+      empty.hidden = false;
+      return;
+    }
+    empty.hidden = true;
+    list.hidden = false;
+    list.innerHTML = "";
+    for (let idx = 0; idx < state.queue.length; idx++) {
+      const item = state.queue[idx];
+      const isFirst = idx === 0;
+      const isLast = idx === state.queue.length - 1;
+      const li = document.createElement("li");
+      li.className = "qitem";
+      // No URL interpolation in the template — set the src via property
+      // afterwards so attribute injection isn't possible if the URL ever
+      // contains a quote or angle-bracket (defense-in-depth; today's URLs
+      // are constructed from a regex-validated 11-char video ID).
+      li.innerHTML = `
+        <div class="thumb"><img alt=""></div>
+        <div class="qbody">
+          <div class="qtitle"></div>
+          <div class="qsub"></div>
+        </div>
+        <div style="display:flex;align-items:center;gap:0.4rem">
+          <span class="qdur"></span>
+          <button class="qup" type="button" title="Move up">▲</button>
+          <button class="qdn" type="button" title="Move down">▼</button>
+          <button class="qrm" type="button" title="Remove">✕</button>
+        </div>`;
+      li.querySelector(".thumb img").src = item.thumbnail_url;
+      li.querySelector(".qtitle").textContent = item.title;
+      li.querySelector(".qsub").textContent = item.channel;
+      li.querySelector(".qdur").textContent = fmtDuration(item.duration_s);
+      const btnUp = li.querySelector(".qup");
+      const btnDn = li.querySelector(".qdn");
+      // Hide buttons that would be no-ops at the queue boundary rather
+      // than rendering them disabled. Cleaner visual — each row shows
+      // only the move directions that actually do something.
+      btnUp.hidden = isFirst;
+      btnDn.hidden = isLast;
+      btnUp.addEventListener("click", async () => {
+        try { await api(`/api/queue/${item.id}/move/up`, { method: "POST" }); }
+        catch (e) { toast($("toast-add"), e.message, "err"); }
+      });
+      btnDn.addEventListener("click", async () => {
+        try { await api(`/api/queue/${item.id}/move/down`, { method: "POST" }); }
+        catch (e) { toast($("toast-add"), e.message, "err"); }
+      });
+      li.querySelector(".qrm").addEventListener("click", async () => {
+        try { await api(`/api/queue/${item.id}`, { method: "DELETE" }); }
+        catch (e) { toast($("toast-add"), e.message, "err"); }
+      });
+      list.appendChild(li);
+    }
+  }
+
+  function renderTransportButtons(state) {
+    const hasCurrent = state.current != null;
+    const hasQueue = (state.queue || []).length > 0;
+    const isPaused = state.paused === true;
+    const lng = state.lounge || {};
+    // Same TV-on gate as renderNowPlaying — don't trust stale Lounge data
+    // from before the TV powered off.
+    // Don't require a specific lng.state here — see the long comment on
+    // loungeConfirmsCurrent. We DO require a non-null current_time though:
+    // when a user navigates away from the player inside SmartTube, Lounge
+    // never fires a clean "video unloaded" event — it just keeps its last
+    // report (often state=Paused with current_time=null/duration=null).
+    // Without this gate that ghost leaves the now-playing card stuck on
+    // a video that isn't actually playing.
+    // loungeActive: only show externally-observed playback (i.e. not
+    // ours) when SmartTube is ACTIVELY playing — state == "Playing".
+    // Paused/Stopped/other states without our own current item mean
+    // either (a) the user backed out of the player but Lounge still
+    // reports a stale video, or (b) external playback the user just
+    // paused — either way, we shouldn't keep "now playing" pinned
+    // on a video that isn't actively running. (When state.current is
+    // set, we trust ours and render the queue item regardless of
+    // Lounge state — that's the queued-by-us path.)
+    const loungeActive = state.tv_on !== false
+      && lng.available && !!lng.video_id
+      && lng.current_time != null
+      && lng.state === "Playing";
+    const hasPlayback = hasCurrent || loungeActive;
+    $("btn-pause").disabled = !hasPlayback || isPaused;
+    $("btn-play").disabled = !(isPaused || (!hasCurrent && hasQueue));
+    $("btn-skip").disabled = !(hasCurrent || hasQueue);
+    $("btn-clear").disabled = !hasQueue;
+    // Seek needs something playing AND a connected Lounge (the seek
+    // primitive comes from Lounge.seek_to). Use hasPlayback as a
+    // proxy: it covers both our queued current and external Lounge
+    // playback. Livestreams shouldn't expose seek either.
+    const isLive = (state.current && state.current.is_live) === true;
+    $("btn-seek").disabled = !hasPlayback || isLive;
+    // Volume controls: the AVR is independent of TV power state (you
+    // can adjust volume / mute even with the TV off). No disable here;
+    // visibility is gated by setStatus on the volume_backend field.
+  }
+
+  // ── SSE wiring ──────────────────────────────────────────────────────────
+
+  let sse = null;
+  function ensureSSE() {
+    if (sse) return;
+    sse = new EventSource("/api/events");
+    sse.onmessage = (ev) => {
+      try {
+        const event = JSON.parse(ev.data);
+        if (event && event.state) renderState(event.state);
+      } catch {}
+    };
+    sse.onerror = () => {
+      // EventSource auto-reconnects; just dim the indicator briefly.
+      const pulse = $("status-pulse");
+      pulse.classList.add("warn");
+      setTimeout(() => refreshStatus(), 2000);
+    };
+  }
+
+  // ── pairing actions ─────────────────────────────────────────────────────
+
+  $("btn-pair-start").addEventListener("click", async () => {
+    const host = $("host").value.trim();
+    if (!host) return toast($("toast-host"), "Enter an IP address.", "err");
+    const btn = $("btn-pair-start"); btn.disabled = true;
+    try {
+      await api("/api/pair/start", { method: "POST", body: { host } });
+      toast($("toast-host"), "Look at your TV.", "ok");
+      await refreshStatus();
+      $("code").focus();
+    } catch (e) {
+      toast($("toast-host"), e.message, "err");
+    } finally { btn.disabled = false; }
+  });
+
+  $("btn-pair-finish").addEventListener("click", async () => {
+    const code = $("code").value.trim();
+    if (code.length < 4) return toast($("toast-code"), "Enter the code from your TV.", "err");
+    const btn = $("btn-pair-finish"); btn.disabled = true;
+    try {
+      await api("/api/pair/finish", { method: "POST", body: { code } });
+      toast($("toast-code"), "Paired.", "ok");
+      $("code").value = "";
+      await refreshStatus();
+    } catch (e) {
+      toast($("toast-code"), e.message, "err");
+    } finally { btn.disabled = false; }
+  });
+
+  $("btn-pair-cancel").addEventListener("click", async () => {
+    try { await api("/api/pair/cancel", { method: "POST" }); } catch {}
+    await refreshStatus();
+  });
+
+  // ── queue actions ───────────────────────────────────────────────────────
+
+  $("btn-add").addEventListener("click", async () => {
+    const url = $("url").value.trim();
+    if (!url) return toast($("toast-add"), "Paste a URL or video ID.", "err");
+    const btn = $("btn-add"); btn.disabled = true;
+    try {
+      const r = await api("/api/queue", { method: "POST", body: { url } });
+      toast($("toast-add"), `▶ Added ${r.item.title}`, "ok");
+      $("url").value = "";
+    } catch (e) {
+      toast($("toast-add"), e.message, "err");
+    } finally { btn.disabled = false; }
+  });
+
+  $("btn-skip").addEventListener("click", async () => {
+    try { await api("/api/skip", { method: "POST" }); }
+    catch (e) { toast($("toast-add"), e.message, "err"); }
+  });
+
+  $("btn-pause").addEventListener("click", async () => {
+    try { await api("/api/pause", { method: "POST" }); }
+    catch (e) { toast($("toast-add"), e.message, "err"); }
+  });
+
+  $("btn-play").addEventListener("click", async () => {
+    try { await api("/api/resume", { method: "POST" }); }
+    catch (e) { toast($("toast-add"), e.message, "err"); }
+  });
+
+  $("btn-clear").addEventListener("click", async () => {
+    if (!confirm("Clear the queue? The currently-playing video will keep playing.")) return;
+    try { await api("/api/clear", { method: "POST" }); }
+    catch (e) { toast($("toast-add"), e.message, "err"); }
+  });
+
+  for (const [id, action] of [
+    ["btn-vol-up",   "up"],
+    ["btn-vol-down", "down"],
+    ["btn-vol-mute", "mute"],
+  ]) {
+    $(id).addEventListener("click", async () => {
+      try { await api("/api/volume/" + action, { method: "POST" }); }
+      catch (e) { toast($("toast-add"), e.message, "err"); }
+    });
+  }
+
+  // ── seek modal ──────────────────────────────────────────────────
+  const seekModal = $("modal-seek");
+  let seekTickInterval = null;
+  function openSeekModal() {
+    refreshSeekCurrent();
+    seekModal.hidden = false;
+    // Tick the displayed current-time once per second while the modal
+    // is open — Lounge only pushes position updates every ~3s, so
+    // without interpolation the display would visibly stall.
+    if (seekTickInterval) clearInterval(seekTickInterval);
+    seekTickInterval = setInterval(refreshSeekCurrent, 500);
+    // Focus the input so users can immediately type a time. Some
+    // mobile keyboards open on focus — that's intended here.
+    setTimeout(() => $("seek-input").focus(), 0);
+  }
+  function closeSeekModal() {
+    seekModal.hidden = true;
+    $("seek-input").value = "";
+    if (seekTickInterval) {
+      clearInterval(seekTickInterval);
+      seekTickInterval = null;
+    }
+  }
+  /**
+   * Compute the best-effort "current playback position" the same way
+   * the now-playing progress bar does: prefer the Lounge-stamped
+   * position interpolated forward by wallclock when PLAYING, else
+   * fall back to started_at + duration math.
+   */
+  function computeCurrentPosition() {
+    if (!currentSnapshot) return [null, null];
+    const cur = currentSnapshot.current;
+    const lng = currentSnapshot.lounge || {};
+    let elapsed = null;
+    let total = null;
+    if (lastCastSync && lastCastSync.duration && lastCastSync.duration > 0) {
+      total = lastCastSync.duration;
+      // Trust the backend's `state.paused` as the source of truth — see
+      // the matching comment in tickProgress for why.
+      const isPlaying = !currentSnapshot.paused
+        && lastCastSync.playerState !== "OTHER";
+      const drift = isPlaying ? (Date.now() - lastCastSync.stampedAt) / 1000 : 0;
+      elapsed = Math.min(total, lastCastSync.currentTime + drift);
+    } else if (cur && cur.duration_s != null && currentSnapshot.current_started_at) {
+      total = cur.duration_s;
+      const startOffset = cur.start_s || 0;
+      if (currentSnapshot.paused) {
+        elapsed = Math.min(total, startOffset);
+      } else {
+        const startedMs = Date.parse(currentSnapshot.current_started_at);
+        const wallElapsed = Math.max(0, (Date.now() - startedMs) / 1000);
+        elapsed = Math.min(total, wallElapsed + startOffset);
+      }
+    }
+    if (total == null && cur && cur.duration_s != null) total = cur.duration_s;
+    if (total == null && lng.duration) total = lng.duration;
+    return [elapsed, total];
+  }
+  function refreshSeekCurrent() {
+    const [elapsed, total] = computeCurrentPosition();
+    $("seek-current").textContent =
+      (elapsed != null ? fmtDuration(elapsed) : "—")
+      + " / "
+      + (total ? fmtDuration(total) : "—");
+  }
+  /**
+   * After a successful seek, jump lastCastSync's anchor to the target
+   * so the displayed position reflects the new spot immediately. The
+   * SSE stream / periodic refresh will overwrite this within ~3s with
+   * the authoritative value from Lounge.
+   */
+  function nudgeLocalPosition(targetSeconds) {
+    if (!lastCastSync) return;
+    lastCastSync = {
+      ...lastCastSync,
+      currentTime: targetSeconds,
+      stampedAt: Date.now(),
+    };
+  }
+
+  $("btn-seek").addEventListener("click", openSeekModal);
+  $("btn-seek-close").addEventListener("click", closeSeekModal);
+  // Click outside the modal box closes (but clicks inside don't bubble).
+  seekModal.addEventListener("click", (e) => {
+    if (e.target === seekModal) closeSeekModal();
+  });
+  // Escape key closes.
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape" && !seekModal.hidden) closeSeekModal();
+  });
+  // Relative seek buttons. data-seek-by holds an integer offset (+/-).
+  for (const btn of seekModal.querySelectorAll("[data-seek-by]")) {
+    btn.addEventListener("click", async () => {
+      const by = Number(btn.getAttribute("data-seek-by"));
+      try {
+        const r = await api("/api/seek", { method: "POST", body: { by } });
+        // Optimistically advance our local position anchor so the
+        // displayed time jumps immediately, without waiting for the
+        // next Lounge push (which can lag a few seconds).
+        if (typeof r.target === "number") nudgeLocalPosition(r.target);
+        refreshSeekCurrent();
+      } catch (e) {
+        toast($("toast-seek"), e.message, "err");
+      }
+    });
+  }
+  async function submitSeekAbsolute() {
+    const to = $("seek-input").value.trim();
+    if (!to) return toast($("toast-seek"), "Enter a time.", "err");
+    try {
+      const r = await api("/api/seek", { method: "POST", body: { to } });
+      if (typeof r.target === "number") nudgeLocalPosition(r.target);
+      refreshSeekCurrent();
+      $("seek-input").value = "";
+    } catch (e) {
+      toast($("toast-seek"), e.message, "err");
+    }
+  }
+  $("btn-seek-go").addEventListener("click", submitSeekAbsolute);
+  $("seek-input").addEventListener("keydown", (e) => {
+    if (e.key === "Enter") submitSeekAbsolute();
+  });
+
+  $("btn-lounge-pair").addEventListener("click", async () => {
+    const code = $("lounge-code").value.trim();
+    if (!code) return toast($("toast-lounge"), "Enter the 12-digit code from SmartTube.", "err");
+    const btn = $("btn-lounge-pair"); btn.disabled = true;
+    try {
+      await api("/api/lounge/pair", { method: "POST", body: { code } });
+      toast($("toast-lounge"), "Lounge paired.", "ok");
+      $("lounge-code").value = "";
+      await refreshStatus();
+    } catch (e) {
+      toast($("toast-lounge"), e.message, "err");
+    } finally { btn.disabled = false; }
+  });
+
+  $("host").addEventListener("keydown", e => { if (e.key === "Enter") $("btn-pair-start").click(); });
+  $("code").addEventListener("keydown", e => { if (e.key === "Enter") $("btn-pair-finish").click(); });
+  $("url").addEventListener("keydown",  e => { if (e.key === "Enter") $("btn-add").click(); });
+  $("lounge-code").addEventListener("keydown", e => { if (e.key === "Enter") $("btn-lounge-pair").click(); });
+
+  refreshStatus();
+  // Lightweight status poll every 30s for TV power state (queue state comes via SSE)
+  setInterval(refreshStatus, 30000);
+})();
+</script>
+</body>
+</html>

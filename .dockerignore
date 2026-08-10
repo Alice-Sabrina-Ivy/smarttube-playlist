@@ -1,0 +1,40 @@
+# Keep the build context small and free of anything local-only.
+# Without this file, `docker build` uploads .git/, .venv/ and — critically —
+# data/, which holds the TV pairing certificate and Lounge auth token.
+
+.git
+.gitignore
+.gitattributes
+.github
+
+# Local-only dev material (see .gitignore).
+.claude
+.venv
+venv
+_keytest
+tools
+tests
+pytest.ini
+requirements-dev.txt
+CLAUDE.md
+
+# Runtime state — pairing certs and Lounge tokens live here.
+data
+*.pem
+config.json
+lounge.json
+
+__pycache__
+*.pyc
+*.pyo
+.pytest_cache
+htmlcov
+.coverage
+
+.vscode
+.idea
+.DS_Store
+
+# Not needed at runtime; the image serves index.html only.
+README.md
+docker-compose.yml
