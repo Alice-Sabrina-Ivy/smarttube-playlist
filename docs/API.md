@@ -26,8 +26,12 @@ POST   /api/pair/start     {host}         begin TV-remote pairing
 POST   /api/pair/finish    {code}         6-character code from the TV
 POST   /api/pair/cancel                   abort an in-progress pairing
 POST   /api/lounge/pair    {code}         12-digit code from SmartTube; 409 if already paired
+GET    /api/avr/brands                    receiver list for the setup UI, with a
+                                          `tested` flag per brand
 POST   /api/avr            {brand,host}   pick the AV receiver for volume. brand: denon |
-                                          marantz | none. Address must be private.
+                                          marantz | yamaha | onkyo | pioneer | sony |
+                                          none. Address must be private. Returns
+                                          `reachable` from a one-shot probe.
 ```
 
 ## Queue a video

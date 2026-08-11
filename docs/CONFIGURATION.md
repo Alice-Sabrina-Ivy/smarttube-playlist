@@ -36,7 +36,24 @@ services:
 
 On many TV devices the remote's volume buttons ride HDMI-CEC straight to the amplifier, so there's nothing for a LAN service to drive. The Google TV Streamer is one of these — it reports no usable volume range over the remote protocol at all. Some other Android TV hardware may respond to volume keycodes, but that path isn't implemented yet and nobody has tested it. Talking to the amplifier directly works regardless of the TV, which is what this does.
 
-**Denon and Marantz receivers** are supported today, and you set this up **in the web UI**, not here — during setup you're asked which receiver you have and for its address. Both brands speak the same legacy port-23 protocol, present on essentially every Denon and Marantz since the early 2010s.
+You set this up **in the web UI**, not here — during setup you're asked which receiver you have and for its address.
+
+| Brand | Protocol | Port | Tested on real hardware? |
+|---|---|---|---|
+| Denon, Marantz | Legacy Telnet | 23 | **Yes** |
+| Yamaha | YNCA | 50000 | No — 2010 or newer (RX-V, RX-A/Aventage, TSR, HTR) |
+| Onkyo, Integra | eISCP | 60128 | No — 2011 or newer |
+| Pioneer | eISCP | 60128 | No — **2016 or newer only** |
+| Sony | Audio Control API | 10000 | No — STR-DN1080, HT-series soundbars |
+
+Everything except Denon/Marantz was written from each manufacturer's protocol documentation and from the source of established open-source libraries, but has never been run against the real device. The commands are pinned byte-for-byte by unit tests, so they match the documentation — that is not the same as knowing they work. If you own one of these, please open an issue either way.
+
+Two things cause most false reports:
+
+- **Network standby must be enabled** on Yamaha, Onkyo and Sony, or the receiver won't answer while it's off.
+- **Yamaha allows only one control connection at a time.** If you also run Home Assistant's `yamaha_ynca` integration, it holds that connection permanently and this app cannot connect at all. The Yamaha phone app uses a different protocol and does not conflict.
+
+**Pioneer models older than 2016** use a different protocol on port 8102 and are deliberately not supported: the mute *query* command could not be verified, and shipping a guess would give you a mute button that half works.
 
 The choice is stored in `config.json` in the data volume, next to the TV pairing. Answering "I don't have one" is recorded too, so you're only asked once. To change it later, re-answer via `POST /api/avr` (see [API.md](API.md)) or clear everything with `RESET_PAIRING`.
 
@@ -44,7 +61,7 @@ The address must be on a private network: the service opens a socket to whatever
 
 Until a receiver is set up, the volume buttons stay hidden.
 
-Other AVR brands aren't supported yet — that's on the roadmap. If you'd like yours added, open an issue naming the model and how it takes network commands.
+Brands outside the table above aren't supported. NAD is the closest candidate and is queued; Rotel, Anthem, Cambridge Audio, Emotiva and Arcam were each looked at and set aside, because their relative volume or mute-query commands couldn't be verified from a reliable source and a guess is worse than an absence. If you'd like yours added, open an issue naming the model and how it accepts network commands.
 
 ## Behind a reverse proxy
 

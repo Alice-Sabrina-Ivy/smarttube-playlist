@@ -430,6 +430,12 @@
     background: rgba(255, 179, 0, 0.05);
     box-shadow: 0 0 8px rgba(255, 179, 0, 0.25);
   }
+  .avr-note {
+    margin: 0.5rem 0 0;
+    font-size: 0.8rem;
+    color: var(--phos-dim);
+  }
+  .avr-note.warn { color: var(--warn); }
   .controls button.muted:disabled {
     background: transparent;
     color: var(--phos-dim);
@@ -680,10 +686,9 @@
     <p class="card-sub">Optional. On many TV devices the remote's volume buttons talk straight to your amplifier over HDMI, so this app can't change the volume through the TV. If you have one of these receivers, it can control the amplifier directly instead.</p>
     <label for="avr-brand">Receiver</label>
     <select id="avr-brand">
-      <option value="denon">Denon</option>
-      <option value="marantz">Marantz</option>
       <option value="none">I don't have one / mine isn't listed</option>
     </select>
+    <p id="avr-note" class="card-sub avr-note" hidden></p>
     <div id="avr-host-row">
       <label for="avr-host">Receiver's IP address</label>
       <input id="avr-host" type="text" inputmode="decimal" autocomplete="off" placeholder="192.168.1.60">
@@ -753,6 +758,7 @@
     // have one", which is why this keys off avr_configured rather than
     // whether a backend exists. Otherwise it would nag forever.
     cards.avr.hidden = !!avrConfigured;
+    if (!cards.avr.hidden) loadAvrBrands();
   }
   function showCard(key) {
     Object.entries(cards).forEach(([k, el]) => el.hidden = (k !== key));
@@ -1542,9 +1548,57 @@
     if (e.key === "Enter") submitSeekAbsolute();
   });
 
-  // Hide the address field for "I don't have one" — nothing to type.
+  // The receiver list comes from the server so it can never drift from the
+  // backend registry — including which entries are marked untested.
+  let avrBrands = [];
+  async function loadAvrBrands() {
+    if (avrBrands.length) return;
+    try {
+      const data = await api("/api/avr/brands");
+      avrBrands = data.brands || [];
+    } catch (e) { return; }
+
+    const sel = $("avr-brand");
+    sel.textContent = "";
+    const tested = avrBrands.filter(b => b.tested);
+    const untested = avrBrands.filter(b => !b.tested);
+    const addGroup = (label, items) => {
+      if (!items.length) return;
+      const g = document.createElement("optgroup");
+      g.label = label;
+      for (const b of items) {
+        const o = document.createElement("option");
+        o.value = b.value;
+        o.textContent = b.note ? `${b.label} — ${b.note}` : b.label;
+        g.appendChild(o);
+      }
+      sel.appendChild(g);
+    };
+    addGroup("Tested on real hardware", tested);
+    addGroup("Untested — should work, please report", untested);
+    const none = document.createElement("option");
+    none.value = "none";
+    none.textContent = "I don't have one / mine isn't listed";
+    sel.appendChild(none);
+    syncAvrHostRow();
+  }
+
+  // Hide the address field for "I don't have one" — nothing to type — and
+  // show the honesty caveat for anything we've never run against real gear.
   function syncAvrHostRow() {
-    $("avr-host-row").hidden = $("avr-brand").value === "none";
+    const brand = $("avr-brand").value;
+    $("avr-host-row").hidden = brand === "none";
+    const spec = avrBrands.find(b => b.value === brand);
+    const note = $("avr-note");
+    if (spec && !spec.tested) {
+      note.hidden = false;
+      note.classList.remove("warn");
+      note.textContent = "Built from this manufacturer's protocol documentation "
+        + "but never tested on one. If the buttons do nothing, please open an "
+        + "issue and include your model.";
+    } else {
+      note.hidden = true;
+    }
   }
   $("avr-brand").addEventListener("change", syncAvrHostRow);
   syncAvrHostRow();
@@ -1557,10 +1611,19 @@
     }
     const btn = $("btn-avr-save"); btn.disabled = true;
     try {
-      await api("/api/avr", { method: "POST", body: { brand, host } });
-      toast($("toast-avr"),
-            brand === "none" ? "No problem — volume control stays off." : "Receiver saved.",
-            "ok");
+      const res = await api("/api/avr", { method: "POST", body: { brand, host } });
+      if (brand === "none") {
+        toast($("toast-avr"), "No problem — volume control stays off.", "ok");
+      } else if (res.reachable) {
+        // Deliberately precise: this proves the receiver answered, NOT that
+        // the volume commands are right for it. Different claims.
+        toast($("toast-avr"), `Saved — reached your receiver at ${host}.`, "ok");
+      } else {
+        toast($("toast-avr"),
+              `Saved, but nothing answered at ${host}. Check the address, and `
+              + `that the receiver's network standby is switched on.`,
+              "err");
+      }
       await refreshStatus();
     } catch (e) {
       toast($("toast-avr"), e.message, "err");

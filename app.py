@@ -33,7 +33,7 @@ from sse_starlette.sse import EventSourceResponse
 import httpx
 
 from events import Broadcaster
-from denon import DenonClient
+from avr import BACKENDS, AvrClient, brand_choices, build as build_avr
 from lounge import LoungeMonitor, LoungeObservation
 from metadata import Metadata, fetch_metadata
 from playlist import QueueController, QueueItem, make_item
@@ -173,8 +173,7 @@ IDLE_KEYCODE_DELAY = float(os.environ.get("IDLE_KEYCODE_DELAY", "0.6"))
 # speak the same legacy Telnet protocol on TCP port 23, so both map to
 # DenonClient. "none" is a real, recorded answer meaning "I don't have one" —
 # it dismisses the setup card instead of leaving it nagging forever.
-AVR_BACKENDS = {"denon": "denon", "marantz": "denon"}
-AVR_BRANDS = set(AVR_BACKENDS) | {"none"}
+AVR_BRANDS = set(BACKENDS) | {"none"}
 
 YT_REGEX = re.compile(r"(?:v=|youtu\.be/|/shorts/|/embed/|/live/)([A-Za-z0-9_-]{11})")
 ID_REGEX = re.compile(r"^[A-Za-z0-9_-]{11}$")
@@ -206,7 +205,9 @@ class State:
     # user has no receiver or hasn't answered yet). We don't probe the AVR at
     # boot — the user might power it on later, so we just hold the client and
     # let individual /api/volume calls succeed or fail on demand.
-    denon: Optional["DenonClient"] = None
+    avr: Optional["AvrClient"] = None
+    #: Brand key of the active backend, so /api/status can name it.
+    avr_brand: Optional[str] = None
     # True once the user has answered the AVR question at all, including
     # answering "I don't have one". Distinct from `denon is not None`, which
     # is False in both the "no receiver" and "not asked yet" cases — the UI
@@ -255,16 +256,19 @@ def _apply_avr_config(cfg: dict) -> None:
     avr = cfg.get("avr") or {}
     brand = str(avr.get("brand") or "").strip().lower()
     if brand not in AVR_BRANDS:
-        state.denon = None
+        state.avr = None
+        state.avr_brand = None
         state.avr_configured = False
         return
     state.avr_configured = True
     host = avr.get("host")
-    if AVR_BACKENDS.get(brand) == "denon" and host:
-        state.denon = DenonClient(host)
-        log.info("Volume backend enabled: %s at %s", brand, host)
-    else:
-        state.denon = None
+    # `port` is not exposed in the UI — each backend knows its own default —
+    # but an explicit one in config.json is honoured, which covers oddities
+    # like Sony portable speakers on 54480.
+    state.avr = build_avr(brand, host, avr.get("port")) if host else None
+    state.avr_brand = brand if state.avr is not None else None
+    if state.avr is not None:
+        log.info("Volume backend enabled: %s at %s:%d", brand, host, state.avr.port)
 
 
 def _is_lounge_paired() -> bool:
@@ -1389,7 +1393,13 @@ async def status():
         # null when no volume backend is configured; the string name of
         # the backend (currently only "denon") when one is active. The
         # frontend uses this to decide whether to render volume buttons.
-        "volume_backend": "denon" if state.denon is not None else None,
+        "volume_backend": state.avr_brand,
+        # False for backends built from protocol docs but never run against
+        # the real hardware — the UI shows a caveat rather than implying it
+        # is known-good.
+        "volume_backend_tested": bool(
+            state.avr_brand and BACKENDS[state.avr_brand].tested
+        ),
         "avr_configured": state.avr_configured,
     }
 
@@ -1562,6 +1572,16 @@ def _require_paired() -> None:
         raise HTTPException(503, "not paired — visit the web UI to pair")
 
 
+@app.get("/api/avr/brands")
+async def avr_brands():
+    """Receiver list for the setup card.
+
+    Served rather than hardcoded in the page so the dropdown can never drift
+    from the registry — including which entries are marked untested.
+    """
+    return {"brands": brand_choices()}
+
+
 @app.post("/api/avr")
 async def set_avr(req: AvrReq):
     """Record which AV receiver (if any) handles volume, from the setup flow.
@@ -1584,9 +1604,21 @@ async def set_avr(req: AvrReq):
     save_config(cfg)
     _apply_avr_config(cfg)
 
+    # Probe once so the UI can say whether anything actually answered. This
+    # proves the device is reachable, NOT that the command set is right for it
+    # — for the untested brands those are different claims. Never fatal: the
+    # receiver may simply be powered off.
+    reachable = None
+    if state.avr is not None:
+        try:
+            reachable = await state.avr.ping()
+        except Exception:
+            reachable = False
+
     return {
         "ok": True,
-        "volume_backend": "denon" if state.denon is not None else None,
+        "volume_backend": state.avr_brand,
+        "reachable": reachable,
     }
 
 
@@ -1769,20 +1801,20 @@ async def volume(action: str):
     us a direct LAN-side path that doesn't depend on the TV at all."""
     if action not in ("up", "down", "mute"):
         raise HTTPException(404, "unknown volume action — use up, down, or mute")
-    if state.denon is None:
+    if state.avr is None:
         raise HTTPException(
             503,
             "no AV receiver set up — choose one in the web UI to enable volume",
         )
     try:
         if action == "up":
-            await state.denon.volume_up()
+            await state.avr.volume_up()
         elif action == "down":
-            await state.denon.volume_down()
+            await state.avr.volume_down()
         elif action == "mute":
-            await state.denon.mute_toggle()
+            await state.avr.mute_toggle()
     except Exception:
-        log.warning("Denon %s command failed", action, exc_info=True)
+        log.warning("%s %s command failed", state.avr_brand, action, exc_info=True)
         raise HTTPException(502, "AVR command failed")
     return {"ok": True, "action": action}
 

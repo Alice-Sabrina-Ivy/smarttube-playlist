@@ -19,7 +19,7 @@ This works, and it's used daily on the setup it was built for. It is not finishe
 **What's supported today:**
 
 - **Google TV devices only**, including Chromecast with Google TV. That's the only hardware this has been developed and tested against. The Android TV Remote v2 protocol underneath is common to Android TV generally, so other boxes and sticks may well work — but nobody has verified it, and Fire TV runs Fire OS, which may not expose the Remote service at all. Tried one? Please [open an issue](https://github.com/Alice-Sabrina-Ivy/smarttube-playlist/issues) and say what happened, working or not.
-- **Volume control on Denon and Marantz receivers only**, via their legacy port-23 protocol.
+- **Volume control** on **Denon and Marantz** (tested), plus **Yamaha, Onkyo/Integra, Pioneer and Sony** built from each manufacturer's protocol documentation but **not tested on real hardware** — if you own one, please report whether it works.
 
 Where this is heading: see [Roadmap](#roadmap).
 
@@ -172,9 +172,11 @@ This is the same mechanism as "play on TV" in the YouTube mobile app; SmartTube 
 
 **3. Volume control** *(optional)*
 
-On many TV devices the remote's volume buttons talk straight to your amplifier over HDMI, so this app can't change the volume through the TV. If you have a **Denon** or **Marantz** receiver, pick it here and enter its IP address, and volume buttons appear in the page.
+On many TV devices the remote's volume buttons talk straight to your amplifier over HDMI, so this app can't change the volume through the TV. Pick your receiver here and enter its IP address, and volume buttons appear in the page.
 
-No receiver, or yours isn't listed? Choose **"I don't have one"** — the card goes away and you're not asked again. Other brands are on the [Roadmap](#roadmap).
+The list separates receivers **tested on real hardware** (Denon, Marantz) from ones **built from the manufacturer's protocol documentation but never tested** (Yamaha, Onkyo/Integra, Pioneer, Sony). Saving tells you whether the receiver actually answered.
+
+No receiver, or yours isn't listed? Choose **"I don't have one"** — the card goes away and you're not asked again.
 
 **4. Done.** Paste a YouTube URL, hit **Add to queue**.
 
@@ -304,7 +306,7 @@ The README covers getting it running. Everything else lives here:
 Rough order, no dates — this is a spare-time project.
 
 - **Verified support for other streaming sticks and boxes** — Nvidia Shield, onn./Xiaomi, and possibly Fire TV. Some may already work; none are tested.
-- **More AVR brands** for volume control — Yamaha, Onkyo, Sony and friends.
+- **Confirming the untested receiver brands** — Yamaha, Onkyo/Integra, Pioneer and Sony are implemented but nobody has run them against real hardware. Reports welcome. NAD is the next brand queued.
 
 Got one of the untested devices? Reports either way are genuinely useful — [open an issue](https://github.com/Alice-Sabrina-Ivy/smarttube-playlist/issues).
 
