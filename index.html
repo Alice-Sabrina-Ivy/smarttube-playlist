@@ -1245,7 +1245,11 @@
     const hasPlayback = hasCurrent || loungeActive;
     $("btn-pause").disabled = !hasPlayback || isPaused;
     $("btn-play").disabled = !(isPaused || (!hasCurrent && hasQueue));
-    $("btn-skip").disabled = !(hasCurrent || hasQueue);
+    // hasPlayback, not hasCurrent: the now-playing card renders from the
+    // Lounge observation too (a video started on the TV, or one we ceded via
+    // the external-switch logic), and Skip must be live whenever that card is
+    // showing. Gating on hasCurrent left a populated card next to a dead Skip.
+    $("btn-skip").disabled = !(hasPlayback || hasQueue);
     $("btn-clear").disabled = !hasQueue;
     // Seek needs something playing AND a connected Lounge (the seek
     // primitive comes from Lounge.seek_to). Use hasPlayback as a

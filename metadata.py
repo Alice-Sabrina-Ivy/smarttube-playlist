@@ -22,7 +22,11 @@ import httpx
 log = logging.getLogger("smarttube-playlist.metadata")
 
 DEFAULT_DURATION_S = int(os.environ.get("DEFAULT_DURATION_S", "600"))
-FETCH_TIMEOUT_S = float(os.environ.get("METADATA_TIMEOUT_S", "5.0"))
+# The watch page is 1.1-1.6 MiB and its size varies run to run, so this needs
+# real headroom — a NAS on a slow link routinely needs more than a few seconds.
+# Overrunning it isn't a cosmetic failure: the fallback duration feeds the
+# auto-advance timer, so a timed-out scrape cuts long videos short.
+FETCH_TIMEOUT_S = float(os.environ.get("METADATA_TIMEOUT_S", "15.0"))
 
 # A recent desktop Chrome UA. YouTube serves a different (lighter) page to
 # obviously-bot UAs, sometimes without ytInitialPlayerResponse.
@@ -214,7 +218,9 @@ async def find_video_id_by_title(
         )
     try:
         try:
-            resp = await client.get(url, headers=headers, params=params)
+            resp = await client.get(
+                url, headers=headers, params=params, timeout=FETCH_TIMEOUT_S,
+            )
             resp.raise_for_status()
         except httpx.HTTPError as e:
             log.warning("YouTube search failed for %r: %s", title, e)
@@ -277,7 +283,12 @@ async def fetch_metadata(
         )
     try:
         try:
-            resp = await client.get(url, headers=headers)
+            # Pass the timeout per-request rather than relying on the client's
+            # own. Callers share one long-lived AsyncClient (app.py builds it
+            # with a much tighter default), and without this override that
+            # client's timeout silently wins and METADATA_TIMEOUT_S does
+            # nothing on the only path the app actually takes.
+            resp = await client.get(url, headers=headers, timeout=FETCH_TIMEOUT_S)
             resp.raise_for_status()
             return parse_metadata(video_id, resp.text)
         except httpx.HTTPError as e:

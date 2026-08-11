@@ -35,6 +35,20 @@ services:
       # All optional. Defaults suit most setups.
       # ---------------------------------------------------------------
 
+      # --- Re-pairing ---
+      # Set to "1" and restart to clear the TV certificate and Lounge token,
+      # returning to the setup screen. Fires ONCE: a container can't unset its
+      # own env var, so a marker file in /data stops it wiping your new pairing
+      # on every subsequent reboot. Take this back out once you've re-paired.
+      # RESET_PAIRING: "1"
+
+      # --- Reverse proxies ---
+      # Comma-separated hostnames to accept in the Host header. Only needed if
+      # you reach the service through a real DOMAIN NAME; bare IPs, single-label
+      # names ("mynas") and .local addresses already work. Requests with any
+      # other Host are refused, which is what blocks DNS rebinding.
+      # ALLOWED_HOSTS: "tv.example.com"
+
       # CLIENT_NAME: "SmartTube Playlist"            # name shown on the TV during pairing
       # SMARTTUBE_PACKAGE: "org.smarttube.stable"    # use org.smarttube.beta for the beta build
       # LOG_LEVEL: "INFO"                            # DEBUG when diagnosing a problem
@@ -77,7 +91,10 @@ services:
 
       # --- Metadata scraping ---
       # DEFAULT_DURATION_S: "600"                    # assumed length when the scrape fails
-      # METADATA_TIMEOUT_S: "5.0"                    # YouTube watch-page fetch timeout
+      # METADATA_TIMEOUT_S: "15.0"                   # YouTube watch-page fetch timeout. The page is
+      #                                              # 1.1-1.6 MiB; too low and the scrape fails, which
+      #                                              # shows the video ID as the title and assumes a
+      #                                              # 10-minute length for the auto-advance timer.
 
       # --- Optional volume control via a Denon/Marantz AVR ---
       # Google TV devices don't expose usable volume over the remote protocol

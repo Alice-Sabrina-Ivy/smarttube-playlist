@@ -6,6 +6,8 @@ No Home Assistant. No ADB. No Google Cast. No accounts, no sign-in, no cloud ser
 
 > **Not affiliated with Google, YouTube, or the SmartTube project.** This is an independent hobby project that talks to software you already run.
 
+![The SmartTube Playlist web UI: a "Now playing" card showing the current video's thumbnail, title, channel, progress bar and elapsed/remaining time, with play, pause, skip, clear and seek controls; below it a field for pasting a YouTube URL, the upcoming queue, and a status panel showing the connected TV, its power state and playback sync](docs/screenshot.png)
+
 ---
 
 ## Project status — work in progress
@@ -136,7 +138,7 @@ The image is multi-arch — `linux/amd64` and `linux/arm64` both work, so Pi and
 #### Notes for this path
 
 - **Data lives in `./data`** next to the compose file: pairing certificate, TV address, Lounge token. Back it up and you never re-pair. It's created on first run and chowned to UID 1000 by the entrypoint, which runs as root just long enough to do that and then drops privileges via `gosu`.
-- **Port binding.** `38420:8000` binds all interfaces. On a LAN-only box that's the point. If the host has anything internet-facing, pin it: `"192.168.1.50:38420:8000"`. There is no authentication — see [Security](#security).
+- **Port binding.** `38420:8000` binds all interfaces. On a LAN-only box that's the point. If the host has anything internet-facing, pin it: `"192.168.1.50:38420:8000"`. There is no authentication — see [SECURITY.md](SECURITY.md).
 - **Reverse proxy.** If you front it with Caddy/nginx/Traefik, pass through `text/event-stream` unbuffered or the live-updating UI will stall. In nginx that means `proxy_buffering off;` and `proxy_read_timeout` well above the default on `/api/events`.
 
 #### Deploying with Portainer
@@ -204,68 +206,40 @@ If your TV is asleep, adding a video wakes it, waits for it to boot, foregrounds
 
 ## Honest limitations
 
-The service talks to the TV over two channels:
+Worth knowing before you commit:
 
-1. **Android TV Remote v2** (port 6466) — waking the TV, foregrounding SmartTube, watching which app is in front. Always required.
-2. **YouTube Lounge** (HTTPS to youtube.com) — pushing videos, reading real playback position, pause/play. Optional but strongly recommended.
+- **Pair Lounge if you can.** Without it, auto-advance runs on a duration estimate that any pause or seek on the TV puts out of sync.
+- **Livestreams never auto-advance.** No fixed duration, so the queue sits on one until you skip. Marked with a `● LIVE` badge.
+- **Leaving SmartTube stops the queue.** Open Netflix or press Home and it stops sending videos. Nothing is lost — go back to SmartTube and press Skip.
+- **The queue is in-memory.** Restart the container and it's empty. Your pairing is saved; the queue deliberately isn't.
+- **One Lounge session per YouTube account.** Another signed-in TV or Chromecast on the same account can override what you sent.
+- **No history, no accounts.** By design — it's a shared room, not a personal library.
 
-Things worth knowing before you commit:
-
-- **With Lounge paired:** auto-advance fires on the actual end of the video, the progress bar shows real position, and pausing on the TV remote is mirrored in the web UI within a second or two.
-- **Without Lounge:** auto-advance runs off a duration estimate scraped from the YouTube page. Any pause or seek on the TV puts it out of sync. Pause/play fall back to the remote's `MEDIA_PAUSE`/`MEDIA_PLAY` keys.
-- **Livestreams never auto-advance.** They have no fixed duration, so the queue sits on them until you skip manually. The UI marks them with a `● LIVE` badge.
-- **Leaving SmartTube stops the queue.** Open Netflix or hit Home and the queue stops sending videos. Nothing is lost — go back to SmartTube and press Skip to pick up again.
-- **The queue is in-memory.** Restart the container and it's empty. Pairing is persisted; the queue deliberately isn't.
-- **One Lounge session per YouTube account.** If another signed-in TV or Chromecast on the same account starts something, it can override what we sent.
-- **No history and no accounts.** By design — it's a shared room, not a personal library.
-- **Why not Cast?** Earlier versions used pychromecast. On current Google TV firmware any unauthenticated cast client makes the TV launch its Default Media Receiver (the blue cast screen), interrupting whatever's playing. The Google Home app dodges this with account auth that third-party tools can't replicate. Lounge never triggers a cast UI.
+For the two-protocol design, why Google Cast wasn't used, and how playback is actually driven, see [How it works](docs/ARCHITECTURE.md).
 
 ---
 
-## Security
+## Security in one paragraph
 
-**The web UI has no authentication. Anyone who can reach the page can control your TV.** On a home LAN that's the whole point — guests shouldn't need an account to queue a song.
+**The web UI has no authentication. Anyone who can reach the page can control your TV.** That's the point on a home network — guests shouldn't need an account to queue a song. So keep it on your LAN, and **don't port-forward it**. If you want access from outside, put it behind your existing reverse-proxy auth.
 
-What that means in practice:
-
-- **Don't port-forward it.** No auth means anyone on the internet could take over your TV. If you want remote access, put it behind your existing reverse-proxy auth (Authelia, Tailscale, basic auth — anything).
-- **Pin the bind interface** if the host has any internet-routable address. See the `ports:` comment in `docker-compose.yml`.
-- **Guest Wi-Fi counts as "reachable."** If your guest network can route to your main LAN, guests can reach this. That is usually what you want here, but decide deliberately.
-- **Re-pairing needs filesystem access, on purpose.** There's no unpair or reset endpoint, so nobody on the LAN can wipe your pairing as a prank or a denial of service. To re-pair, delete `cert.pem`, `key.pem`, and `config.json` (TV remote) or `lounge.json` (Lounge) from the `data` folder and restart.
-- **Cross-origin POSTs are blocked** by a CSRF check, so a random website you visit can't quietly drive your TV in the background. Non-browser clients (curl, webhooks) are unaffected.
-- **Requests are rate-limited per IP** (10s between submissions by default) so one person can't flood the queue.
+Cross-site requests and DNS rebinding are both blocked, pairing can't be hijacked or wiped remotely, and submissions are rate-limited per IP. The threat model, reverse-proxy setup and how to reset a pairing are all in **[SECURITY.md](SECURITY.md)**.
 
 ---
 
 ## Configuration
 
-All optional, all set as environment variables in `docker-compose.yml`. Defaults are sensible; most people change none of these.
+Everything is optional — the defaults work, and most people change nothing. The ones people actually touch:
 
 | Variable | Default | What it does |
 |---|---|---|
-| `CLIENT_NAME` | `SmartTube Playlist` | Name shown on the TV during pairing |
 | `SMARTTUBE_PACKAGE` | `org.smarttube.stable` | Set to `org.smarttube.beta` for the beta build |
-| `LOG_LEVEL` | `INFO` | Set `DEBUG` when diagnosing something |
-| `RATE_LIMIT_SECONDS` | `10` | Per-IP cool-down between queue submissions |
-| `WAKE_DELAY` | `15.0` | Minimum seconds to wait after `POWER` before launching. A floor, not a timeout — instant-on TVs report "on" in ~1s while still booting |
-| `WAKE_TIMEOUT` | `30.0` | Give up waiting for the TV to report on |
-| `WAKE_POLL` | `0.5` | How often to re-check while waking |
-| `SCREENSAVER_PACKAGES` | `com.google.android.apps.tv.dreamx,com.google.android.backdrop` | Packages treated as screensavers; these swallow launch intents, so they get dismissed first |
-| `SCREENSAVER_DISMISS_KEY` | `HOME` | Key that dismisses the screensaver. `BACK` also works. `DPAD_CENTER` and `WAKEUP` are **not** supported — the remote protocol drops them silently |
-| `IDLE_KEYCODE` | `HOME,BACK` | Keys sent when Skip empties the queue; lands on the ambient screensaver. `POWER` turns the display off, `HOME` stops at the launcher, empty disables it |
-| `IDLE_KEYCODE_DELAY` | `0.6` | Seconds between those keys |
-| `DEFAULT_DURATION_S` | `600` | Assumed length when the metadata scrape fails |
-| `METADATA_TIMEOUT_S` | `5.0` | YouTube watch-page fetch timeout |
-| `DENON_HOST` | (unset) | Denon/Marantz AVR IP. Set it and volume buttons appear in the UI |
-| `DATA_DIR` | `/data` | Where pairing state is stored inside the container. Change the volume mount instead |
+| `DENON_HOST` | (unset) | Denon/Marantz AVR IP — set it and volume buttons appear |
+| `WAKE_DELAY` | `15.0` | Raise it if the TV wakes but the video doesn't start |
+| `LOG_LEVEL` | `INFO` | Set `DEBUG` when something's wrong |
+| `RESET_PAIRING` | (unset) | Set to `1` and restart to clear pairing and start over |
 
-### Volume control
-
-Google TV devices don't expose usable volume over the remote protocol — the physical remote's volume buttons ride HDMI-CEC straight to your amp, which a LAN service can't imitate. The way around that is to talk to the amp directly.
-
-**Denon and Marantz receivers** are supported today: set `DENON_HOST` to the receiver's IP and the UI grows volume up/down/mute buttons that speak its legacy port-23 protocol (present on essentially every Denon since the early 2010s). Without it, the volume buttons stay hidden.
-
-Other AVR brands aren't supported yet — that's on the roadmap. If you'd like yours added, open an issue naming the model and how it takes network commands.
+Every setting, volume control and reverse-proxy notes: **[docs/CONFIGURATION.md](docs/CONFIGURATION.md)**.
 
 ---
 
@@ -275,7 +249,7 @@ Other AVR brands aren't supported yet — that's on the roadmap. If you'd like y
 
 **Pairing fails immediately.** Confirm the TV is on the same network and ports 6466/6467 are reachable. Some Google TV devices have the Remote Service enabled but firewalled until a power cycle.
 
-**`InvalidAuth` on startup.** The pairing certificate was rejected — the TV revoked it, or the files got out of sync. Delete `cert.pem`, `key.pem`, and `config.json` from the `data` folder, restart, and pair again.
+**`InvalidAuth` on startup.** The pairing certificate was rejected — the TV revoked it, or the files got out of sync. Set `RESET_PAIRING: "1"` in `docker-compose.yml`, restart, pair again, then take the flag back out.
 
 **HTTP 500 with `PermissionError: '/data/cert.pem'`.** The data directory isn't writable by the container's user. The entrypoint chowns it to UID 1000 at startup, so this normally self-heals — unless you added a `user:` line to `docker-compose.yml`, which prevents the chown. Either remove that line or pre-create the directory with the right owner: `sudo chown -R 1000:1000 ./data`.
 
@@ -299,53 +273,16 @@ On Docker Desktop you can also click the container and open the **Logs** tab.
 
 ---
 
-## API
+## More documentation
 
-Everything the web UI does is a plain HTTP call, so webhooks and Home Assistant automations can drive it too.
+The README covers getting it running. Everything else lives here:
 
-```
-GET    /api/status                        connection state, TV power, pairing status
-GET    /api/queue                         full queue state as JSON
-POST   /api/queue          {url|video_id} add a video (rate-limited)
-DELETE /api/queue/{id}                    remove a queued item
-POST   /api/queue/{id}/move/{up|down}     reorder a queued item one slot
-POST   /api/skip                          next video, or screensaver if empty
-POST   /api/pause                         pause playback and freeze auto-advance
-POST   /api/resume                        resume
-POST   /api/clear                         empty the queue, leave current playing
-POST   /api/seek           {to|by}        `to`: "1:23" / "90s" / "1h30m"; `by`: ±seconds
-POST   /api/volume/{up|down|mute}         requires DENON_HOST; 503 otherwise
-GET    /api/events                        SSE stream of queue snapshots
-POST   /api/play           {url|video_id} legacy: clear queue and replace current
-GET    /healthz                           liveness probe
-
-POST   /api/pair/start     {host}         begin TV-remote pairing
-POST   /api/pair/finish    {code}         6-character code from the TV
-POST   /api/pair/cancel                   abort an in-progress pairing
-POST   /api/lounge/pair    {code}         12-digit code from SmartTube
-```
-
-Every SSE event carries a complete snapshot under `state`, plus a `type` naming the transition. Clients replace their whole view from each message — there's no diffing to implement.
-
-Queue a video from anywhere on the LAN:
-
-```bash
-curl -X POST http://<host>:38420/api/queue \
-  -H 'Content-Type: application/json' \
-  -d '{"url": "https://www.youtube.com/watch?v=dQw4w9WgXcQ"}'
-```
-
----
-
-## How it works
-
-1. A persistent TLS connection to the TV on port 6466 (Android TV Remote v2) handles waking, launching, and app-foreground observation. When Lounge is paired, an HTTPS session to YouTube's Lounge endpoint runs alongside it.
-2. Queuing a video fetches its YouTube watch page server-side and pulls title, channel, duration, and livestream status out of the embedded `ytInitialPlayerResponse` JSON.
-3. Starting a video: if the TV is off, send `POWER` and wait for it to come up. If a screensaver is in front, dismiss it. If SmartTube isn't foreground, launch it via `market://launch`. Then send **exactly one** play signal — `setPlaylist` over Lounge when it's connected, otherwise a `vnd.youtube.launch://` deep link through the remote. Sending both makes SmartTube load the video twice, audibly.
-4. Lounge pushes state changes (now playing, position, play/pause, end of video). Those drive auto-advance, mirror pause state into the UI, and feed the progress bar.
-5. Without Lounge, an `asyncio` timer sized to the scraped duration drives auto-advance instead.
-6. If the foreground app changes away from SmartTube, the queue stops sending videos.
-7. Every queue mutation is broadcast as a full snapshot to all connected SSE clients.
+| | |
+|---|---|
+| **[SECURITY.md](SECURITY.md)** | Threat model, what the no-auth design means, DNS-rebinding and CSRF protection, reverse proxies, resetting a pairing |
+| **[docs/CONFIGURATION.md](docs/CONFIGURATION.md)** | Every environment variable, volume control, timezones |
+| **[docs/API.md](docs/API.md)** | HTTP endpoints and the SSE stream, for webhooks and Home Assistant |
+| **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)** | How it works internally, module layout, running from source, contributing |
 
 ---
 
@@ -357,35 +294,6 @@ Rough order, no dates — this is a spare-time project.
 - **More AVR brands** for volume control — Yamaha, Onkyo, Sony and friends.
 
 Got one of the untested devices? Reports either way are genuinely useful — open an issue.
-
----
-
-## Development
-
-Running it directly, without Docker:
-
-```bash
-python -m venv .venv
-.venv/bin/pip install -r requirements.txt      # Windows: .venv\Scripts\pip
-DATA_DIR=./data .venv/bin/python -m uvicorn app:app --port 8000 --reload
-```
-
-Python 3.12. The frontend is a single `index.html` — vanilla HTML/CSS/JS, no build step, no bundler. Edit and reload.
-
-Module layout:
-
-| File | Responsibility |
-|---|---|
-| `app.py` | FastAPI app, HTTP endpoints, TV launch sequence, Lounge bridge |
-| `playlist.py` | Queue state machine (named to avoid shadowing stdlib `queue`) |
-| `lounge.py` | YouTube Lounge client wrapper and playback observation |
-| `metadata.py` | YouTube watch-page scraper |
-| `events.py` | SSE fan-out to connected browsers |
-| `ratelimit.py` | Per-IP rate limiting |
-| `denon.py` | Denon/Marantz AVR volume backend |
-| `index.html` | The entire frontend |
-
-Bug reports are welcome, especially with logs at `LOG_LEVEL=DEBUG`. This is a personal project maintained in spare time — issues and PRs may sit for a while.
 
 ---
 

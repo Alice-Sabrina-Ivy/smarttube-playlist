@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import ipaddress
 import json
 import logging
 import os
@@ -44,11 +45,34 @@ from ratelimit import RateLimiter
 # them in local time. Nothing user-facing depends on this — every timestamp we
 # serialise is UTC with an explicit offset, so each browser renders times in its
 # own local zone regardless of what the container clock is set to.
+_VALID_LOG_LEVELS = frozenset(
+    ("CRITICAL", "FATAL", "ERROR", "WARN", "WARNING", "INFO", "DEBUG", "NOTSET")
+)
+
+
+def _resolve_log_level(raw: Optional[str]) -> str:
+    """Normalise LOG_LEVEL, falling back to INFO on anything unrecognised.
+
+    logging.basicConfig raises ValueError on an unknown level name, and its
+    table is uppercase-only — so a perfectly reasonable `LOG_LEVEL=debug`
+    used to kill the process at import, before any handler existed to report
+    why. A misconfigured log level must never be fatal.
+    """
+    level = (raw or "").strip().upper()
+    return level if level in _VALID_LOG_LEVELS else "INFO"
+
+
+_RAW_LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO")
+_LOG_LEVEL = _resolve_log_level(_RAW_LOG_LEVEL)
 logging.basicConfig(
-    level=os.environ.get("LOG_LEVEL", "INFO"),
+    level=_LOG_LEVEL,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
 log = logging.getLogger("smarttube-playlist")
+if _resolve_log_level(_RAW_LOG_LEVEL) != (_RAW_LOG_LEVEL or "").strip().upper():
+    log.warning(
+        "LOG_LEVEL=%r is not a recognised level; using INFO", _RAW_LOG_LEVEL
+    )
 
 DATA_DIR = Path(os.environ.get("DATA_DIR", "/data"))
 DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -56,6 +80,26 @@ CERT_FILE = DATA_DIR / "cert.pem"
 KEY_FILE = DATA_DIR / "key.pem"
 CONFIG_FILE = DATA_DIR / "config.json"
 LOUNGE_AUTH_FILE = DATA_DIR / "lounge.json"
+
+# Operator escape hatch for re-pairing. There is deliberately no HTTP endpoint
+# that clears credentials — that would hand any LAN client a one-shot denial of
+# service — so resetting requires access to the container's configuration.
+RESET_PAIRING = os.environ.get("RESET_PAIRING", "").strip().lower() in (
+    "1", "true", "yes", "on",
+)
+# A container cannot rewrite its own environment, so RESET_PAIRING stays set
+# across restarts. Without this marker the flag would wipe the pairing on every
+# single boot, which is a worse outage than the hole it closes. The marker makes
+# the reset one-shot; clearing the flag deletes it and re-arms the mechanism.
+RESET_MARKER = DATA_DIR / ".reset_done"
+
+# Extra Host values to trust, comma-separated — for reverse-proxy setups that
+# terminate on a real domain name. See _host_header_is_trusted.
+ALLOWED_HOSTS = frozenset(
+    h.strip().lower()
+    for h in os.environ.get("ALLOWED_HOSTS", "").split(",")
+    if h.strip()
+)
 
 CLIENT_NAME = os.environ.get("CLIENT_NAME", "SmartTube Playlist")
 SMARTTUBE_PACKAGE = os.environ.get("SMARTTUBE_PACKAGE", "org.smarttube.stable")
@@ -166,6 +210,57 @@ def _is_tv_paired() -> bool:
     /api/pair/start so a hostile LAN client can't wipe the cert by
     re-triggering the pairing flow on a paired service."""
     return CERT_FILE.exists() and KEY_FILE.exists() and CONFIG_FILE.exists()
+
+
+def _is_lounge_paired() -> bool:
+    """True if a Lounge token exists on disk. Gates /api/lounge/pair so a LAN
+    client can't overwrite a working token and hijack playback control."""
+    return LOUNGE_AUTH_FILE.exists()
+
+
+def _apply_reset_if_requested() -> None:
+    """Honour RESET_PAIRING at startup, exactly once per time it's set.
+
+    Runs before anything reads the data dir, so the service comes up unpaired
+    and lands the user on the setup screen.
+    """
+    if not RESET_PAIRING:
+        # Flag cleared — re-arm so the next RESET_PAIRING=1 boot fires.
+        with contextlib.suppress(OSError):
+            RESET_MARKER.unlink(missing_ok=True)
+        return
+
+    if RESET_MARKER.exists():
+        log.warning(
+            "RESET_PAIRING is still set but the reset has already run. "
+            "Remove RESET_PAIRING from the container's environment and "
+            "restart. Ignoring so your new pairing survives."
+        )
+        return
+
+    removed = []
+    for f in (CERT_FILE, KEY_FILE, CONFIG_FILE, LOUNGE_AUTH_FILE):
+        try:
+            if f.exists():
+                f.unlink()
+                removed.append(f.name)
+        except OSError:
+            log.exception("RESET_PAIRING: could not remove %s", f.name)
+
+    try:
+        RESET_MARKER.write_text(
+            "RESET_PAIRING already ran. Clear RESET_PAIRING (or delete this "
+            "file) to arm it again.\n"
+        )
+        _secure_data_file(RESET_MARKER)
+    except OSError:
+        log.exception("RESET_PAIRING: could not write the one-shot marker")
+
+    log.warning(
+        "RESET_PAIRING set — cleared %s. Set RESET_PAIRING=0 (or remove it) "
+        "and restart, then re-pair from the web UI.",
+        ", ".join(removed) if removed else "nothing (already unpaired)",
+    )
 
 
 def _secure_data_file(path: Path) -> None:
@@ -1049,6 +1144,10 @@ async def lifespan(_app: FastAPI):
         play_button_callable=_lounge_play,
     )
 
+    # Before anything reads the data dir, so a requested reset lands the user
+    # on the setup screen rather than half-connecting with stale credentials.
+    _apply_reset_if_requested()
+
     # One-time cleanup for users upgrading from a version that didn't
     # restrict perms on persisted secrets.
     for f in (CERT_FILE, KEY_FILE, CONFIG_FILE, LOUNGE_AUTH_FILE):
@@ -1109,20 +1208,65 @@ async def lifespan(_app: FastAPI):
 app = FastAPI(title="SmartTube Playlist", lifespan=lifespan)
 
 
+_PRIVATE_HOST_SUFFIXES = (".local", ".localhost", ".internal", ".home.arpa")
+
+
+def _host_header_is_trusted(hostname: Optional[str]) -> bool:
+    """True if this Host header could plausibly be our own LAN identity.
+
+    Anchors the CSRF check against something the caller can't mint. Comparing
+    Origin to Host alone is worthless — both come from the client, so a
+    DNS-rebinding attacker simply sends a matching pair: their page at
+    `evil.com` re-resolves to the LAN IP, the browser dutifully sends
+    `Origin: http://evil.com` and `Host: evil.com`, they agree, and the
+    request sails through with full control of the TV.
+
+    Rebinding needs a *registrable domain*, which always contains a dot. So we
+    accept bare IPs (the normal way anyone reaches a LAN service), single-label
+    names like `mynas` (not publicly registrable, so not a rebinding vector),
+    and non-public suffixes such as `.local`. Anything else — a real domain —
+    must be opted into via ALLOWED_HOSTS.
+    """
+    h = (hostname or "").strip().lower()
+    if not h:
+        return False
+    if h in ALLOWED_HOSTS:
+        return True
+    try:
+        ipaddress.ip_address(h)
+        return True
+    except ValueError:
+        pass
+    if "." not in h:
+        return True
+    return h.endswith(_PRIVATE_HOST_SUFFIXES)
+
+
 @app.middleware("http")
 async def csrf_origin_check(request: Request, call_next):
     """Same-origin guard for state-mutating requests.
 
-    Browsers send the `Origin` header on cross-origin POSTs (and on
-    same-origin POSTs from `fetch`). If the value is present and doesn't
-    match the request's own host, reject — this is a cross-site attempt.
-    Non-browser clients (curl, scripts, home-automation webhooks) don't
-    send Origin, and those requests are allowed through unchanged.
+    Two layers, because either alone is insufficient:
+
+    1. The `Host` header must look like our own LAN identity
+       (_host_header_is_trusted). This is what actually stops DNS rebinding;
+       without it the Origin comparison below is self-referential and proves
+       nothing.
+    2. If `Origin` is present it must match the request's own origin — the
+       classic cross-site check. Non-browser clients (curl, scripts,
+       home-automation webhooks) don't send Origin and pass through.
 
     No-op on safe methods (GET/HEAD/OPTIONS) — those can't cause state
     changes by themselves.
     """
     if request.method not in ("GET", "HEAD", "OPTIONS"):
+        if not _host_header_is_trusted(request.url.hostname):
+            log.warning(
+                "blocked %s %s with untrusted Host=%r — if you reach this "
+                "service by a domain name, add it to ALLOWED_HOSTS",
+                request.method, request.url.path, request.url.hostname,
+            )
+            return Response("untrusted Host header", status_code=403)
         origin = request.headers.get("origin")
         if origin:
             expected = f"{request.url.scheme}://{request.url.netloc}"
@@ -1318,7 +1462,18 @@ class LoungePairReq(BaseModel):
 async def lounge_pair(req: LoungePairReq):
     """Pair with SmartTube via a 12-digit YouTube Lounge code (shown by
     SmartTube's "Link with TV code" screen). Persists the resulting auth
-    token to /data/lounge.json and starts the Lounge monitor."""
+    token to /data/lounge.json and starts the Lounge monitor.
+
+    Refuses once a token exists, mirroring the pair_start guard: otherwise any
+    LAN client could overwrite a working token, taking over playback control
+    and silently breaking the real owner's session. Re-pair via RESET_PAIRING.
+    """
+    if _is_lounge_paired():
+        raise HTTPException(
+            409,
+            "already paired with YouTube Lounge — set RESET_PAIRING=1 and "
+            "restart the container to re-pair",
+        )
     try:
         auth = await LoungeMonitor.pair_with_code(CLIENT_NAME, req.code)
     except ValueError:
@@ -1391,13 +1546,27 @@ async def skip():
     skip past the last item is a clear signal the user is done, so put
     the TV into the ambient screensaver."""
     _require_paired()
-    had_current = queue_controller.state.current is not None
+    # Something is playing if our queue owns it OR Lounge actively reports it.
+    # The second clause matters: a video started from the TV remote, or one our
+    # queue ceded via the external-switch logic, leaves state.current None while
+    # the UI still renders a "Now playing" card off the Lounge observation.
+    # Gating solely on state.current made Skip a silent no-op in exactly that
+    # state. `Playing` specifically — a cached Paused/Stopped observation is a
+    # stale ghost, not playback, and must not trigger the idle sequence.
+    lng = queue_controller.state.lounge or {}
+    lounge_playing = bool(
+        lng.get("available")
+        and lng.get("video_id")
+        and lng.get("current_time") is not None
+        and lng.get("state") == "Playing"
+    )
+    had_playback = queue_controller.state.current is not None or lounge_playing
     await queue_controller.skip()
     queue_now_idle = (
         queue_controller.state.current is None
         and not queue_controller.state.queue
     )
-    if had_current and queue_now_idle and state.remote and IDLE_KEYCODE:
+    if had_playback and queue_now_idle and state.remote and IDLE_KEYCODE:
         keycodes = [k.strip() for k in IDLE_KEYCODE.split(",") if k.strip()]
         for i, kc in enumerate(keycodes):
             if i > 0:

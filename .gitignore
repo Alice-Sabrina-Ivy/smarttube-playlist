@@ -23,3 +23,6 @@ htmlcov/
 # Editor / IDE
 .vscode/
 .idea/
+
+# Local dev-server state (pairing cert + Lounge token for tests/screenshot_harness.py)
+data-dev/
