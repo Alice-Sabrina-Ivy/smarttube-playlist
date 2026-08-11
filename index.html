@@ -152,6 +152,39 @@
     border-color: var(--phos);
     box-shadow: 0 0 0 1px var(--phos), 0 0 12px rgba(255,179,0,0.25);
   }
+  /* Native selects render in OS chrome (white on Windows), which looks
+     pasted-on against the phosphor theme. appearance:none strips that; the
+     chevron is an inline SVG data URI because a select can't carry ::after. */
+  select {
+    width: 100%;
+    appearance: none;
+    -webkit-appearance: none;
+    background-color: var(--ink);
+    background-image: url("data:image/svg+xml;charset=UTF-8,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 12 8'%3E%3Cpath d='M1 1l5 5 5-5' fill='none' stroke='%23b87a00' stroke-width='1.5'/%3E%3C/svg%3E");
+    background-repeat: no-repeat;
+    background-position: right 0.85rem center;
+    background-size: 0.75rem;
+    border: 1px solid var(--phos-dim);
+    color: var(--phos-bright);
+    font-family: "IBM Plex Mono", monospace;
+    font-size: 16px; /* >=16px so iOS Safari doesn't auto-zoom on focus */
+    padding: 0.75rem 2.4rem 0.75rem 0.85rem;
+    outline: none;
+    border-radius: 0;
+    cursor: pointer;
+    transition: border-color 120ms ease, box-shadow 120ms ease;
+  }
+  select:focus {
+    border-color: var(--phos);
+    box-shadow: 0 0 0 1px var(--phos), 0 0 12px rgba(255,179,0,0.25);
+  }
+  select:hover { border-color: var(--phos); }
+  /* The dropdown list itself is drawn by the OS; these are honoured on
+     Windows/Linux and ignored on macOS and iOS, which is acceptable. */
+  select option {
+    background: var(--bg-1);
+    color: var(--phos-bright);
+  }
   input::placeholder { color: rgba(184, 122, 0, 0.55); }
 
   button {
