@@ -28,22 +28,21 @@ services:
 | `IDLE_KEYCODE_DELAY` | `0.6` | Seconds between those keys |
 | `DEFAULT_DURATION_S` | `600` | Assumed length when the metadata scrape fails |
 | `METADATA_TIMEOUT_S` | `15.0` | YouTube watch-page fetch timeout. The page is 1.1–1.6 MiB; too low and the scrape fails, giving the video a wrong title and a 10-minute assumed length that cuts long videos short |
-| `DENON_HOST` | (unset) | Denon/Marantz AVR IP. Set it and volume buttons appear in the UI |
 | `DATA_DIR` | `/data` | Where pairing state is stored **inside** the container. Change the volume mount instead |
 | `ALLOWED_HOSTS` | (unset) | Comma-separated hostnames to accept in the `Host` header. Only needed behind a reverse proxy on a real domain — see [SECURITY.md](../SECURITY.md) |
 | `RESET_PAIRING` | (unset) | Set to `1` to clear all pairing on the next start. Fires **once** — see [SECURITY.md](../SECURITY.md#resetting-the-pairing) |
 
 ## Volume control
 
-Google TV devices don't expose usable volume over the remote protocol — the physical remote's volume buttons ride HDMI-CEC straight to your amp, which a LAN service can't imitate. The way around it is to talk to the amp directly.
+On many TV devices the remote's volume buttons ride HDMI-CEC straight to the amplifier, so there's nothing for a LAN service to drive. The Google TV Streamer is one of these — it reports no usable volume range over the remote protocol at all. Some other Android TV hardware may respond to volume keycodes, but that path isn't implemented yet and nobody has tested it. Talking to the amplifier directly works regardless of the TV, which is what this does.
 
-**Denon and Marantz receivers** are supported today. Set `DENON_HOST` to the receiver's IP and the UI grows volume up/down/mute buttons that speak its legacy port-23 protocol, present on essentially every Denon since the early 2010s:
+**Denon and Marantz receivers** are supported today, and you set this up **in the web UI**, not here — during setup you're asked which receiver you have and for its address. Both brands speak the same legacy port-23 protocol, present on essentially every Denon and Marantz since the early 2010s.
 
-```yaml
-DENON_HOST: "192.168.1.60"
-```
+The choice is stored in `config.json` in the data volume, next to the TV pairing. Answering "I don't have one" is recorded too, so you're only asked once. To change it later, re-answer via `POST /api/avr` (see [API.md](API.md)) or clear everything with `RESET_PAIRING`.
 
-Without it, the volume buttons stay hidden.
+The address must be on a private network: the service opens a socket to whatever it's given and has no authentication, so public addresses are refused.
+
+Until a receiver is set up, the volume buttons stay hidden.
 
 Other AVR brands aren't supported yet — that's on the roadmap. If you'd like yours added, open an issue naming the model and how it takes network commands.
 

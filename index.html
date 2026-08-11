@@ -642,6 +642,23 @@
     <div id="toast-lounge" class="toast"></div>
   </section>
 
+  <section id="card-avr" class="card" hidden>
+    <h2 class="card-title">▌ Volume control</h2>
+    <p class="card-sub">Optional. On many TV devices the remote's volume buttons talk straight to your amplifier over HDMI, so this app can't change the volume through the TV. If you have one of these receivers, it can control the amplifier directly instead.</p>
+    <label for="avr-brand">Receiver</label>
+    <select id="avr-brand">
+      <option value="denon">Denon</option>
+      <option value="marantz">Marantz</option>
+      <option value="none">I don't have one / mine isn't listed</option>
+    </select>
+    <div id="avr-host-row">
+      <label for="avr-host">Receiver's IP address</label>
+      <input id="avr-host" type="text" inputmode="decimal" autocomplete="off" placeholder="192.168.1.60">
+    </div>
+    <button id="btn-avr-save">Save</button>
+    <div id="toast-avr" class="toast"></div>
+  </section>
+
   <!-- ── Status ──────────────────────────────────────────────────────── -->
   <section id="card-meta" class="card" hidden>
     <dl class="meta">
@@ -688,16 +705,21 @@
     add:    $("card-add"),
     queue:  $("card-queue"),
     lounge: $("card-lounge"),
+    avr:    $("card-avr"),
     meta:   $("card-meta"),
   };
 
   // queue cards (now/add/queue/meta) all show together when paired.
   // The lounge-pair card is shown only when configured but not lounge-paired.
-  function showPaired(loungePaired) {
+  function showPaired(loungePaired, avrConfigured) {
     cards.host.hidden = true; cards.code.hidden = true;
     cards.now.hidden = false; cards.add.hidden = false;
     cards.queue.hidden = false; cards.meta.hidden = false;
     cards.lounge.hidden = !!loungePaired;
+    // Shown until the question is answered — including answering "I don't
+    // have one", which is why this keys off avr_configured rather than
+    // whether a backend exists. Otherwise it would nag forever.
+    cards.avr.hidden = !!avrConfigured;
   }
   function showCard(key) {
     Object.entries(cards).forEach(([k, el]) => el.hidden = (k !== key));
@@ -767,10 +789,10 @@
     $("meta-lounge").textContent =
       !s.lounge_paired ? "NOT PAIRED" :
       s.lounge_connected ? "PAIRED · CONNECTED" : "PAIRED · OFFLINE";
-    // Volume buttons render only when a volume backend is configured
-    // (currently: a Denon AVR set via DENON_HOST). Most Android TV /
-    // Google TV devices can't expose volume via the remote protocol —
-    // see the volume_info.max=0 note in app.py.
+    // Volume buttons render only once a receiver has been set up (chosen in
+    // the setup flow, not via an env var). Many TV devices route the remote's
+    // volume over HDMI-CEC to the amplifier, leaving nothing for us to drive —
+    // see the volume_info note in app.py.
     const showVol = !!s.volume_backend;
     for (const b of document.querySelectorAll(".vol-btn")) {
       b.hidden = !showVol;
@@ -783,7 +805,7 @@
       lastStatus = s;
       setStatus(s);
       if (s.pairing_in_progress)      showCard("code");
-      else if (s.configured)          { showPaired(s.lounge_paired); ensureSSE(); }
+      else if (s.configured)          { showPaired(s.lounge_paired, s.avr_configured); ensureSSE(); }
       else                            showCard("host");
     } catch (e) {
       $("status-line").textContent = "API UNREACHABLE";
@@ -1485,6 +1507,31 @@
   $("btn-seek-go").addEventListener("click", submitSeekAbsolute);
   $("seek-input").addEventListener("keydown", (e) => {
     if (e.key === "Enter") submitSeekAbsolute();
+  });
+
+  // Hide the address field for "I don't have one" — nothing to type.
+  function syncAvrHostRow() {
+    $("avr-host-row").hidden = $("avr-brand").value === "none";
+  }
+  $("avr-brand").addEventListener("change", syncAvrHostRow);
+  syncAvrHostRow();
+
+  $("btn-avr-save").addEventListener("click", async () => {
+    const brand = $("avr-brand").value;
+    const host = $("avr-host").value.trim();
+    if (brand !== "none" && !host) {
+      return toast($("toast-avr"), "Enter your receiver's IP address.", "err");
+    }
+    const btn = $("btn-avr-save"); btn.disabled = true;
+    try {
+      await api("/api/avr", { method: "POST", body: { brand, host } });
+      toast($("toast-avr"),
+            brand === "none" ? "No problem — volume control stays off." : "Receiver saved.",
+            "ok");
+      await refreshStatus();
+    } catch (e) {
+      toast($("toast-avr"), e.message, "err");
+    } finally { btn.disabled = false; }
   });
 
   $("btn-lounge-pair").addEventListener("click", async () => {

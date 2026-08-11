@@ -96,8 +96,5 @@ services:
       #                                              # shows the video ID as the title and assumes a
       #                                              # 10-minute length for the auto-advance timer.
 
-      # --- Optional volume control via a Denon/Marantz AVR ---
-      # Google TV devices don't expose usable volume over the remote protocol
-      # (the physical remote's volume rides HDMI-CEC straight to the amp), so
-      # point this at your receiver's LAN IP to get volume buttons in the UI.
-      # DENON_HOST: "192.168.1.60"
+      # Volume control is NOT configured here. You pick your AV receiver in the
+      # web UI during setup, and the choice is saved with the TV pairing.

@@ -156,15 +156,25 @@ POST_SETPLAYLIST_POLL = 0.2
 # alone just lands on the launcher; an empty value disables the behavior.
 IDLE_KEYCODE = os.environ.get("IDLE_KEYCODE", "HOME,BACK").strip()
 IDLE_KEYCODE_DELAY = float(os.environ.get("IDLE_KEYCODE_DELAY", "0.6"))
-# Optional Denon AVR for volume control. Most Android TV / Google TV
-# devices report no volume capability via the remote protocol (the Google
-# TV Streamer, for one, reports volume_info.max=0) because the physical remote
-# routes volume directly to the TV/AVR via HDMI-CEC, bypassing the
-# streamer entirely. Set DENON_HOST to your AVR's LAN IP to enable a
-# /api/volume/{up|down|mute} endpoint that talks to the AVR directly
-# over its legacy Telnet protocol (TCP port 23). Unset → no volume
-# control exposed (UI buttons hidden).
-DENON_HOST = os.environ.get("DENON_HOST", "").strip() or None
+# Optional AV receiver for volume control. androidtvremote2 exposes
+# `volume_info` read-only (no setter), so volume over the remote protocol would
+# mean VOLUME_UP/VOLUME_DOWN keycodes — and whether those land is
+# device-dependent. The Google TV Streamer reports volume_info.max=0 and routes
+# its remote's volume straight to the amplifier over HDMI-CEC, so there is
+# nothing for us to drive there. Other Android TV hardware may well accept the
+# keycodes; nobody has tested it, and we don't implement that path yet.
+# Talking to the receiver directly works regardless of the TV.
+#
+# The receiver is chosen during setup in the web UI and persisted to
+# config.json — deliberately NOT an environment variable, so a non-technical
+# user never has to edit YAML to get volume buttons.
+#
+# Denon and Marantz are one entry each because that's what's on the box; both
+# speak the same legacy Telnet protocol on TCP port 23, so both map to
+# DenonClient. "none" is a real, recorded answer meaning "I don't have one" —
+# it dismisses the setup card instead of leaving it nagging forever.
+AVR_BACKENDS = {"denon": "denon", "marantz": "denon"}
+AVR_BRANDS = set(AVR_BACKENDS) | {"none"}
 
 YT_REGEX = re.compile(r"(?:v=|youtu\.be/|/shorts/|/embed/|/live/)([A-Za-z0-9_-]{11})")
 ID_REGEX = re.compile(r"^[A-Za-z0-9_-]{11}$")
@@ -192,11 +202,16 @@ class State:
     # overlays, ad insertion brief switches, etc.) would trip the check
     # and blank the snapshot for a tick, causing UI flicker.
     suppress_lounge: bool = False
-    # Optional Denon AVR for volume control. Constructed at startup if
-    # DENON_HOST is set, None otherwise. We don't probe the AVR at boot
-    # — the user might power it on later, so we just hold the client
-    # and let individual /api/volume calls succeed or fail on demand.
+    # Volume backend, built from the AVR chosen during setup (None if the
+    # user has no receiver or hasn't answered yet). We don't probe the AVR at
+    # boot — the user might power it on later, so we just hold the client and
+    # let individual /api/volume calls succeed or fail on demand.
     denon: Optional["DenonClient"] = None
+    # True once the user has answered the AVR question at all, including
+    # answering "I don't have one". Distinct from `denon is not None`, which
+    # is False in both the "no receiver" and "not asked yet" cases — the UI
+    # needs to tell those apart to know whether to show the setup card.
+    avr_configured: bool = False
 
 
 state = State()
@@ -210,6 +225,46 @@ def _is_tv_paired() -> bool:
     /api/pair/start so a hostile LAN client can't wipe the cert by
     re-triggering the pairing flow on a paired service."""
     return CERT_FILE.exists() and KEY_FILE.exists() and CONFIG_FILE.exists()
+
+
+def _validate_avr_host(raw: Optional[str]) -> str:
+    """Validate an AVR address, or raise HTTPException(400).
+
+    Restricted to private addresses on purpose. This endpoint makes the server
+    open a TCP connection to whatever it's given, and the service has no
+    authentication — so without this an unauthenticated LAN caller could aim it
+    at arbitrary internet hosts and use it as a port-probing primitive. A
+    receiver lives on your LAN; there is no legitimate public-address case.
+    """
+    host = (raw or "").strip()
+    if not host:
+        raise HTTPException(400, "receiver address is required")
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        raise HTTPException(
+            400, "enter the receiver's IP address, e.g. 192.168.1.60",
+        )
+    if not (ip.is_private or ip.is_loopback):
+        raise HTTPException(400, "the receiver must be on your local network")
+    return host
+
+
+def _apply_avr_config(cfg: dict) -> None:
+    """Build (or clear) the volume backend from a persisted config block."""
+    avr = cfg.get("avr") or {}
+    brand = str(avr.get("brand") or "").strip().lower()
+    if brand not in AVR_BRANDS:
+        state.denon = None
+        state.avr_configured = False
+        return
+    state.avr_configured = True
+    host = avr.get("host")
+    if AVR_BACKENDS.get(brand) == "denon" and host:
+        state.denon = DenonClient(host)
+        log.info("Volume backend enabled: %s at %s", brand, host)
+    else:
+        state.denon = None
 
 
 def _is_lounge_paired() -> bool:
@@ -1132,9 +1187,6 @@ async def lifespan(_app: FastAPI):
     state.http_client = httpx.AsyncClient(
         timeout=5.0, follow_redirects=True, max_redirects=3,
     )
-    if DENON_HOST:
-        state.denon = DenonClient(DENON_HOST)
-        log.info("Denon volume backend enabled (host=%s)", DENON_HOST)
     queue_controller = QueueController(
         play_callable=tv_play,
         broadcaster=broadcaster,
@@ -1154,6 +1206,7 @@ async def lifespan(_app: FastAPI):
         _secure_data_file(f)
 
     cfg = load_config()
+    _apply_avr_config(cfg)
     host = cfg.get("host")
     startup_retry_task: Optional[asyncio.Task] = None
     if host and CERT_FILE.exists() and KEY_FILE.exists():
@@ -1295,6 +1348,11 @@ class AddReq(BaseModel):
     video_id: Optional[str] = None
 
 
+class AvrReq(BaseModel):
+    brand: str
+    host: Optional[str] = None
+
+
 # ── status / pairing endpoints ───────────────────────────────────────────────
 @app.get("/api/status")
 async def status():
@@ -1324,6 +1382,7 @@ async def status():
         # the backend (currently only "denon") when one is active. The
         # frontend uses this to decide whether to render volume buttons.
         "volume_backend": "denon" if state.denon is not None else None,
+        "avr_configured": state.avr_configured,
     }
 
 
@@ -1493,6 +1552,34 @@ async def lounge_pair(req: LoungePairReq):
 def _require_paired() -> None:
     if not state.remote or state.pairing_in_progress:
         raise HTTPException(503, "not paired — visit the web UI to pair")
+
+
+@app.post("/api/avr")
+async def set_avr(req: AvrReq):
+    """Record which AV receiver (if any) handles volume, from the setup flow.
+
+    Unlike the pairing endpoints this stays open after it's been answered:
+    it holds a preference, not a credential, so re-answering it can't lock
+    anyone out or destroy anything. People buy receivers, and swap them.
+    """
+    brand = (req.brand or "").strip().lower()
+    if brand not in AVR_BRANDS:
+        raise HTTPException(
+            400, f"unknown receiver type (pick one of: {', '.join(sorted(AVR_BRANDS))})",
+        )
+
+    cfg = load_config()
+    if brand == "none":
+        cfg["avr"] = {"brand": "none"}
+    else:
+        cfg["avr"] = {"brand": brand, "host": _validate_avr_host(req.host)}
+    save_config(cfg)
+    _apply_avr_config(cfg)
+
+    return {
+        "ok": True,
+        "volume_backend": "denon" if state.denon is not None else None,
+    }
 
 
 @app.get("/api/queue")
@@ -1667,17 +1754,17 @@ async def seek(req: SeekReq):
 @app.post("/api/volume/{action}")
 async def volume(action: str):
     """Control volume via the configured Denon AVR. Only active when
-    DENON_HOST is set — Android TV / Google TV devices don't expose
-    a usable volume control over the remote protocol (the physical
-    remote routes volume via HDMI-CEC, not via the network protocol
-    we have access to). The Denon's network port 23 protocol gives us
-    a direct LAN-side path that doesn't depend on the TV at all."""
+    a receiver was chosen during setup — Android TV / Google TV devices
+    don't expose a usable volume control over the remote protocol (the
+    physical remote routes volume via HDMI-CEC, not via the network
+    protocol we have access to). The receiver's port 23 protocol gives
+    us a direct LAN-side path that doesn't depend on the TV at all."""
     if action not in ("up", "down", "mute"):
         raise HTTPException(404, "unknown volume action — use up, down, or mute")
     if state.denon is None:
         raise HTTPException(
             503,
-            "no volume backend configured (set DENON_HOST to your AVR's IP)",
+            "no AV receiver set up — choose one in the web UI to enable volume",
         )
     try:
         if action == "up":

@@ -37,13 +37,37 @@ This is the easier alternative: one page on your LAN, anyone pastes a link, the 
 
 ## What you'll need
 
-- A **Google TV** device with **[SmartTube](https://github.com/yuliskov/SmartTube)** installed. Other Android TV hardware is untested — see [Project status](#project-status--work-in-progress).
+- A **Google TV** device with **[SmartTube](https://smarttubeapp.github.io/)** installed — don't have it? [See below](#never-heard-of-smarttube). Other Android TV hardware is untested — see [Project status](#project-status--work-in-progress).
 - A computer that can run Docker and stays on while you're watching — a PC, a Mac, a NAS, a Raspberry Pi (64-bit OS), whatever you have.
 - Both on the **same network** as the TV.
 - **An internet connection** on that computer — video titles and lengths come from YouTube, and playback commands relay through YouTube's servers. Only the web page itself is LAN-only.
 - The TV's IP address (Settings → Network, or your router's device list).
 
 **Give the TV a permanent address** if you can — most routers call this a *DHCP reservation* or *static lease*, usually in the router's device list. Optional, but if the TV's address changes this app stops finding it, and re-pairing means setting `RESET_PAIRING: "1"` in `docker-compose.yml` and restarting (the pairing screen is hidden once a TV is paired).
+
+### Never heard of SmartTube?
+
+[SmartTube](https://smarttubeapp.github.io/) is a free, ad-free YouTube app for TV devices. It plays the same YouTube you already know, without the adverts. It's a separate project from this one, and it's what this app sends your videos to — so you need it on the TV first.
+
+**What can run it:** Android TV and Google TV devices — Chromecast with Google TV, Nvidia Shield, Xiaomi Mi Box, onn. boxes, and most Android TV set-top boxes and built-in Android TVs.
+
+**What can't:** phones and tablets, Samsung (Tizen) and LG (webOS) TVs, Apple TV, and Roku. Fire TV sits in between — SmartTube supports older Fire TV devices but not the newest ones, and this app may not work with Fire TV regardless. See [Project status](#project-status--work-in-progress).
+
+**Installing it.** SmartTube is **not on the Play Store** and never has been — you install it yourself. Its developer warns that copies floating around app stores and APK sites may contain malware, so only use the official source.
+
+The easiest route, done entirely on the TV:
+
+1. From the Play Store on your TV, install **Downloader by AFTVnews**.
+2. Open Downloader and type this into its address box:
+
+   ```
+   kutt.to/stn_stable
+   ```
+
+3. It downloads the official APK. Accept the prompts — Android will ask you to allow installs from Downloader — then install.
+4. Open SmartTube once and play something, just to confirm it works.
+
+Other methods (USB stick, "Send Files to TV", ADB) are documented at [smarttubeapp.github.io](https://smarttubeapp.github.io/).
 
 ---
 
@@ -53,7 +77,7 @@ Pick the path that matches you. Both end at the same place.
 
 | | **Option A — Docker Desktop** | **Option B — Docker Engine** |
 |---|---|---|
-| **For** | Windows or Mac, point-and-click | Linux, NAS, homelab, terminal-comfortable |
+| **For** | Windows or Mac, point-and-click | Linux, NAS, homelab — terminal required |
 | **Runs on** | Your everyday computer | An always-on box |
 | **Catch** | Only works while that computer is awake and Docker Desktop is running | You're expected to know your way around a shell |
 
@@ -122,59 +146,17 @@ Fine for trying it out or for movie night on a desktop that's already on. For so
 
 ---
 
-### Option B — Docker Engine (Linux, NAS, homelab)
+### Option B — Linux, NAS, or homelab
 
-*Skip this whole section if you followed Option A.*
+Comfortable in a terminal, or putting this on a NAS or Raspberry Pi? The whole path — Docker Engine, Portainer, choosing where data lives, reverse proxies, building from source — is in **[docs/ADVANCED-SETUP.md](docs/ADVANCED-SETUP.md)**.
 
-Assumes Docker Engine and the Compose plugin are already installed.
-
-```bash
-mkdir -p /opt/smarttube-playlist && cd /opt/smarttube-playlist
-curl -O https://raw.githubusercontent.com/Alice-Sabrina-Ivy/smarttube-playlist/main/docker-compose.yml
-# optional: edit docker-compose.yml to set the bind address or DENON_HOST
-docker compose up -d
-```
-
-Then open `http://<host-ip>:38420/` and continue to [Pair with your TV](#pair-with-your-tv).
-
-The image is multi-arch — `linux/amd64` and `linux/arm64`. A Raspberry Pi needs a **64-bit** OS: check with `uname -m`, you want `aarch64`, not `armv7l`.
-
-#### Notes for this path
-
-- **Data lives in `./data`** next to the compose file: pairing certificate, TV address, Lounge token. Back it up and you never re-pair. It's created on first run and chowned to UID 1000 by the entrypoint, which runs as root just long enough to do that and then drops privileges via `gosu`.
-- **Port binding.** `38420:8000` binds all interfaces. On a LAN-only box that's the point. If the host has anything internet-facing, pin it: `"192.168.1.50:38420:8000"`. There is no authentication — see [SECURITY.md](SECURITY.md).
-- **Reverse proxy.** Two things to set: `ALLOWED_HOSTS` (without it every add/skip/pause 403s), and unbuffered `text/event-stream` (without it the live UI stalls). Both in [docs/CONFIGURATION.md](docs/CONFIGURATION.md#behind-a-reverse-proxy).
-
-#### Deploying with Portainer
-
-Portainer flags CLI-deployed stacks as "limited" because it has no record of the compose source, so deploy through its own UI if you want full control:
-
-**Stacks → Add stack →** name it `smarttube-playlist` → build method **Web editor** → paste the contents of `docker-compose.yml` → **Deploy**.
-
-Because the compose file references a published image, Portainer pulls it directly — no source tree needed on the host. To update later, hit **Pull and redeploy** on the stack.
-
-If a CLI-deployed container is already running, remove it first so the stack doesn't fight it for the name:
-
-```bash
-docker stop smarttube-playlist && docker rm smarttube-playlist
-```
-
-#### Build from source
-
-Only needed if you're modifying the code or want to avoid the prebuilt image:
-
-```bash
-git clone https://github.com/Alice-Sabrina-Ivy/smarttube-playlist
-cd smarttube-playlist
-# in docker-compose.yml: comment out `image:`, uncomment `build: .`
-docker compose up -d --build
-```
+Come back here for [Pair with your TV](#pair-with-your-tv) once it's running; that part is the same either way.
 
 ---
 
 ### Pair with your TV
 
-Same for both options. Open the page and work through the two cards.
+Same for both options. Open the page and work through the cards.
 
 **1. Pair the TV remote** *(required)*
 
@@ -188,9 +170,15 @@ On the TV: **SmartTube → Settings → "Link with TV code"**. A **12-digit code
 
 This is the same mechanism as "play on TV" in the YouTube mobile app; SmartTube implements the receiver side. Skipping it still works, but you lose real playback position and precise end-of-video detection — see [Honest limitations](#honest-limitations).
 
-**3. Done.** Paste a YouTube URL, hit **Add to queue**.
+**3. Volume control** *(optional)*
 
-Both pairings persist to the `data` folder, so this is a one-time job.
+On many TV devices the remote's volume buttons talk straight to your amplifier over HDMI, so this app can't change the volume through the TV. If you have a **Denon** or **Marantz** receiver, pick it here and enter its IP address, and volume buttons appear in the page.
+
+No receiver, or yours isn't listed? Choose **"I don't have one"** — the card goes away and you're not asked again. Other brands are on the [Roadmap](#roadmap).
+
+**4. Done.** Paste a YouTube URL, hit **Add to queue**.
+
+Your answers persist to the `data` folder, so this is a one-time job.
 
 ---
 
@@ -238,7 +226,6 @@ Everything is optional — the defaults work, and most people change nothing. Th
 | Variable | Default | What it does |
 |---|---|---|
 | `SMARTTUBE_PACKAGE` | `org.smarttube.stable` | Set to `org.smarttube.beta` for the beta build |
-| `DENON_HOST` | (unset) | Denon/Marantz AVR IP — set it and volume buttons appear |
 | `WAKE_DELAY` | `15.0` | Raise it if the TV wakes but the video doesn't start |
 | `LOG_LEVEL` | `INFO` | Set `DEBUG` when something's wrong |
 | `RESET_PAIRING` | (unset) | Set to `1` and restart to clear pairing and start over |
@@ -303,6 +290,7 @@ The README covers getting it running. Everything else lives here:
 
 | | |
 |---|---|
+| **[docs/ADVANCED-SETUP.md](docs/ADVANCED-SETUP.md)** | Linux, NAS and homelab installs: Docker Engine, Portainer, where data lives, port binding, reverse proxies, building from source |
 | **[SECURITY.md](SECURITY.md)** | Threat model, what the no-auth design means, DNS-rebinding and CSRF protection, reverse proxies, resetting a pairing |
 | **[docs/CONFIGURATION.md](docs/CONFIGURATION.md)** | Every environment variable, volume control, timezones |
 | **[docs/API.md](docs/API.md)** | HTTP endpoints and the SSE stream, for webhooks and Home Assistant |

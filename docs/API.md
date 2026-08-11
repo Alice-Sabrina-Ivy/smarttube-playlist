@@ -17,7 +17,7 @@ POST   /api/pause                         pause playback and freeze auto-advance
 POST   /api/resume                        resume
 POST   /api/clear                         empty the queue, leave current playing
 POST   /api/seek           {to|by}        `to`: "1:23" / "90s" / "1h30m"; `by`: ±seconds
-POST   /api/volume/{up|down|mute}         requires DENON_HOST; 503 otherwise
+POST   /api/volume/{up|down|mute}         503 unless an AV receiver is set up
 GET    /api/events                        SSE stream of queue snapshots
 POST   /api/play           {url|video_id} legacy: clear queue and replace current
 GET    /healthz                           liveness probe
@@ -26,6 +26,8 @@ POST   /api/pair/start     {host}         begin TV-remote pairing
 POST   /api/pair/finish    {code}         6-character code from the TV
 POST   /api/pair/cancel                   abort an in-progress pairing
 POST   /api/lounge/pair    {code}         12-digit code from SmartTube; 409 if already paired
+POST   /api/avr            {brand,host}   pick the AV receiver for volume. brand: denon |
+                                          marantz | none. Address must be private.
 ```
 
 ## Queue a video
