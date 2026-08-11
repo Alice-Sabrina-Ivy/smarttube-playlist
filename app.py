@@ -580,7 +580,15 @@ async def _wait_for_lounge_connected(timeout: float, poll: float) -> bool:
     """Poll until our Lounge sender session is connected, or until timeout.
     Lounge typically (re)connects shortly after SmartTube foregrounds, so
     callers can use this to wait for the chance to send a setPlaylist
-    command that will reach SmartTube."""
+    command that will reach SmartTube.
+
+    Returns immediately when there is no Lounge monitor at all. Without that
+    short-circuit, an install where the user skipped Lounge pairing paid the
+    full timeout on *every* play and resume — waiting for a session that can
+    never appear — before falling back to the deep link.
+    """
+    if state.lounge_monitor is None:
+        return False
     deadline = asyncio.get_running_loop().time() + timeout
     while asyncio.get_running_loop().time() < deadline:
         if state.lounge_monitor and state.lounge_monitor.is_connected:
