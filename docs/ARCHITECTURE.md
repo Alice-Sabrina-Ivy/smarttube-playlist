@@ -64,7 +64,6 @@ Python 3.12. The frontend is a single `index.html` — vanilla HTML/CSS/JS, no b
 | `metadata.py` | YouTube watch-page scraper |
 | `events.py` | SSE fan-out to connected browsers |
 | `ratelimit.py` | Per-IP rate limiting |
-| `denon.py` | Denon/Marantz AVR volume backend |
 | `index.html` | The entire frontend |
 
 ## Contributing

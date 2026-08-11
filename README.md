@@ -8,7 +8,7 @@ No Home Assistant. No Google Cast. No accounts to create and no third-party serv
 
 ![The web UI: a "Now playing" card with thumbnail, progress bar and playback controls, a box for pasting a YouTube link, the upcoming queue, and a TV status panel](docs/screenshot.png)
 
-*The volume buttons appear only when a supported AV receiver is set up.*
+*Volume buttons need HDMI-CEC volume control enabled on your TV — see below.*
 
 ---
 
@@ -19,7 +19,7 @@ This works, and it's used daily on the setup it was built for. It is not finishe
 **What's supported today:**
 
 - **Google TV devices only**, including Chromecast with Google TV. That's the only hardware this has been developed and tested against. The Android TV Remote v2 protocol underneath is common to Android TV generally, so other boxes and sticks may well work — but nobody has verified it, and Fire TV runs Fire OS, which may not expose the Remote service at all. Tried one? Please [open an issue](https://github.com/Alice-Sabrina-Ivy/smarttube-playlist/issues) and say what happened, working or not.
-- **Volume control** on **Denon and Marantz** (tested), plus **Yamaha, Onkyo/Integra, Pioneer and Sony** built from each manufacturer's protocol documentation but **not tested on real hardware** — if you own one, please report whether it works.
+- **Volume and mute**, sent over HDMI-CEC to whatever is producing the sound — your TV, soundbar or amplifier. Needs CEC volume control switched on; see [Volume and mute](#volume-and-mute).
 
 Where this is heading: see [Roadmap](#roadmap).
 
@@ -170,15 +170,7 @@ On the TV: **SmartTube → Settings → "Link with TV code"**. A **12-digit code
 
 This is the same mechanism as "play on TV" in the YouTube mobile app; SmartTube implements the receiver side. Skipping it still works, but you lose real playback position and precise end-of-video detection — see [Honest limitations](#honest-limitations).
 
-**3. Volume control** *(optional)*
-
-On many TV devices the remote's volume buttons talk straight to your amplifier over HDMI, so this app can't change the volume through the TV. Pick your receiver here and enter its IP address, and volume buttons appear in the page.
-
-The list separates receivers **tested on real hardware** (Denon, Marantz) from ones **built from the manufacturer's protocol documentation but never tested** (Yamaha, Onkyo/Integra, Pioneer, Sony). Saving tells you whether the receiver actually answered.
-
-No receiver, or yours isn't listed? Choose **"I don't have one"** — the card goes away and you're not asked again.
-
-**4. Done.** Paste a YouTube URL, hit **Add to queue**.
+**3. Done.** Paste a YouTube URL, hit **Add to queue**.
 
 Your answers persist to the `data` folder, so this is a one-time job.
 
@@ -210,6 +202,16 @@ Worth knowing before you commit:
 - **No history, no accounts.** By design — it's a shared room, not a personal library.
 
 For the two-protocol design, why Google Cast wasn't used, and how playback is actually driven, see [How it works](docs/ARCHITECTURE.md).
+
+---
+
+## Volume and mute
+
+The volume and mute buttons ask your streaming device to send an **HDMI-CEC volume command** to whatever is making the sound — TV speakers, a soundbar, or an amplifier. Nothing to set up, and brand doesn't matter.
+
+The catch: **HDMI-CEC volume control has to be enabled**. It's on by default, so it probably already is — but if the buttons do nothing, that's the first thing to check. Every manufacturer gives CEC a different name (Samsung calls it *Anynet+*, LG *SIMPLINK*, Sony *BRAVIA Sync*), which makes it annoying to find. The full list, and where to look on the streaming device itself, is in [docs/CONFIGURATION.md](docs/CONFIGURATION.md#volume-and-mute).
+
+If your gear can't do CEC, there's no volume control — the buttons just won't do anything.
 
 ---
 
@@ -274,6 +276,8 @@ To stop it: `docker compose down`. To remove it entirely, stop it and delete the
 
 **Auto-advance is early or late.** You're in the no-Lounge fallback, running on a duration estimate. Pair Lounge to fix it properly, or use Skip to realign.
 
+**The volume and mute buttons do nothing.** HDMI-CEC volume control is switched off somewhere in the chain. Check it on the TV, on the receiver or soundbar if you have one, and on the streaming device (**Settings → Display & Sound → HDMI-CEC**). Your manufacturer probably calls CEC something else entirely — see [docs/CONFIGURATION.md](docs/CONFIGURATION.md#volume-and-mute).
+
 **A video shows a 10:00 duration that's obviously wrong,** or its title shows as a jumble of letters. The lookup to YouTube failed, so it fell back to an assumed 10 minutes. This isn't cosmetic: that fake length drives auto-advance, so a long video gets skipped 10 minutes in. Look for `metadata fetch failed` in the logs; if it happens often, your connection is slow to reach YouTube — raise `METADATA_TIMEOUT_S` (see [docs/CONFIGURATION.md](docs/CONFIGURATION.md)).
 
 **Reading the logs:**
@@ -306,7 +310,7 @@ The README covers getting it running. Everything else lives here:
 Rough order, no dates — this is a spare-time project.
 
 - **Verified support for other streaming sticks and boxes** — Nvidia Shield, onn./Xiaomi, and possibly Fire TV. Some may already work; none are tested.
-- **Confirming the untested receiver brands** — Yamaha, Onkyo/Integra, Pioneer and Sony are implemented but nobody has run them against real hardware. Reports welcome. NAD is the next brand queued.
+- **Volume for devices without working HDMI-CEC** — currently those users get no volume control at all.
 
 Got one of the untested devices? Reports either way are genuinely useful — [open an issue](https://github.com/Alice-Sabrina-Ivy/smarttube-playlist/issues).
 

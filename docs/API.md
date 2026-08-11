@@ -17,7 +17,8 @@ POST   /api/pause                         pause playback and freeze auto-advance
 POST   /api/resume                        resume
 POST   /api/clear                         empty the queue, leave current playing
 POST   /api/seek           {to|by}        `to`: "1:23" / "90s" / "1h30m"; `by`: ±seconds
-POST   /api/volume/{up|down|mute}         503 unless an AV receiver is set up
+POST   /api/volume/{up|down|mute}         relays an HDMI-CEC volume keycode; 503 if
+                                          no TV is paired
 GET    /api/events                        SSE stream of queue snapshots
 POST   /api/play           {url|video_id} legacy: clear queue and replace current
 GET    /healthz                           liveness probe
@@ -26,12 +27,6 @@ POST   /api/pair/start     {host}         begin TV-remote pairing
 POST   /api/pair/finish    {code}         6-character code from the TV
 POST   /api/pair/cancel                   abort an in-progress pairing
 POST   /api/lounge/pair    {code}         12-digit code from SmartTube; 409 if already paired
-GET    /api/avr/brands                    receiver list for the setup UI, with a
-                                          `tested` flag per brand
-POST   /api/avr            {brand,host}   pick the AV receiver for volume. brand: denon |
-                                          marantz | yamaha | onkyo | pioneer | sony |
-                                          none. Address must be private. Returns
-                                          `reachable` from a one-shot probe.
 ```
 
 ## Queue a video

@@ -24,7 +24,6 @@ RUN pip install --no-cache-dir -r requirements.txt \
     && apt-get autoremove -y
 
 COPY app.py events.py lounge.py metadata.py playlist.py ratelimit.py ./
-COPY avr/ ./avr/
 COPY index.html ./
 COPY entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
