@@ -1,5 +1,15 @@
 FROM python:3.12-slim
 
+# The licence label describes THIS IMAGE, not the repository. The project's own
+# source is MIT, but the image bundles pyytlounge, which is GPL-3.0. The image is
+# therefore a combined work carrying GPL-3.0 obligations, while the source on
+# GitHub remains MIT. See THIRD_PARTY_NOTICES.md.
+LABEL org.opencontainers.image.title="SmartTube Playlist" \
+      org.opencontainers.image.description="LAN-only web service for queueing YouTube videos to SmartTube" \
+      org.opencontainers.image.source="https://github.com/Alice-Sabrina-Ivy/smarttube-playlist" \
+      org.opencontainers.image.documentation="https://github.com/Alice-Sabrina-Ivy/smarttube-playlist#readme" \
+      org.opencontainers.image.licenses="GPL-3.0-or-later"
+
 WORKDIR /app
 
 # Build deps for cryptography (used by androidtvremote2 for TLS); removed after install.

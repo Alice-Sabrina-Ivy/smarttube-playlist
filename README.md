@@ -2,11 +2,13 @@
 
 A small, LAN-only web page that lets anyone on your home network paste a YouTube link and have it play on **SmartTube** on your **Google TV**. Several people can add videos at once; the queue plays through them in order.
 
-No Home Assistant. No ADB. No Google Cast. No accounts, no sign-in, no cloud service in the middle.
+No Home Assistant. No Google Cast. No accounts to create and no third-party service to sign up for.
 
 > **Not affiliated with Google, YouTube, or the SmartTube project.** This is an independent hobby project that talks to software you already run.
 
-![The SmartTube Playlist web UI: a "Now playing" card showing the current video's thumbnail, title, channel, progress bar and elapsed/remaining time, with play, pause, skip, clear and seek controls; below it a field for pasting a YouTube URL, the upcoming queue, and a status panel showing the connected TV, its power state and playback sync](docs/screenshot.png)
+![The web UI: a "Now playing" card with thumbnail, progress bar and playback controls, a box for pasting a YouTube link, the upcoming queue, and a TV status panel](docs/screenshot.png)
+
+*The volume buttons appear only when a supported AV receiver is set up.*
 
 ---
 
@@ -16,13 +18,10 @@ This works, and it's used daily on the setup it was built for. It is not finishe
 
 **What's supported today:**
 
-- **Google TV devices only.** That's the only hardware this has been developed and tested against. The underlying Android TV Remote v2 protocol is common to Android TV generally, so other Android TV boxes and sticks — Nvidia Shield, Fire TV, Chromecast with Google TV, onn. and Xiaomi boxes — may well work. Nobody has verified it. If you try one, please open an issue and say what happened, working or not.
+- **Google TV devices only**, including Chromecast with Google TV. That's the only hardware this has been developed and tested against. The Android TV Remote v2 protocol underneath is common to Android TV generally, so other boxes and sticks may well work — but nobody has verified it, and Fire TV runs Fire OS, which may not expose the Remote service at all. Tried one? Please [open an issue](https://github.com/Alice-Sabrina-Ivy/smarttube-playlist/issues) and say what happened, working or not.
 - **Volume control on Denon and Marantz receivers only**, via their legacy port-23 protocol.
 
-**Coming in future versions:**
-
-- Support for other streaming sticks and boxes, tested rather than assumed.
-- Volume support for more AVR brands beyond Denon/Marantz.
+Where this is heading: see [Roadmap](#roadmap).
 
 Expect rough edges, occasional breaking changes between versions, and issues that take a while to get answered.
 
@@ -39,11 +38,12 @@ This is the easier alternative: one page on your LAN, anyone pastes a link, the 
 ## What you'll need
 
 - A **Google TV** device with **[SmartTube](https://github.com/yuliskov/SmartTube)** installed. Other Android TV hardware is untested — see [Project status](#project-status--work-in-progress).
-- A computer that can run Docker and stays on while you're watching — a PC, a Mac, a NAS, a Raspberry Pi, whatever you have.
+- A computer that can run Docker and stays on while you're watching — a PC, a Mac, a NAS, a Raspberry Pi (64-bit OS), whatever you have.
 - Both on the **same network** as the TV.
+- **An internet connection** on that computer — video titles and lengths come from YouTube, and playback commands relay through YouTube's servers. Only the web page itself is LAN-only.
 - The TV's IP address (Settings → Network, or your router's device list).
 
-**Pin the TV's IP** with a DHCP reservation in your router if you can. If the TV's address changes you'll have to pair again.
+**Give the TV a permanent address** if you can — most routers call this a *DHCP reservation* or *static lease*, usually in the router's device list. Optional, but if the TV's address changes this app stops finding it, and re-pairing means setting `RESET_PAIRING: "1"` in `docker-compose.yml` and restarting (the pairing screen is hidden once a TV is paired).
 
 ---
 
@@ -78,13 +78,13 @@ Anywhere you like, e.g. `Documents\smarttube-playlist`. Everything lives here, i
 
 Download [`docker-compose.yml`](docker-compose.yml) (click **Raw**, then save) into the folder you just made.
 
-> **Windows:** if you save from Notepad, set *Save as type* to **All Files** so you don't end up with `docker-compose.yml.txt`. Docker will not find a file with the extra `.txt`.
+> **Windows:** turn on File Explorer → **View → Show → File name extensions** first, so you can see the real filename. It must be exactly `docker-compose.yml` — a hidden `.txt` on the end is the single most common thing that goes wrong here. From Notepad, set *Save as type* to **All Files**.
 
 You don't need to edit it. The defaults work as-is.
 
 **4. Open a terminal in that folder.**
 
-- **Windows:** open the folder in File Explorer, right-click a blank area, choose **Open in Terminal**.
+- **Windows:** open the folder in File Explorer, right-click a blank area, choose **Open in Terminal**. (Windows 10: hold **Shift** while right-clicking, then **Open PowerShell window here**.)
 - **Mac:** right-click the folder, choose **Services → New Terminal at Folder**. (If it's not there: enable it in System Settings → Keyboard → Keyboard Shortcuts → Services.)
 
 **5. Start it.**
@@ -93,13 +93,13 @@ You don't need to edit it. The defaults work as-is.
 docker compose up -d
 ```
 
-First run downloads the image — a minute or two. `-d` means it keeps running in the background, and restarts automatically whenever Docker Desktop starts.
+First run downloads the image — a minute or two. `-d` runs it in the background; the `restart: unless-stopped` line in the compose file is what brings it back whenever Docker Desktop starts. When it finishes you'll see a line ending in `Container smarttube-playlist  Started`, and the container shows green in Docker Desktop's **Containers** tab.
 
 **6. Open the page.**
 
 <http://localhost:38420>
 
-Now skip to [Pair with your TV](#pair-with-your-tv).
+The page should load. Two short things worth reading below before you pair.
 
 #### Letting phones and tablets reach it
 
@@ -118,9 +118,13 @@ The service is only alive while that computer is powered on, awake, and running 
 
 Fine for trying it out or for movie night on a desktop that's already on. For something that just works whenever guests are over, move it to a NAS or a Pi using Option B.
 
+**Option A is done — skip Option B entirely and go to [Pair with your TV](#pair-with-your-tv).**
+
 ---
 
 ### Option B — Docker Engine (Linux, NAS, homelab)
+
+*Skip this whole section if you followed Option A.*
 
 Assumes Docker Engine and the Compose plugin are already installed.
 
@@ -133,13 +137,13 @@ docker compose up -d
 
 Then open `http://<host-ip>:38420/` and continue to [Pair with your TV](#pair-with-your-tv).
 
-The image is multi-arch — `linux/amd64` and `linux/arm64` both work, so Pi and ARM NAS boxes are covered.
+The image is multi-arch — `linux/amd64` and `linux/arm64`. A Raspberry Pi needs a **64-bit** OS: check with `uname -m`, you want `aarch64`, not `armv7l`.
 
 #### Notes for this path
 
 - **Data lives in `./data`** next to the compose file: pairing certificate, TV address, Lounge token. Back it up and you never re-pair. It's created on first run and chowned to UID 1000 by the entrypoint, which runs as root just long enough to do that and then drops privileges via `gosu`.
 - **Port binding.** `38420:8000` binds all interfaces. On a LAN-only box that's the point. If the host has anything internet-facing, pin it: `"192.168.1.50:38420:8000"`. There is no authentication — see [SECURITY.md](SECURITY.md).
-- **Reverse proxy.** If you front it with Caddy/nginx/Traefik, pass through `text/event-stream` unbuffered or the live-updating UI will stall. In nginx that means `proxy_buffering off;` and `proxy_read_timeout` well above the default on `/api/events`.
+- **Reverse proxy.** Two things to set: `ALLOWED_HOSTS` (without it every add/skip/pause 403s), and unbuffered `text/event-stream` (without it the live UI stalls). Both in [docs/CONFIGURATION.md](docs/CONFIGURATION.md#behind-a-reverse-proxy).
 
 #### Deploying with Portainer
 
@@ -174,7 +178,7 @@ Same for both options. Open the page and work through the two cards.
 
 **1. Pair the TV remote** *(required)*
 
-Enter your TV's IP address and submit. A **6-character code** appears on the TV screen — type it into the web UI.
+**Turn the TV on first** and leave it on the home screen — pairing can't wake a sleeping TV; that only works once paired. Enter your TV's IP address and submit. A **6-character code** appears on the TV screen — type it into the web UI.
 
 This is the same protocol the official Google TV mobile app uses. The TV will remember this client under *Settings → Apps → See all apps → Show system apps → Android TV Remote Service* if you ever want to revoke it.
 
@@ -243,11 +247,31 @@ Every setting, volume control and reverse-proxy notes: **[docs/CONFIGURATION.md]
 
 ---
 
+## Updating, stopping, removing
+
+Open a terminal in the folder with `docker-compose.yml` and run:
+
+```bash
+docker compose pull && docker compose up -d
+```
+
+Your `data` folder is untouched, so you won't have to pair again. The same command applies any setting you changed in `docker-compose.yml`. Portainer users: hit **Pull and redeploy** on the stack instead.
+
+To stop it: `docker compose down`. To remove it entirely, stop it and delete the folder — nothing was ever installed on the TV, though you can revoke the pairing under *Settings → Apps → See all apps → Show system apps → Android TV Remote Service*.
+
+---
+
 ## Troubleshooting
+
+**`manifest unknown` or `denied` when starting.** Docker couldn't download the image. Check you're online and try `docker compose pull`. If it still fails, [open an issue](https://github.com/Alice-Sabrina-Ivy/smarttube-playlist/issues).
+
+**`no configuration file provided: not found`.** Either the terminal isn't in the folder holding `docker-compose.yml`, or the file is really called `docker-compose.yml.txt` — Windows hides the extension. Type `dir` (Windows) or `ls` (Mac) to see the real filenames.
+
+**`error during connect` or `port is already allocated`.** The first means Docker Desktop hasn't finished starting — wait for **Engine running** and re-run. The second means something else is using port 38420 — change the left-hand number in `docker-compose.yml` to e.g. `38421:8000` and re-run.
 
 **Other devices can't open the page (Docker Desktop).** Firewall. See [Letting phones and tablets reach it](#letting-phones-and-tablets-reach-it). Confirm it works at `http://localhost:38420` on the host first — if that fails, it's not the firewall.
 
-**Pairing fails immediately.** Confirm the TV is on the same network and ports 6466/6467 are reachable. Some Google TV devices have the Remote Service enabled but firewalled until a power cycle.
+**Pairing fails immediately.** Is the TV actually on and awake? Then confirm it's on the same network and ports 6466/6467 are reachable. Some Google TV devices have the Remote Service enabled but firewalled until a power cycle.
 
 **`InvalidAuth` on startup.** The pairing certificate was rejected — the TV revoked it, or the files got out of sync. Set `RESET_PAIRING: "1"` in `docker-compose.yml`, restart, pair again, then take the flag back out.
 
@@ -261,7 +285,7 @@ Every setting, volume control and reverse-proxy notes: **[docs/CONFIGURATION.md]
 
 **Auto-advance is early or late.** You're in the no-Lounge fallback, running on a duration estimate. Pair Lounge to fix it properly, or use Skip to realign.
 
-**A video shows a 10:00 duration that's obviously wrong.** The metadata scrape failed and fell back to `DEFAULT_DURATION_S`. Look for `metadata fetch failed` in the logs — usually transient. Playback is fine; only the auto-advance timing is off.
+**A video shows a 10:00 duration that's obviously wrong,** or its title shows as a jumble of letters. The lookup to YouTube failed, so it fell back to an assumed 10 minutes. This isn't cosmetic: that fake length drives auto-advance, so a long video gets skipped 10 minutes in. Look for `metadata fetch failed` in the logs; if it happens often, your connection is slow to reach YouTube — raise `METADATA_TIMEOUT_S` (see [docs/CONFIGURATION.md](docs/CONFIGURATION.md)).
 
 **Reading the logs:**
 
@@ -283,6 +307,7 @@ The README covers getting it running. Everything else lives here:
 | **[docs/CONFIGURATION.md](docs/CONFIGURATION.md)** | Every environment variable, volume control, timezones |
 | **[docs/API.md](docs/API.md)** | HTTP endpoints and the SSE stream, for webhooks and Home Assistant |
 | **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)** | How it works internally, module layout, running from source, contributing |
+| **[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)** | Licences of the bundled dependencies — read before redistributing the image |
 
 ---
 
@@ -290,22 +315,17 @@ The README covers getting it running. Everything else lives here:
 
 Rough order, no dates — this is a spare-time project.
 
-- **Verified support for other streaming sticks and boxes** — Fire TV, Nvidia Shield, Chromecast with Google TV, onn./Xiaomi. Some may already work; none are tested.
+- **Verified support for other streaming sticks and boxes** — Nvidia Shield, onn./Xiaomi, and possibly Fire TV. Some may already work; none are tested.
 - **More AVR brands** for volume control — Yamaha, Onkyo, Sony and friends.
 
-Got one of the untested devices? Reports either way are genuinely useful — open an issue.
+Got one of the untested devices? Reports either way are genuinely useful — [open an issue](https://github.com/Alice-Sabrina-Ivy/smarttube-playlist/issues).
 
 ---
 
 ## License
 
-This project's own source is **MIT** — see [LICENSE](LICENSE).
+This project's own source is **MIT** — see [LICENSE](LICENSE). Built on [tronikos/androidtvremote2](https://github.com/tronikos/androidtvremote2) and [FabioGNR/pyytlounge](https://github.com/FabioGNR/pyytlounge).
 
-It depends on third-party packages under their own licenses:
-
-- [tronikos/androidtvremote2](https://github.com/tronikos/androidtvremote2) — Apache-2.0
-- [FabioGNR/pyytlounge](https://github.com/FabioGNR/pyytlounge) — **GPL-3.0**
-
-A note on that last one: pyytlounge's PyPI classifier claims MIT, but the LICENSE file shipped inside the package *and* in the upstream repository is the GNU GPL v3. Where a classifier and a license file disagree, the license file governs. A container image built from this repository bundles that GPL-3.0 code, so the image as distributed is a combined work carrying GPL-3.0 obligations — even though this repository's own source stays MIT and you can use it under MIT terms.
+The prebuilt container image bundles pyytlounge (GPL-3.0), so **the image as a whole is distributed under GPL-3.0-or-later**, even though this repository's source is MIT. Redistributing the image? Read [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) first.
 
 Not affiliated with, endorsed by, or connected to Google, YouTube, or the SmartTube project. "SmartTube" and "YouTube" are the marks of their respective owners; they're used here only to describe what this software talks to.

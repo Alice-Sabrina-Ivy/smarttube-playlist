@@ -60,11 +60,17 @@ jobs:
         uses: docker/metadata-action@v5
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          # `latest` is emitted for BOTH a push to the default branch and a
+          # release tag. The default-branch case matters: docker-compose.yml
+          # pulls :latest, so without it the very first publish would leave
+          # every new user's `docker compose up -d` failing with
+          # "manifest unknown" until the first vX.Y.Z tag was cut.
           tags: |
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
             type=ref,event=branch
             type=ref,event=pr
+            type=raw,value=latest,enable={{is_default_branch}}
             type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') }}
 
       - name: Build and push
