@@ -18,8 +18,16 @@ This works, and it's used daily on the setup it was built for. It is not finishe
 
 **What's supported today:**
 
-- **Google TV devices only**, including Chromecast with Google TV. That's the only hardware this has been developed and tested against. The Android TV Remote v2 protocol underneath is common to Android TV generally, so other boxes and sticks may well work — but nobody has verified it, and Fire TV runs Fire OS, which may not expose the Remote service at all. Tried one? Please [open an issue](https://github.com/Alice-Sabrina-Ivy/smarttube-playlist/issues) and say what happened, working or not.
-- **Volume and mute**, sent over HDMI-CEC to whatever is producing the sound — your TV, soundbar or amplifier. Needs CEC volume control switched on; see [Volume and mute](#volume-and-mute).
+**Verified on real hardware:**
+
+| Device | Pairing | Playback | Wake from off | Volume / mute |
+|---|---|---|---|---|
+| Google TV Streamer (4K) | ✓ | ✓ | ✓ | ✓ (via HDMI-CEC) |
+| Chromecast with Google TV (4K) | ✓ | ✓ | ✓ | ✓ (device's own output — that TV has no CEC) |
+
+Everything in that table was exercised end to end on the actual devices, including pairing, YouTube Lounge, pause/resume, auto-advance, the wake-from-sleep sequence, and returning the TV to its screensaver.
+
+**Other Google TV and Android TV hardware** — Nvidia Shield, onn., Xiaomi and the rest — uses the same Android TV Remote v2 protocol and will most likely work, but nobody has confirmed it. Fire TV runs Fire OS and may not expose the Remote service at all. Tried one? Please [open an issue](https://github.com/Alice-Sabrina-Ivy/smarttube-playlist/issues) and say what happened, working or not.
 
 Where this is heading: see [Roadmap](#roadmap).
 
@@ -166,7 +174,7 @@ This is the same protocol the official Google TV mobile app uses. The TV will re
 
 **2. Pair YouTube Lounge** *(optional, strongly recommended)*
 
-On the TV: **SmartTube → Settings → "Link with TV code"**. A **12-digit code** appears. Paste it into the web UI's *Pair YouTube Lounge* card.
+On the TV: **SmartTube → Settings → Remote control**. A **12-digit code** appears — paste it into the web UI's *Pair YouTube Lounge* card. (Older guides call this "Link with TV code"; it moved. Verified on SmartTube 32.10.)
 
 This is the same mechanism as "play on TV" in the YouTube mobile app; SmartTube implements the receiver side. Skipping it still works, but you lose real playback position and precise end-of-video detection — see [Honest limitations](#honest-limitations).
 
@@ -207,11 +215,14 @@ For the two-protocol design, why Google Cast wasn't used, and how playback is ac
 
 ## Volume and mute
 
-The volume and mute buttons ask your streaming device to send an **HDMI-CEC volume command** to whatever is making the sound — TV speakers, a soundbar, or an amplifier. Nothing to set up, and brand doesn't matter.
+The volume and mute buttons work on both devices this has been tested on, by two different routes depending on the hardware:
 
-The catch: **HDMI-CEC volume control has to be enabled**. It's on by default, so it probably already is — but if the buttons do nothing, that's the first thing to check. Every manufacturer gives CEC a different name (Samsung calls it *Anynet+*, LG *SIMPLINK*, Sony *BRAVIA Sync*), which makes it annoying to find. The full list, and where to look on the streaming device itself, is in [docs/CONFIGURATION.md](docs/CONFIGURATION.md#volume-and-mute).
+- **Over HDMI-CEC** to whatever is making the sound — TV speakers, a soundbar, or an amplifier.
+- **By the streaming device's own output volume**, when there's no CEC link to use.
 
-If your gear can't do CEC, there's no volume control — the buttons just won't do anything.
+You don't choose; the device does. Nothing to configure either way.
+
+If the buttons do nothing, the usual cause is **HDMI-CEC volume control being switched off**. It's normally on by default. Every manufacturer calls CEC something different — Samsung *Anynet+*, LG *SIMPLINK*, Sony *BRAVIA Sync* — which makes it maddening to search for. The full list and where to look is in [docs/CONFIGURATION.md](docs/CONFIGURATION.md#volume-and-mute).
 
 ---
 

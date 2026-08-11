@@ -34,9 +34,16 @@ services:
 
 ## Volume and mute
 
-The page has volume and mute buttons. They work by asking your streaming device to send an **HDMI-CEC volume command** to whatever is actually producing the sound — your TV's speakers, a soundbar, or an AV receiver. Nothing to configure, and it doesn't matter what brand any of it is.
+The volume and mute buttons send `VOLUME_UP` / `VOLUME_DOWN` / `VOLUME_MUTE` over the same connection used to control the TV. What happens next depends on the hardware, and both outcomes have been verified:
 
-There is one prerequisite: **HDMI-CEC volume control has to be switched on**. It's on by default, so most people already have it. If the buttons do nothing, that's almost certainly why.
+- **HDMI-CEC.** The streaming device turns the keypress into a CEC volume command aimed at whatever is doing the audio — TV speakers, soundbar, or AV receiver. Brand-agnostic. Confirmed against a Denon receiver: each press moved it one step.
+- **The device's own output volume.** With no CEC link available, the streaming device attenuates its own HDMI output instead. Confirmed on a Chromecast with Google TV plugged into a TV with no CEC at all — volume tracked exactly.
+
+There is nothing to choose or configure. The device picks whichever applies.
+
+### If the buttons do nothing
+
+The usual cause is **HDMI-CEC volume control being switched off**. It's on by default, but not always — it was off on one of the two devices tested here, which is what made volume look impossible at first.
 
 CEC is branded differently by nearly every manufacturer, which makes it hard to search for. It's the same feature under all these names:
 
@@ -52,11 +59,9 @@ CEC is branded differently by nearly every manufacturer, which makes it hard to 
 | TCL | T-Link |
 | Toshiba | Regza Link / CE-Link |
 
-Enable it on the TV **and** on the receiver or soundbar if you have one — the chain only works if every device in it has CEC on.
+Enable it on the TV **and** on the receiver or soundbar if you have one — the chain only works if every device in it has CEC on. On the streaming device, look under **Settings → Display & Sound → HDMI-CEC** (wording varies by device and Android version).
 
-On the streaming device itself, look under **Settings → Display & Sound → HDMI-CEC** (wording varies by device and Android version) and make sure volume control is enabled there too.
-
-If your setup can't do CEC at all, there's no volume control — the buttons will simply do nothing. That's a real gap, and it's on the [roadmap](../README.md#roadmap).
+If your TV has no CEC at all, that isn't necessarily fatal: a streaming stick may still adjust its own output volume, which is exactly what happens on the Chromecast tested here.
 
 ## Behind a reverse proxy
 
