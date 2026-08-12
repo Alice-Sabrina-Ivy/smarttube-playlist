@@ -96,8 +96,13 @@ docker compose pull && docker compose up -d
 
 Your `data` directory is untouched, so no re-pairing. Portainer users: **Pull and redeploy** on the stack.
 
-The compose file tracks `:latest`. To pin a specific release instead, change the tag:
+The compose file tracks `:latest`, which follows the newest build from `main` — so a redeploy picks up whatever has landed since. That's the intended default.
+
+If you'd rather only move when you choose to, pin a tag instead:
 
 ```yaml
-image: ghcr.io/alice-sabrina-ivy/smarttube-playlist:1.0.0
+image: ghcr.io/alice-sabrina-ivy/smarttube-playlist:1.0   # exactly this release
+image: ghcr.io/alice-sabrina-ivy/smarttube-playlist:1     # newest 1.x
 ```
+
+Every published version stays available, so a pin can sit unchanged for as long as you like, and you can always drop back to an older one. See the [releases](https://github.com/Alice-Sabrina-Ivy/smarttube-playlist/releases).
