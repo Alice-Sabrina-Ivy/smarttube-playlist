@@ -23,7 +23,7 @@ Used daily on the setup it was built for, but not finished, and only proven on t
 | Google TV Streamer (4K) | ✓ | ✓ | ✓ | ✓ (via HDMI-CEC) |
 | Chromecast with Google TV (4K) | ✓ | ✓ | ✓ | ✓ (device's own output — that TV has no CEC) |
 
-Each was exercised end to end: pairing, Lounge, pause/resume, auto-advance, wake-from-sleep, and returning the TV to its screensaver.
+Each exercised end to end: pairing, Lounge, pause/resume, auto-advance, wake-from-sleep, screensaver return.
 
 **Other Android TV hardware** — Nvidia Shield, onn., Xiaomi — uses the same protocol and will most likely work, but nobody has confirmed it. Fire TV runs Fire OS and may not expose the Remote service at all. Tried one? [Open an issue](https://github.com/Alice-Sabrina-Ivy/smarttube-playlist/issues) either way.
 
@@ -44,39 +44,13 @@ This is the easier alternative: one page on your LAN, anyone pastes a link, the 
 ## What you'll need
 
 - A **Google TV** device — verified on the Google TV Streamer and Chromecast with Google TV. Other Android TV hardware most likely works but is unconfirmed; see [Project status](#project-status--work-in-progress).
-- **[SmartTube](https://smarttubeapp.github.io/)** installed on it. It's a separate project from this one, it isn't on the Play Store, and you install it yourself — **[Never heard of SmartTube?](#never-heard-of-smarttube)** walks you through it.
+- **[SmartTube](https://smarttubeapp.github.io/)** installed on it. It's a separate project from this one, it isn't on the Play Store, and you install it yourself — **[docs/INSTALL-SMARTTUBE.md](docs/INSTALL-SMARTTUBE.md)** walks you through it.
 - A computer that can run Docker and stays on while you're watching — a PC, a Mac, a NAS, a Raspberry Pi (64-bit OS), whatever you have.
 - Both on the **same network** as the TV.
 - **An internet connection** on that computer — video titles and lengths come from YouTube, and playback commands relay through YouTube's servers. Only the web page itself is LAN-only.
 - The TV's IP address (Settings → Network, or your router's device list).
 
 **Give the TV a permanent address** if you can — most routers call this a *DHCP reservation* or *static lease*, usually in the router's device list. Optional, but if the TV's address changes this app stops finding it, and re-pairing means setting `RESET_PAIRING: "1"` in `docker-compose.yml` and restarting (the pairing screen is hidden once a TV is paired).
-
-### Never heard of SmartTube?
-
-[SmartTube](https://smarttubeapp.github.io/) is a free, ad-free YouTube app for TV devices — the same YouTube, without the adverts. It's a separate project, and it's what this app sends your videos to, so it needs to be on the TV first.
-
-**Runs on:** Android TV and Google TV devices — Chromecast with Google TV, Nvidia Shield, Xiaomi Mi Box, onn. boxes, and most Android TV boxes and built-in Android TVs.
-
-**Doesn't run on:** phones and tablets, Samsung (Tizen) and LG (webOS) TVs, Apple TV, Roku. Fire TV is in between — SmartTube supports older ones, and this app may not work with Fire TV regardless.
-
-**Installing it.** SmartTube is **not on the Play Store** — you install it yourself, and only from the official source: its developer warns that copies on app stores and APK sites may contain malware.
-
-Easiest route, done entirely on the TV:
-
-1. From the Play Store on your TV, install **Downloader by AFTVnews**.
-2. Open Downloader and type this into its address box:
-
-   ```
-   kutt.to/stn_stable
-   ```
-
-3. It downloads the official APK. Accept the prompts — Android asks you to allow installs from Downloader — then install.
-4. Open SmartTube once and play something, to confirm it works.
-
-Other methods (USB stick, "Send Files to TV", ADB) are at [smarttubeapp.github.io](https://smarttubeapp.github.io/).
-
----
 
 ## Setup
 
@@ -99,24 +73,22 @@ If you just want to try it, start with **Option A**. You can move it to a NAS la
 - [Download for Windows](https://docs.docker.com/desktop/install/windows-install/)
 - [Download for Mac](https://docs.docker.com/desktop/install/mac-install/) — pick the Apple Silicon or Intel build to match your Mac
 
-Run the installer, then launch Docker Desktop. Wait until the whale icon settles and the bottom-left corner says **Engine running**. On Windows it may ask to install WSL 2 and reboot — let it.
+Run the installer and launch it. Wait until the bottom-left says **Engine running**. On Windows it may ask to install WSL 2 and reboot — let it.
 
 **2. Make a folder for it.**
 
-Anywhere you like, e.g. `Documents\smarttube-playlist`. Everything lives here, including your TV pairing.
+Anywhere, e.g. `Documents\smarttube-playlist`. Everything lives here, including your TV pairing.
 
 **3. Save the configuration file into that folder.**
 
-Download [`docker-compose.yml`](docker-compose.yml) (click **Raw**, then save) into the folder you just made.
+Download [`docker-compose.yml`](docker-compose.yml) (click **Raw**, then save) into that folder. No need to edit it — the defaults work.
 
-> **Windows:** turn on File Explorer → **View → Show → File name extensions** first, so you can see the real filename. It must be exactly `docker-compose.yml` — a hidden `.txt` on the end is the single most common thing that goes wrong here. From Notepad, set *Save as type* to **All Files**.
-
-You don't need to edit it. The defaults work as-is.
+> **Windows:** first turn on File Explorer → **View → Show → File name extensions**, so you can see the real filename. It must be exactly `docker-compose.yml` — a hidden `.txt` on the end is the most common thing that goes wrong here. From Notepad, set *Save as type* to **All Files**.
 
 **4. Open a terminal in that folder.**
 
-- **Windows:** open the folder in File Explorer, right-click a blank area, choose **Open in Terminal**. (Windows 10: hold **Shift** while right-clicking, then **Open PowerShell window here**.)
-- **Mac:** right-click the folder, choose **Services → New Terminal at Folder**. (If it's not there: enable it in System Settings → Keyboard → Keyboard Shortcuts → Services.)
+- **Windows:** right-click a blank area in the folder → **Open in Terminal**. (Windows 10: **Shift**+right-click → **Open PowerShell window here**.)
+- **Mac:** right-click the folder → **Services → New Terminal at Folder**. (Missing? Enable it in System Settings → Keyboard → Keyboard Shortcuts → Services.)
 
 **5. Start it.**
 
@@ -124,30 +96,30 @@ You don't need to edit it. The defaults work as-is.
 docker compose up -d
 ```
 
-First run downloads the image — a minute or two. `-d` runs it in the background; the `restart: unless-stopped` line in the compose file is what brings it back whenever Docker Desktop starts. When it finishes you'll see a line ending in `Container smarttube-playlist  Started`, and the container shows green in Docker Desktop's **Containers** tab.
+First run downloads the image — a minute or two. You'll see `Container smarttube-playlist  Started`, and it shows green in Docker Desktop's **Containers** tab. It restarts with Docker Desktop from then on.
 
 **6. Open the page.**
 
 <http://localhost:38420>
 
-The page should load. Two short things worth reading below before you pair.
+It should load. Two short things before you pair.
 
 #### Letting phones and tablets reach it
 
-`localhost` only works on the computer running it. For everyone else on the network you need that computer's LAN IP:
+`localhost` only works on the computer running it. Everyone else needs that computer's LAN address:
 
 - **Windows:** `ipconfig` → *IPv4 Address* under your active adapter
 - **Mac:** System Settings → Network → your connection → *Details*
 
-Then browse to `http://<that-ip>:38420` from any device on the LAN — e.g. `http://192.168.1.50:38420`.
+Then browse to `http://<that-address>:38420` from any device on the network.
 
-**Windows only:** the first time you run it, Windows Defender Firewall pops up asking whether to allow Docker Desktop. Tick **Private networks** and allow it. If you missed the prompt and other devices can't connect, go to *Windows Security → Firewall & network protection → Allow an app through firewall*, find Docker Desktop, and make sure **Private** is ticked.
+**Windows only:** on first run, Windows Defender Firewall asks whether to allow Docker Desktop — tick **Private networks** and allow it. Missed the prompt and nothing else can connect? *Windows Security → Firewall & network protection → Allow an app through firewall*, find Docker Desktop, tick **Private**.
 
 #### The honest catch with Docker Desktop
 
-The service is only alive while that computer is powered on, awake, and running Docker Desktop. If the machine sleeps mid-video, playback on the TV continues but the queue stops advancing and the web page goes dead until it wakes.
+It's only alive while that computer is on, awake, and running Docker Desktop. If the machine sleeps mid-video, the TV keeps playing but the queue stops advancing and the page goes dead until it wakes.
 
-Fine for trying it out or for movie night on a desktop that's already on. For something that just works whenever guests are over, move it to a NAS or a Pi using Option B.
+Fine for trying it out, or movie night on a desktop that's already on. For something always available, move it to a NAS or Pi — Option B.
 
 **Option A is done — skip Option B entirely and go to [Pair with your TV](#pair-with-your-tv).**
 
@@ -193,38 +165,9 @@ Your answers persist to the `data` folder, so this is a one-time job.
 - **Pause/Resume** works whether or not Lounge is paired.
 - The page updates live for everyone with it open — adds, removes, skips, and advances show up without refreshing.
 
-If your TV is asleep, adding a video wakes it, waits for it to boot, foregrounds SmartTube, and plays. That whole sequence takes about 15–20 seconds on most TVs.
+If your TV is asleep, adding a video wakes it, waits for it to boot, foregrounds SmartTube, and plays — about 15–20 seconds on most TVs.
 
----
-
-## Give your guests a QR code
-
-Nobody wants an IP address read out to them at a party. Make a QR code of the page and guests scan it with their camera — no app, no typing.
-
-Encode the LAN address, **not** `localhost`:
-
-```
-http://192.168.1.50:38420
-```
-
-⚠️ **Example IP** — use your own, from [Letting phones and tablets reach it](#letting-phones-and-tablets-reach-it).
-
-**Easiest:** [goqr.me](https://goqr.me/) → pick **URL** → paste → download the PNG. Free, no sign-up. Any generator works; a `192.168.x.x` address means nothing outside your home.
-
-**Offline instead**, replacing the address with yours:
-
-```bash
-qrencode -o queue.png "http://192.168.1.50:38420"    # brew/apt install qrencode
-
-pip install "qrcode[pil]"                            # any OS
-qr "http://192.168.1.50:38420" > queue.png
-qr --ascii "http://192.168.1.50:38420"               # preview in the terminal
-```
-
-Print it and stick it by the TV or on the fridge. Two things break it:
-
-- **The host's address changing.** Give that machine a DHCP reservation, as [suggested for the TV](#what-youll-need). Or encode a name — `http://mynas:38420` survives address changes, and single-label names are accepted.
-- **Guests not on your Wi-Fi.** Mobile data or an isolated guest network won't reach it, which may be deliberate — see [Security](#security-in-one-paragraph).
+**Guests coming over?** Stick a QR code of the page on the fridge and they can scan straight to it: [docs/QR-CODE.md](docs/QR-CODE.md).
 
 ---
 
@@ -245,14 +188,9 @@ For the two-protocol design, why Google Cast wasn't used, and how playback is ac
 
 ## Volume and mute
 
-The volume and mute buttons work on both devices this has been tested on, by two different routes depending on the hardware:
+The volume and mute buttons reach your TV, soundbar or amplifier over HDMI — nothing to configure, and it worked on both tested devices.
 
-- **Over HDMI-CEC** to whatever is making the sound — TV speakers, a soundbar, or an amplifier.
-- **By the streaming device's own output volume**, when there's no CEC link to use.
-
-You don't choose; the device does. Nothing to configure either way.
-
-If the buttons do nothing, the usual cause is **HDMI-CEC volume control being switched off**. It's normally on by default. Every manufacturer calls CEC something different — Samsung *Anynet+*, LG *SIMPLINK*, Sony *BRAVIA Sync* — which makes it maddening to search for. The full list and where to look is in [docs/CONFIGURATION.md](docs/CONFIGURATION.md#volume-and-mute).
+If they do nothing, HDMI-CEC volume control is switched off somewhere. Note your TV probably calls CEC something else entirely (*Anynet+*, *SIMPLINK*, *BRAVIA Sync*): [docs/CONFIGURATION.md](docs/CONFIGURATION.md#volume-and-mute).
 
 ---
 
@@ -266,30 +204,21 @@ Cross-site requests and DNS rebinding are both blocked, pairing can't be hijacke
 
 ## Configuration
 
-Everything is optional — the defaults work, and most people change nothing. The ones people actually touch:
+Everything is optional and the defaults work — most people change nothing. Set anything you do want as an environment variable in `docker-compose.yml`.
 
-| Variable | Default | What it does |
-|---|---|---|
-| `SMARTTUBE_PACKAGE` | `org.smarttube.stable` | Set to `org.smarttube.beta` for the beta build |
-| `WAKE_DELAY` | `15.0` | Raise it if the TV wakes but the video doesn't start |
-| `LOG_LEVEL` | `INFO` | Set `DEBUG` when something's wrong |
-| `RESET_PAIRING` | (unset) | Set to `1` and restart to clear pairing and start over |
-
-Every setting, volume control and reverse-proxy notes: **[docs/CONFIGURATION.md](docs/CONFIGURATION.md)**.
+Every setting, with what it's for: **[docs/CONFIGURATION.md](docs/CONFIGURATION.md)**.
 
 ---
 
-## Updating, stopping, removing
+## Updating
 
-Open a terminal in the folder with `docker-compose.yml` and run:
+In the folder with `docker-compose.yml`:
 
 ```bash
 docker compose pull && docker compose up -d
 ```
 
-Your `data` folder is untouched, so you won't have to pair again. The same command applies any setting you changed in `docker-compose.yml`. Portainer users: hit **Pull and redeploy** on the stack instead.
-
-To stop it: `docker compose down`. To remove it entirely, stop it and delete the folder — nothing was ever installed on the TV, though you can revoke the pairing under *Settings → Apps → See all apps → Show system apps → Android TV Remote Service*.
+Your pairing is kept. Stopping and removing it: [docs/ADVANCED-SETUP.md](docs/ADVANCED-SETUP.md#updating-stopping-removing).
 
 ---
 
@@ -306,6 +235,8 @@ The README covers getting it running. Everything else lives here:
 | | |
 |---|---|
 | **[docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md)** | Symptoms and fixes, from install errors to playback oddities |
+| **[docs/INSTALL-SMARTTUBE.md](docs/INSTALL-SMARTTUBE.md)** | Installing SmartTube on the TV, and which devices can run it |
+| **[docs/QR-CODE.md](docs/QR-CODE.md)** | Make a QR code so guests scan straight to the page |
 | **[docs/ADVANCED-SETUP.md](docs/ADVANCED-SETUP.md)** | Linux, NAS and homelab installs: Docker Engine, Portainer, where data lives, port binding, reverse proxies, building from source |
 | **[SECURITY.md](SECURITY.md)** | Threat model, what the no-auth design means, DNS-rebinding and CSRF protection, reverse proxies, resetting a pairing |
 | **[docs/CONFIGURATION.md](docs/CONFIGURATION.md)** | Every environment variable, volume control, timezones |
@@ -317,12 +248,12 @@ The README covers getting it running. Everything else lives here:
 
 ## Roadmap
 
-Rough order, no dates — this is a spare-time project.
+No dates — spare-time project.
 
-- **Verified support for other streaming sticks and boxes** — Nvidia Shield, onn./Xiaomi, and possibly Fire TV. Some may already work; none are tested.
-- **Volume for devices without working HDMI-CEC** — currently those users get no volume control at all.
+- **Verified support for other sticks and boxes** — Nvidia Shield, onn./Xiaomi, possibly Fire TV.
+- **Volume where HDMI-CEC isn't available** — those users currently get none.
 
-Got one of the untested devices? Reports either way are genuinely useful — [open an issue](https://github.com/Alice-Sabrina-Ivy/smarttube-playlist/issues).
+Got one of the untested devices? [Open an issue](https://github.com/Alice-Sabrina-Ivy/smarttube-playlist/issues) either way.
 
 ---
 

@@ -88,13 +88,15 @@ docker compose up -d --build
 
 For running it without Docker at all, plus the module layout, see [ARCHITECTURE.md](ARCHITECTURE.md).
 
-## Updating
+## Updating, stopping, removing
 
 ```bash
 docker compose pull && docker compose up -d
 ```
 
-Your `data` directory is untouched, so no re-pairing. Portainer users: **Pull and redeploy** on the stack.
+Your `data` directory is untouched, so no re-pairing. The same command applies any setting you changed in `docker-compose.yml`. Portainer users: **Pull and redeploy** on the stack instead.
+
+To stop it: `docker compose down`. To remove it entirely, stop it and delete the folder — nothing was ever installed on the TV, though you can revoke the pairing under *Settings → Apps → See all apps → Show system apps → Android TV Remote Service*.
 
 The compose file tracks `:latest`, which follows the newest build from `main` — so a redeploy picks up whatever has landed since. That's the intended default.
 
