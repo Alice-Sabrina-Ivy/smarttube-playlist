@@ -11,6 +11,8 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import ipaddress
+from collections import deque
+from datetime import datetime, timezone
 import json
 import logging
 import os
@@ -200,6 +202,65 @@ VOLUME_KEYCODES = {
     "down": "VOLUME_DOWN",
     "mute": "VOLUME_MUTE",
 }
+
+# ── beta-only diagnostics ────────────────────────────────────────────────────
+# This project is verified on hardware the maintainer owns. Supporting anything
+# else means asking someone who owns it to tell us what their device does — and
+# a list of twenty questions over text message is a poor way to do that.
+#
+# So every device event we observe goes into a small ring buffer, and
+# /api/diagnostics renders it as one pasteable report. The single most valuable
+# field is the history of `current_app` values: it is how we learn what a given
+# device calls its screensaver and its launcher, which is exactly the thing that
+# breaks launching on unfamiliar hardware (screensavers silently swallow
+# app-launch intents, so a screensaver we don't recognise is never dismissed).
+#
+# Bounded on purpose: a long-running container must not grow a log forever.
+DEVICE_LOG_MAX = 200
+_device_log: deque = deque(maxlen=DEVICE_LOG_MAX)
+
+# Foreground packages that are expected and therefore not screensaver suspects.
+# Launchers are included because "sitting on the home screen" is normal, not a
+# fault — listing them keeps the suspect list short enough to act on.
+KNOWN_BENIGN_PACKAGES = frozenset({
+    "com.google.android.tvlauncher",         # Android TV launcher
+    "com.google.android.apps.tv.launcherx",  # Google TV launcher
+    "com.android.tv.settings",
+    "com.google.android.katniss",            # Assistant / search overlay
+    "android",                               # the system app-chooser dialog
+})
+
+
+def _record_device_event(kind: str, value) -> None:
+    """Append one observed device event. Never raises: diagnostics must not be
+    able to break playback."""
+    try:
+        _device_log.append({
+            "t": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "kind": kind,
+            "value": str(value),
+        })
+    except Exception:
+        # Non-fatal by design — diagnostics must never break playback — but
+        # logged, because a silent except here once hid a NameError and made
+        # the report claim the device had produced no events at all.
+        log.warning("diagnostics: could not record %s event", kind, exc_info=True)
+
+
+def _diagnostic_host() -> Optional[str]:
+    """The TV's address, unmasked.
+
+    Beta builds report the real address: it is genuinely useful when diagnosing
+    an unfamiliar device (wrong subnet, wrong device, stale pairing), and these
+    reports go to someone the operator chose to share them with. Credentials are
+    still never included — the certificate, its key and the Lounge token stay
+    out, and that part is not negotiable.
+
+    If a report is pasted somewhere public, note this is an RFC1918 address and
+    is meaningless outside the network it belongs to.
+    """
+    return state.host
+
 
 YT_REGEX = re.compile(r"(?:v=|youtu\.be/|/shorts/|/embed/|/live/)([A-Za-z0-9_-]{11})")
 ID_REGEX = re.compile(r"^[A-Za-z0-9_-]{11}$")
@@ -435,6 +496,7 @@ def _on_current_app_changed(new_app: str) -> None:
     suppress_lounge flag based on whether SmartTube is foreground."""
     prev = state.last_current_app
     state.last_current_app = new_app
+    _record_device_event("current_app", new_app)
     was_suppressed = state.suppress_lounge
     state.suppress_lounge = (new_app != SMARTTUBE_PACKAGE)
     queue_controller.on_current_app_changed(prev, new_app)
@@ -470,6 +532,7 @@ def _on_is_on_changed(is_on: bool) -> None:
 
 
 async def _handle_is_on_change(is_on: bool) -> None:
+    _record_device_event("is_on", is_on)
     await queue_controller.update_tv_on(is_on)
     if not is_on:
         # Invalidate the cached foreground app — once the TV's off, we
@@ -548,6 +611,20 @@ async def _wait_for_smarttube_foreground(timeout: float, poll: float) -> bool:
         if _get_current_app() == SMARTTUBE_PACKAGE:
             return True
         await asyncio.sleep(poll)
+    # Say what was in the way, not just that we failed. On hardware we have
+    # never seen, an unrecognised screensaver is the likeliest cause: it eats
+    # the launch intent, and because it isn't in SCREENSAVER_PACKAGES we never
+    # dismissed it. Naming the package turns "it doesn't work" into a fix.
+    blocker = _get_current_app()
+    if blocker and blocker != SMARTTUBE_PACKAGE:
+        _record_device_event("launch_blocked_by", blocker)
+        if blocker not in SCREENSAVER_PACKAGES:
+            log.warning(
+                "SmartTube did not reach the foreground within %.1fs; %r was in "
+                "front and is NOT in SCREENSAVER_PACKAGES. If that is this "
+                "device's screensaver, add it: SCREENSAVER_PACKAGES=%s,%s",
+                timeout, blocker, ",".join(sorted(SCREENSAVER_PACKAGES)), blocker,
+            )
     return False
 
 
@@ -579,6 +656,12 @@ def _wire_callbacks(remote: AndroidTVRemote) -> None:
         state.last_current_app is not None
         and state.last_current_app != SMARTTUBE_PACKAGE
     )
+    # Seed the diagnostics log with what the device looks like right now. The
+    # buffer otherwise only records *changes*, so a tester who opens the report
+    # before touching anything would see an empty list and reasonably conclude
+    # the feature was broken.
+    _record_device_event("connected", "is_on=%s current_app=%s" % (
+        getattr(remote, "is_on", None), state.last_current_app))
     remote.add_current_app_updated_callback(_on_current_app_changed)
     remote.add_is_available_updated_callback(_on_is_available_changed)
     remote.add_is_on_updated_callback(_on_is_on_changed)
@@ -1533,6 +1616,58 @@ async def lounge_pair(req: LoungePairReq):
 def _require_paired() -> None:
     if not state.remote or state.pairing_in_progress:
         raise HTTPException(503, "not paired — visit the web UI to pair")
+
+
+@app.get("/api/diagnostics")
+async def diagnostics():
+    """One pasteable report for someone beta testing on hardware we don't own.
+
+    Beta builds only. Never contains credentials: no certificate, no private
+    key, no Lounge token. It does include the TV's local address, which is
+    useful for diagnosis — see _diagnostic_host.
+    """
+    seen = [e["value"] for e in _device_log if e["kind"] == "current_app"]
+    suspects = sorted({
+        pkg for pkg in seen
+        if pkg
+        and pkg != SMARTTUBE_PACKAGE
+        and pkg not in SCREENSAVER_PACKAGES
+        and pkg not in KNOWN_BENIGN_PACKAGES
+    })
+
+    remote = state.remote
+    return {
+        "version": VERSION,
+        "channel": "beta",
+        "tv_paired": _is_tv_paired(),
+        "lounge_paired": _is_lounge_paired(),
+        "lounge_connected": bool(
+            state.lounge_monitor and state.lounge_monitor.is_connected
+        ),
+        "host": _diagnostic_host(),
+        "device": {
+            "is_on": getattr(remote, "is_on", None) if remote else None,
+            "current_app": _get_current_app(),
+            # The field that distinguished our two known devices: the Streamer
+            # reports max=0 and drives volume over CEC, the Chromecast reports
+            # a real range and attenuates its own output.
+            "volume_info": (
+                dict(getattr(remote, "volume_info", None) or {}) if remote else None
+            ),
+        },
+        "config": {
+            "smarttube_package": SMARTTUBE_PACKAGE,
+            "screensaver_packages": sorted(SCREENSAVER_PACKAGES),
+            "screensaver_dismiss_key": SCREENSAVER_DISMISS_KEY,
+            "idle_keycode": IDLE_KEYCODE,
+            "wake_delay": WAKE_DELAY,
+        },
+        # Packages seen in the foreground that we neither expect nor know how to
+        # dismiss. On new hardware this is usually the screensaver, and usually
+        # the reason a video won't start.
+        "unrecognised_foreground_packages": suspects,
+        "events": list(_device_log),
+    }
 
 
 @app.get("/api/queue")

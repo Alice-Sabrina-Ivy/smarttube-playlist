@@ -256,6 +256,12 @@
     text-transform: uppercase;
   }
 
+  .beta-diag {
+    margin-top: 1rem;
+    padding-top: 0.85rem;
+    border-top: 1px dashed var(--phos-dim);
+  }
+  .beta-diag button { width: 100%; margin-top: 0.5rem; }
   .meta {
     display: grid; grid-template-columns: 1fr 1fr; gap: 0.4rem 1rem;
     font-size: 0.78rem; margin-top: 0.5rem;
@@ -683,9 +689,18 @@
       <dt>TV power</dt><dd id="meta-power">—</dd>
       <dt>Playback sync</dt><dd id="meta-lounge">—</dd>
     </dl>
+    <div class="beta-diag">
+      <p class="card-sub">
+        <strong>Beta build.</strong> If something doesn't work on your device,
+        copy the report and send it over — it says what your TV reported, and
+        includes your TV&#39;s local address but never any credentials.
+      </p>
+      <button id="btn-diag" class="muted">📋 Copy diagnostics</button>
+      <div id="toast-diag" class="toast"></div>
+    </div>
   </section>
 
-  <footer>SmartTube Playlist · <span id="app-version">v1.0</span> · <a href="https://opensource.org/licenses/MIT" target="_blank" rel="noopener noreferrer">MIT</a> · <a href="https://github.com/Alice-Sabrina-Ivy" target="_blank" rel="noopener noreferrer">Alice Sabrina Ivy</a></footer>
+  <footer>SmartTube Playlist · <span id="app-version">v1.01</span> · <a href="https://opensource.org/licenses/MIT" target="_blank" rel="noopener noreferrer">MIT</a> · <a href="https://github.com/Alice-Sabrina-Ivy" target="_blank" rel="noopener noreferrer">Alice Sabrina Ivy</a></footer>
 </div>
 
 <!-- ── Seek modal (opens via the "Seek" button on the now-playing card) ── -->
@@ -1522,6 +1537,33 @@
   $("btn-seek-go").addEventListener("click", submitSeekAbsolute);
   $("seek-input").addEventListener("keydown", (e) => {
     if (e.key === "Enter") submitSeekAbsolute();
+  });
+
+  $("btn-diag").addEventListener("click", async () => {
+    const btn = $("btn-diag"); btn.disabled = true;
+    try {
+      const report = await api("/api/diagnostics");
+      const text = JSON.stringify(report, null, 2);
+      let copied = false;
+      // navigator.clipboard requires a secure context. This page is plain http
+      // on a LAN, so that is usually unavailable — hence the fallback below.
+      if (navigator.clipboard && window.isSecureContext) {
+        try { await navigator.clipboard.writeText(text); copied = true; } catch (e) {}
+      }
+      if (copied) {
+        toast($("toast-diag"), "Copied. Paste it to whoever asked.", "ok");
+      } else {
+        const ta = document.createElement("textarea");
+        ta.value = text;
+        ta.setAttribute("readonly", "");
+        ta.style.cssText = "width:100%;height:12rem;margin-top:.5rem;background:var(--ink);color:var(--phos-bright);border:1px solid var(--phos-dim);font-family:'IBM Plex Mono',monospace;font-size:12px;";
+        btn.insertAdjacentElement("afterend", ta);
+        ta.focus(); ta.select();
+        toast($("toast-diag"), "Select all and copy the text below.", "ok");
+      }
+    } catch (e) {
+      toast($("toast-diag"), e.message, "err");
+    } finally { btn.disabled = false; }
   });
 
   $("btn-lounge-pair").addEventListener("click", async () => {

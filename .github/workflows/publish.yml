@@ -3,6 +3,7 @@ name: Publish container image
 # Builds a multi-arch image and pushes it to GitHub Container Registry.
 #
 #   push to main   -> ghcr.io/<owner>/smarttube-playlist:main
+#   push to beta   -> ghcr.io/<owner>/smarttube-playlist:beta  (hardware beta testing)
 #   tag v1.1       -> :1.1, :1, :latest  + a GitHub Release
 #   pull request   -> build only, never pushed (validates the Dockerfile)
 #
@@ -18,7 +19,7 @@ name: Publish container image
 
 on:
   push:
-    branches: [main]
+    branches: [main, beta]
     tags: ['v*.*']
   pull_request:
     branches: [main]
