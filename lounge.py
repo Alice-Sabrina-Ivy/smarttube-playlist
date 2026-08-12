@@ -192,9 +192,10 @@ class LoungeMonitor:
         self._auth: Optional[dict] = None
         self._stopped = False
         # Set by request_reconnect_now() to interrupt the subscribe loop's
-        # backoff sleep — used by tv_play right after market://launch
-        # foregrounds SmartTube, so we don't have to wait out a 5-60s
-        # exponential backoff before our next reconnect attempt.
+        # backoff sleep — used by tv_play before it waits on Lounge, so we
+        # don't sit out a 5-60s exponential backoff. That backoff is easy to
+        # land in: the sender gives up while SmartTube is backgrounded behind
+        # a screensaver, which is exactly when the next play arrives.
         self._wake_subscribe = asyncio.Event()
 
     @property

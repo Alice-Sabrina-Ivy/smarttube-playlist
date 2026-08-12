@@ -156,10 +156,6 @@ WAKE_POLL = float(os.environ.get("WAKE_POLL", "0.5"))
 WAKE_KEYCODE = os.environ.get("WAKE_KEYCODE", "POWER").strip() or "POWER"
 # Timeouts inside tv_play's launch path. Module-level so tests can stub
 # them down to milliseconds for fast unit tests.
-SMARTTUBE_FG_TIMEOUT = 3.0       # market://launch -> SmartTube foregrounded
-                                 # (measured: ~166ms typical; this is a poll-
-                                 # with-early-exit, so it just caps worst-case)
-SMARTTUBE_FG_POLL = 0.3
 # Lounge sender can be in a 5-60s exponential backoff sleep after SmartTube
 # has been backgrounded (e.g. during the screensaver). 15s comfortably
 # covers a typical post-foreground reconnect; we ALSO poke the monitor to
@@ -172,12 +168,6 @@ SCREENSAVER_DISMISS_DELAY = 0.3  # after the dismiss key, time for the OS to
                                  # settle (measured: ~100ms typical for HOME
                                  # to take dreamx off screen; we poll with
                                  # early-exit so this caps worst-case wait)
-# Post-setPlaylist nudge window: max time to wait for Lounge to report
-# state=Playing after setPlaylist, before sending a play() nudge for a
-# Paused load. Only used on the cold-boot / re-foreground path; hot-path
-# setPlaylist auto-plays and skips the nudge entirely.
-POST_SETPLAYLIST_TIMEOUT = 2.0
-POST_SETPLAYLIST_POLL = 0.2
 # Sequence of keycodes sent when /api/skip empties the queue. Comma-separated
 # so multi-step "go idle" routines work. The default "HOME,BACK" mirrors
 # pressing the home button then back on the physical remote — that's what
@@ -674,32 +664,6 @@ async def _reconnect_remote() -> bool:
     return await _attempt_startup_connect(state.host)
 
 
-async def _wait_for_smarttube_foreground(timeout: float, poll: float) -> bool:
-    """Poll until SmartTube is the foreground app, or until timeout. Used
-    after a market://launch send so we know SmartTube is actually ready
-    to receive the YouTube deep link before we fire it."""
-    deadline = asyncio.get_running_loop().time() + timeout
-    while asyncio.get_running_loop().time() < deadline:
-        if _get_current_app() == SMARTTUBE_PACKAGE:
-            return True
-        await asyncio.sleep(poll)
-    # Say what was in the way, not just that we failed. On hardware we have
-    # never seen, an unrecognised screensaver is the likeliest cause: it eats
-    # the launch intent, and because it isn't in SCREENSAVER_PACKAGES we never
-    # dismissed it. Naming the package turns "it doesn't work" into a fix.
-    blocker = _get_current_app()
-    if blocker and blocker != SMARTTUBE_PACKAGE:
-        _record_device_event("launch_blocked_by", blocker)
-        if blocker not in SCREENSAVER_PACKAGES:
-            log.warning(
-                "SmartTube did not reach the foreground within %.1fs; %r was in "
-                "front and is NOT in SCREENSAVER_PACKAGES. If that is this "
-                "device's screensaver, add it: SCREENSAVER_PACKAGES=%s,%s",
-                timeout, blocker, ",".join(sorted(SCREENSAVER_PACKAGES)), blocker,
-            )
-    return False
-
-
 async def _wait_for_lounge_connected(timeout: float, poll: float) -> bool:
     """Poll until our Lounge sender session is connected, or until timeout.
     Lounge typically (re)connects shortly after SmartTube foregrounds, so
@@ -772,8 +736,8 @@ async def _lounge_play() -> bool:
        paused then hit BACK on the remote) → fall through to tv_play()
        for the current item. tv_play's "foreground but idle" branch
        sends the deep link Intent and relaunches the player cleanly.
-    3. SmartTube NOT foreground → tv_play() runs the full launch
-       sequence (market://launch + deep link).
+    3. SmartTube NOT foreground → tv_play() sends the deep-link Intent,
+       which foregrounds SmartTube and starts playback in one step.
     4. Last resort → MEDIA_PLAY keycode.
 
     Note: we can't tell "player torn down" from Lounge observation
@@ -1089,8 +1053,9 @@ async def tv_play(video_id: str, start_s: Optional[int] = None) -> None:
     current_app = _get_current_app()
 
     # Dismiss the screensaver if it's foreground. Verified empirically:
-    # dreamx silently swallows send_launch_app_command intents — both
-    # market://launch and vnd.youtube.launch:// — leaving us stuck. Any
+    # dreamx silently swallows send_launch_app_command intents of every
+    # kind, including the vnd.youtube.launch:// one we rely on — leaving us
+    # stuck with no error to see. Any
     # navigation key dismisses the screensaver and returns the TV to
     # whatever app was foreground before it kicked in (typically SmartTube
     # or the launcher), and from there our normal launch flow works.
@@ -1126,8 +1091,9 @@ async def tv_play(video_id: str, start_s: Optional[int] = None) -> None:
     # exactly this case). The deep link is the right primitive here:
     # Android resolves `vnd.youtube.launch://` to SmartTube's Intent
     # handler, which launches SmartTube AND kicks playback fresh in
-    # one step. No market://launch needed — the Intent itself
-    # foregrounds the app.
+    # one step. Do NOT add a separate app-launch command before this:
+    # the Intent already foregrounds SmartTube, and sending both is the
+    # double-play regression (invariant 1).
     #
     # When SmartTube IS already foreground (had_to_foreground=False),
     # use Lounge primitives for a smooth swap (no PlaybackActivity

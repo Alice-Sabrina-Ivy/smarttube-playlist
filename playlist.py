@@ -931,8 +931,8 @@ class QueueController:
         launched twice), or as a stale tv_play waking the TV during
         the next one's setup. The
         cancelled tv_play raises CancelledError out of its sleep;
-        partial side-effects (POWER already sent, market://launch
-        already fired) are idempotent.
+        partial side-effects (wake key already sent, deep link already
+        fired) are idempotent.
         """
         for prior in list(self._send_tasks):
             if not prior.done():

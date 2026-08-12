@@ -13,12 +13,13 @@ Without Lounge the service is flying blind: it knows what it asked the TV to do,
 
 ## Starting a video
 
-1. If the TV reports off, send `POWER` and wait for it to come up. Instant-on TVs claim to be awake within about a second while the OS is still booting, so a minimum delay is enforced rather than trusting the "on" signal.
+1. If the TV reports off, send the wake key and wait for it to come up. Instant-on TVs claim to be awake within about a second while the OS is still booting, so a minimum delay is enforced rather than trusting the "on" signal.
 2. If a screensaver is in the foreground, dismiss it first — screensavers silently swallow app-launch intents.
-3. If SmartTube isn't in the foreground, launch it via `market://launch`.
-4. Send **exactly one** play signal: `setPlaylist` over Lounge when it's connected, otherwise a `vnd.youtube.launch://` deep link through the remote.
+3. Then one of two things, depending on whether SmartTube is already in front:
+   - **Not in front** (cold boot, screensaver, launcher, another app) — send a single `vnd.youtube.launch://` deep link and stop there. Android hands the Intent to SmartTube, which comes to the foreground *and* starts playing in one step, so no separate launch command is needed. This is the common case.
+   - **Already in front** — use Lounge instead, for a smoother swap: skip entirely if it's already playing that video, resume in place if it's genuinely paused mid-video, otherwise `setPlaylist`. If Lounge isn't reachable, or SmartTube is in front but idle, fall back to the same single deep link.
 
-That last point is load-bearing. Sending both makes SmartTube load the video twice, which is audible.
+Either way: **exactly one** play signal. Sending both makes SmartTube load the video twice, which is audible, and it is the most-repeated regression in this project's history.
 
 ## Auto-advance
 
