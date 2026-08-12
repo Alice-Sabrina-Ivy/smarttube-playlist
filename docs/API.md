@@ -29,6 +29,18 @@ POST   /api/pair/cancel                   abort an in-progress pairing
 POST   /api/lounge/pair    {code}         12-digit code from SmartTube; 409 if already paired
 ```
 
+### Beta build only
+
+```
+GET    /api/diagnostics                   passive report: reads state, sends nothing
+POST   /api/selftest                      start a device self-test; 202 + run id
+GET    /api/selftest                      progress while running, full report when done
+```
+
+`POST /api/selftest` returns immediately — the run takes about three minutes — so poll the `GET` for progress. It returns **409** while a run is in flight, and `/api/queue` and `/api/play` also return 409 for the duration: the self-test sends its own commands to the TV, and two senders at once is the double-play failure this project guards hardest against.
+
+Set `SELF_TEST=0` to remove the button and make `POST` return 503.
+
 ## Queue a video
 
 ```bash

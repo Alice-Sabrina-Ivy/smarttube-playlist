@@ -21,6 +21,8 @@ services:
 | `RATE_LIMIT_SECONDS` | `10` | Per-IP cool-down between queue submissions |
 | `WAKE_DELAY` | `15.0` | Minimum seconds to wait after `POWER` before launching. A floor, not a timeout — instant-on TVs report "on" in ~1s while still booting |
 | `WAKE_TIMEOUT` | `30.0` | Give up waiting for the TV to report on |
+| `SELF_TEST` | `1` | Beta builds only. `0` hides the **Run device self-test** button and makes the endpoint return 503. The self-test drives the TV — starts a short video, tries pause/resume and volume — so turn it off if you'd rather guests couldn't. It never puts the device to sleep |
+| `WAKE_KEYCODE` | `POWER` | Key sent to wake a sleeping device. `POWER` is a *toggle*; a device that ignores toggles while asleep can never be woken and reports no error. Try `WAKEUP` or `TV_POWER` if yours never wakes — but note `WAKEUP` is silently dropped on Google TV, so only change this if the default has failed |
 | `WAKE_POLL` | `0.5` | How often to re-check while waking |
 | `SCREENSAVER_PACKAGES` | `com.google.android.apps.tv.dreamx,com.google.android.backdrop` | Packages treated as screensavers; these swallow launch intents, so they get dismissed first |
 | `SCREENSAVER_DISMISS_KEY` | `HOME` | Key that dismisses the screensaver. `BACK` also works. `DPAD_CENTER` and `WAKEUP` are **not** supported — the remote protocol drops them silently |

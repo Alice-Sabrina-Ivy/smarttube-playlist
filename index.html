@@ -262,6 +262,33 @@
     border-top: 1px dashed var(--phos-dim);
   }
   .beta-diag button { width: 100%; margin-top: 0.5rem; }
+  .st-bar {
+    height: 6px; margin-top: 0.85rem;
+    background: var(--ink); border: 1px solid var(--phos-dim);
+  }
+  .st-bar > div {
+    height: 100%; width: 0;
+    background: var(--phos); box-shadow: 0 0 8px var(--phos);
+    transition: width 500ms linear;
+  }
+  .st-list { list-style: none; margin: 0.6rem 0 0; padding: 0; font-size: 0.78rem; }
+  .st-list li {
+    display: flex; gap: 0.5rem; align-items: baseline;
+    padding: 0.2rem 0; color: var(--phos-dim);
+  }
+  .st-list li .st-ico { width: 1.2rem; flex: 0 0 1.2rem; text-align: center; }
+  .st-list li .st-secs { margin-left: auto; opacity: 0.75; font-size: 0.72rem; }
+  /* Running is the brightest row: on a 2-minute run the one thing a tester
+     wants at a glance is "is it still moving". */
+  .st-list li.st-running { color: var(--phos-bright); }
+  .st-list li.st-ok      { color: var(--phos); }
+  .st-list li.st-bad     { color: var(--warn); }
+  #st-json {
+    width: 100%; height: 14rem; margin-top: 0.5rem;
+    background: var(--ink); color: var(--phos-bright);
+    border: 1px solid var(--phos-dim);
+    font-family: "IBM Plex Mono", monospace; font-size: 12px;
+  }
   .meta {
     display: grid; grid-template-columns: 1fr 1fr; gap: 0.4rem 1rem;
     font-size: 0.78rem; margin-top: 0.5rem;
@@ -696,6 +723,30 @@
         includes your TV&#39;s local address but never any credentials.
       </p>
       <button id="btn-diag" class="muted">📋 Copy diagnostics</button>
+
+      <p class="card-sub" id="st-intro" style="margin-top:0.9rem">
+        <strong>Device self-test.</strong> Everything above, plus live checks
+        against your TV: it starts a 19-second test video, tries pause, resume
+        and volume, then hands the TV back. Takes about
+        <span id="st-eta-intro">3 minutes</span> — please don&#39;t use the page
+        while it runs.
+        <br><br>
+        <strong>To test waking:</strong> turn the TV off with your own remote
+        first, then run this from your phone. The wake checks skip themselves
+        when the TV is already on, and nothing here ever puts your TV to sleep.
+      </p>
+      <button id="btn-selftest" class="muted">🔬 Run device self-test</button>
+
+      <div id="st-panel" hidden>
+        <div class="st-bar"><div id="st-fill"></div></div>
+        <p id="st-eta" class="card-sub" style="margin-top:0.4rem"></p>
+        <ol id="st-list" class="st-list"></ol>
+        <button id="btn-st-show" class="muted" hidden>📄 Show the report</button>
+        <div id="st-out" hidden>
+          <button id="btn-st-copy" class="muted">📋 Copy report</button>
+          <textarea id="st-json" readonly></textarea>
+        </div>
+      </div>
       <div id="toast-diag" class="toast"></div>
     </div>
   </section>
@@ -1565,6 +1616,160 @@
       toast($("toast-diag"), e.message, "err");
     } finally { btn.disabled = false; }
   });
+
+  // ── device self-test ─────────────────────────────────────────────────────
+  // One button; the backend runs every probe and this polls for progress.
+  // Polling rather than SSE on purpose: the SSE stream carries queue snapshots
+  // and adding a second message shape to it would touch the hot path for a
+  // beta-only diagnostic.
+  const ST_ICONS = {
+    pending: "·", running: "▸", ok: "✓",
+    skipped: "–", unmeasurable: "?", failed: "✕", cancelled: "✕",
+  };
+  let stTimer = null;
+  let stFailures = 0;
+
+  function stStop() {
+    if (stTimer) clearInterval(stTimer);
+    stTimer = null;
+    $("btn-selftest").disabled = false;
+  }
+
+  function stRender(s) {
+    const list = $("st-list");
+    list.innerHTML = "";
+    for (const p of s.probes) {
+      const li = document.createElement("li");
+      // Skipped is not a failure — several probes only apply when the TV is
+      // off, or when nothing is playing. Only real breakage gets the warn
+      // colour, so a tester isn't alarmed by a normal run.
+      const cls = p.status === "running" ? "st-running"
+                : p.status === "ok" ? "st-ok"
+                : (p.status === "failed" || p.status === "cancelled") ? "st-bad"
+                : "";
+      if (cls) li.className = cls;
+      const ico = document.createElement("span");
+      ico.className = "st-ico";
+      ico.textContent = ST_ICONS[p.status] || "·";
+      const label = document.createElement("span");
+      label.textContent = p.label;
+      li.append(ico, label);
+      if (p.seconds != null) {
+        const secs = document.createElement("span");
+        secs.className = "st-secs";
+        secs.textContent = p.seconds + "s";
+        li.append(secs);
+      }
+      list.append(li);
+    }
+    const done = s.probes.filter(p => !["pending", "running"].includes(p.status)).length;
+    const pct = s.probes.length ? Math.round((done / s.probes.length) * 100) : 0;
+    $("st-fill").style.width = pct + "%";
+
+    if (s.status === "running") {
+      const m = Math.floor(s.eta_s / 60), sec = Math.round(s.eta_s % 60);
+      $("st-eta").textContent =
+        `Running — ${done} of ${s.probes.length} done, about ` +
+        (m ? `${m}m ${sec}s` : `${sec}s`) + " left. Leave this page open.";
+    } else if (s.status === "done") {
+      $("st-eta").textContent = "Finished. Send the report over when you can.";
+      $("btn-st-show").hidden = false;
+    } else if (s.status === "error") {
+      $("st-eta").textContent = "The run stopped early — the report says why.";
+      $("btn-st-show").hidden = false;
+    }
+  }
+
+  async function stPoll() {
+    try {
+      const s = await api("/api/selftest");
+      stFailures = 0;
+      // Populate the report BEFORE revealing the button that shows it, so
+      // there's no window where Show yields an empty box.
+      if (s.report) $("st-json").value = JSON.stringify(s.report, null, 2);
+      stRender(s);
+      if (s.status === "running") return;
+      stStop();
+    } catch (e) {
+      // The run lives on the server, so one dropped poll — phone sleeping,
+      // wifi roaming, a reload mid-flight — is not a reason to abandon a
+      // three-minute test. Only give up after several in a row, and say so
+      // rather than leaving the panel frozen at its last painted state.
+      if (++stFailures < 5) return;
+      stStop();
+      $("st-eta").textContent =
+        "Lost contact with the server. The test may still be running — " +
+        "reload this page to pick it back up.";
+      toast($("toast-diag"), e.message, "err");
+    }
+  }
+
+  $("btn-selftest").addEventListener("click", async () => {
+    const btn = $("btn-selftest"); btn.disabled = true;
+    $("st-out").hidden = true; $("btn-st-show").hidden = true;
+    try {
+      const started = await api("/api/selftest", { method: "POST" });
+      stFailures = 0;
+      $("st-json").value = "";
+      $("st-panel").hidden = false;
+      $("st-eta").textContent = "Starting…";
+      $("st-list").innerHTML = "";
+      $("st-fill").style.width = "0%";
+      stRender({
+        status: "running", eta_s: started.eta_s,
+        probes: started.probes.map(p => ({ ...p, status: "pending", seconds: null })),
+      });
+      if (stTimer) clearInterval(stTimer);
+      stTimer = setInterval(stPoll, 1000);
+    } catch (e) {
+      btn.disabled = false;
+      toast($("toast-diag"), e.message, "err");
+    }
+  });
+
+  $("btn-st-show").addEventListener("click", () => {
+    $("st-out").hidden = false;
+    $("btn-st-show").hidden = true;
+    $("st-json").focus(); $("st-json").select();
+  });
+
+  $("btn-st-copy").addEventListener("click", async () => {
+    const text = $("st-json").value;
+    // Same secure-context problem as Copy diagnostics: this page is plain http
+    // on a LAN, so navigator.clipboard is usually unavailable and selecting
+    // the textarea is the fallback that actually works.
+    if (navigator.clipboard && window.isSecureContext) {
+      try {
+        await navigator.clipboard.writeText(text);
+        return toast($("toast-diag"), "Copied. Paste it to whoever asked.", "ok");
+      } catch (e) {}
+    }
+    $("st-json").focus(); $("st-json").select();
+    toast($("toast-diag"), "Select all and copy the text above.", "ok");
+  });
+
+  // Another guest may have started a run before this page loaded — show it
+  // rather than offering a button that would only 409.
+  (async () => {
+    try {
+      const s = await api("/api/selftest");
+      if (s.enabled === false) {
+        $("btn-selftest").hidden = true;
+        $("st-intro").hidden = true;
+        return;
+      }
+      if (s.total_budget_s) {
+        const m = Math.round(s.total_budget_s / 60);
+        $("st-eta-intro").textContent = `${m} minute${m === 1 ? "" : "s"}`;
+      }
+      if (s.status === "running") {
+        $("st-panel").hidden = false;
+        $("btn-selftest").disabled = true;
+        stRender(s);
+        stTimer = setInterval(stPoll, 1000);
+      }
+    } catch (e) { /* self-test is beta-only; a 404 here is expected on stable */ }
+  })();
 
   $("btn-lounge-pair").addEventListener("click", async () => {
     const code = $("lounge-code").value.trim();

@@ -18,9 +18,20 @@ Then `docker compose pull && docker compose up -d`. Your pairing is kept.
 
 Beta builds report their version as `1.01` so it's obvious which one you're running.
 
-## The report
+## The easy way: one button
 
-The status card at the bottom of the page has a **📋 Copy diagnostics** button. It produces a JSON blob describing what your device reported.
+The status card at the bottom of the page has a **🔬 Run device self-test** button. Press it and it works through everything below by itself — about three minutes, with a progress list and a countdown so you can see it moving. When it finishes, **📄 Show the report** reveals the JSON and **📋 Copy report** puts it on your clipboard.
+
+Two things worth knowing before you press it:
+
+- **It drives your TV.** It starts a 19-second test video, tries pause, resume and volume, then hands the TV back to the screensaver. Don't run it while someone's watching something — it skips those steps if the queue is busy, but it's simpler to run it on an idle TV.
+- **To test waking, turn the TV off first** with your own remote, then run it from your phone. The wake checks skip themselves when the TV is already on. Nothing in the self-test ever puts your TV to sleep — that's deliberate, since a device that ignores wake commands is exactly what we're looking for and we'd have no way to bring it back.
+
+At the end the report has a `questions_for_the_tester` section — a few things the app genuinely can't observe, like whether the volume actually changed. Fill those in before sending if you can; blank ones are fine too.
+
+## The passive report
+
+The **📋 Copy diagnostics** button next to it produces the same information without touching your TV at all. Use it if you'd rather not have anything moved, or to capture a moment — see step 2 below.
 
 It contains **no credentials** — no pairing certificate, no private key, no YouTube token. It *does* include your TV's local address (like `192.168.1.42`), because that's useful for diagnosis. That's a private address that means nothing outside your own network, but if you'd rather not share it, delete the `host` line before sending.
 
@@ -28,21 +39,20 @@ The most useful thing in there is `events` — a log of what app was in the fore
 
 ## What to do, in order
 
-Each step is useful even if a later one fails, so please report as you go rather than waiting until the end.
+Three passes. Each one is useful on its own, so send what you have rather than waiting until the end.
 
-**1. Pair it.** Enter the TV's address, then the 6-character code. If pairing fails outright, stop and say so — that's the load-bearing step.
+**1. Pair it.** Enter the TV's address, then the 6-character code. If pairing fails outright, stop and say so — nothing else can work without it.
 
-**2. Let it go idle.** Leave the device alone until the screensaver appears. Don't touch the remote. Then open the page from your phone or another computer and hit **Copy diagnostics**.
+**2. Catch the screensaver.** Leave the device alone until the screensaver appears, don't touch the remote, then open the page from your phone and hit **📋 Copy diagnostics** (the passive one — it won't disturb the screensaver).
 
-This is the important one: we need to see what package your screensaver reports as. Screensavers silently swallow app-launch requests, so if the app doesn't recognise yours, videos won't start.
+This is the single most valuable thing you can send. We need to know what package your screensaver reports as: screensavers silently swallow app-launch requests, so if the app doesn't recognise yours, videos never start and nothing errors.
 
-**3. Play something.** Paste a YouTube link and hit Add to queue. Report whether it plays, and roughly how long it took.
+**3. Run the self-test twice.**
 
-**4. Try the controls.** Pause, resume, skip. Then volume up, down, and mute — report whether the volume actually changed, since the app can't tell.
+- Once with the **TV off** (turn it off with your own remote first, then press the button from your phone). This is the only way to answer whether your device wakes over the network, and which keycode does it.
+- Once with the **TV on and idle**. This covers playback, pause/resume, volume, and where the device lands when the app hands the TV back.
 
-**5. Let the TV sleep, then queue a video.** It should wake by itself and start playing. Report whether it woke.
-
-**6. Copy diagnostics one last time** and send it over.
+Send both reports. Then tell us anything you saw on the screen that the app couldn't — that's the half we're missing.
 
 ## Known device-specific settings
 
@@ -51,6 +61,8 @@ If something doesn't work, these are the usual culprits — all on the device, n
 ### NVIDIA Shield
 
 - **The TV won't wake.** Settings → **Remotes & accessories** → **Simplified wake buttons**, and disable *"SHIELD 2019 Remote: Wake on power and Netflix buttons only"* and *"Controllers: Wake on NVIDIA or logo buttons only"*. With these on, the Shield ignores a power command sent over the network, so waking cannot work.
+
+  If it still won't wake with those off, the Shield may be ignoring the key itself rather than blocking it. The wake key is configurable — add `WAKE_KEYCODE=WAKEUP` (or `TV_POWER`) to the `environment:` block in your compose file and restart. Please report which one worked, including "none of them"; that answer is the whole reason this is a setting rather than a constant.
 - **Volume does nothing.** Settings → Device Preferences → **Display & Sound → Volume control**. The Shield offers three modes, and only two can work here:
   - **HDMI-CEC** (the default on 2019 models) — works, provided the TV or receiver honours CEC volume. Many TVs don't.
   - **Digital** (the default on 2015/2017 models) — works; the Shield attenuates its own output.
@@ -65,4 +77,6 @@ If something doesn't work, these are the usual culprits — all on the device, n
 
 ## Sending it back
 
-Paste the report, plus your device model and its software version. If something failed, say what you saw on the TV screen — that's the part the app can't observe.
+Paste the reports, plus your device model and its software version. If something failed, say what you saw on the TV screen — that's the part the app can't observe, and usually the part that explains the rest.
+
+A run where most probes say `skipped` is normal, not a failure: several only apply when the TV is off, and others stand down when something's already playing. `unmeasurable` is different — it means the app couldn't see well enough to judge, and it's worth mentioning.

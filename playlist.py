@@ -938,6 +938,16 @@ class QueueController:
             if not prior.done():
                 prior.cancel()
 
+    def has_pending_sends(self) -> bool:
+        """Is a tv_play still in flight?
+
+        Exposed for the beta self-test, which must refuse to start while one
+        is running: _cancel_in_flight_sends only cancels tasks the controller
+        created, so it cannot see the self-test, and a probe firing alongside
+        an in-flight tv_play is two senders — the double-play shape.
+        """
+        return any(not t.done() for t in self._send_tasks)
+
     def _send_to_tv(self, item: QueueItem) -> None:
         """Fire-and-forget TV send. Failures are logged; state has already moved on."""
         self._cancel_in_flight_sends()
