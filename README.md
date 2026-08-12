@@ -199,47 +199,32 @@ If your TV is asleep, adding a video wakes it, waits for it to boot, foregrounds
 
 ## Give your guests a QR code
 
-Reading an IP address out loud at a party doesn't work. Make a QR code of the page, and guests scan it with their phone camera — no app to install, nothing to type, nobody asking you how to spell it.
+Nobody wants an IP address read out to them at a party. Make a QR code of the page and guests scan it with their camera — no app, no typing.
 
-**The address to encode** is the one other devices use — the LAN address, **not** `localhost`. It looks like this:
+Encode the LAN address, **not** `localhost`:
 
 ```
 http://192.168.1.50:38420
 ```
 
-⚠️ **That is an example, not your address.** Copying it will not work. Use your own, which you can find under [Letting phones and tablets reach it](#letting-phones-and-tablets-reach-it) — same numbers you'd type into a phone browser.
+⚠️ **Example IP** — use your own, from [Letting phones and tablets reach it](#letting-phones-and-tablets-reach-it).
 
-### The easy way
+**Easiest:** [goqr.me](https://goqr.me/) → pick **URL** → paste → download the PNG. Free, no sign-up. Any generator works; a `192.168.x.x` address means nothing outside your home.
 
-Go to **[goqr.me](https://goqr.me/)**, pick **URL**, paste your address, and download the PNG. Free, no sign-up, no account.
-
-Any QR generator works — use whichever you like. And there's nothing sensitive about pasting your address into one: an address like `192.168.1.50` is private to your home network and means nothing to anyone outside it.
-
-### Or make it offline (advanced)
-
-If you'd rather not use a website, generate it from a terminal. Replace the example address with your own:
+**Offline instead**, replacing the address with yours:
 
 ```bash
-# macOS / Linux
-brew install qrencode                                   # or: apt install qrencode
-qrencode -o queue.png "http://192.168.1.50:38420"
+qrencode -o queue.png "http://192.168.1.50:38420"    # brew/apt install qrencode
 
-# Any OS, with Python
-pip install "qrcode[pil]"
+pip install "qrcode[pil]"                            # any OS
 qr "http://192.168.1.50:38420" > queue.png
-
-# Check it scans without making a file at all:
-qr --ascii "http://192.168.1.50:38420"
+qr --ascii "http://192.168.1.50:38420"               # preview in the terminal
 ```
 
-### Then put it where people are
+Print it and stick it by the TV or on the fridge. Two things break it:
 
-Print it and tape it by the TV, stick it on the fridge, or prop it on the coffee table. Guests scan it, the queue opens, they paste a link. That's the whole interaction.
-
-**Two things will break it:**
-
-- **The host computer's address changing.** If your router hands that machine a different address later, the code points nowhere. Give the host a permanent address (a *DHCP reservation*), the same as suggested for the TV in [What you'll need](#what-youll-need). Better still, encode a name instead of numbers — something like `http://mynas:38420` keeps working even when addresses change, and names like that are accepted.
-- **Guests not being on your Wi-Fi.** A phone on mobile data, or a guest network that can't reach your main one, won't load the page. That separation might be deliberate — see [Security](#security-in-one-paragraph).
+- **The host's address changing.** Give that machine a DHCP reservation, as [suggested for the TV](#what-youll-need). Or encode a name — `http://mynas:38420` survives address changes, and single-label names are accepted.
+- **Guests not on your Wi-Fi.** Mobile data or an isolated guest network won't reach it, which may be deliberate — see [Security](#security-in-one-paragraph).
 
 ---
 
