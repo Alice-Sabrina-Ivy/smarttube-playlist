@@ -148,9 +148,11 @@ Same for both options. Open the page and work through the cards.
 
 This is the same protocol the official Google TV mobile app uses. The TV will remember this client under *Settings → Apps → See all apps → Show system apps → Android TV Remote Service* if you ever want to revoke it.
 
-**2. Pair YouTube Lounge** *(optional, strongly recommended)*
+**2. Pair with SmartTube** *(optional, strongly recommended)*
 
-On the TV: **SmartTube → Settings → Remote control**. A **12-digit code** appears — paste it into the web UI's *Pair YouTube Lounge* card. (Older guides call this "Link with TV code"; it moved. Verified on SmartTube 32.10.)
+On the TV: **SmartTube → Settings → Remote control**. A **12-digit code** appears — paste it into the web UI's *Pair with SmartTube* card. (Older guides call this "Link with TV code"; it moved. Verified on SmartTube 32.10.)
+
+This uses the same YouTube Lounge protocol the phone app's "play on TV" button uses. You'll see the name in logs and the API; the UI just calls it SmartTube, since that's the app you're actually linking to.
 
 This is the same mechanism as "play on TV" in the YouTube mobile app; SmartTube implements the receiver side. Skipping it still works, but you lose real playback position and precise end-of-video detection — see [Honest limitations](#honest-limitations).
 
@@ -180,7 +182,7 @@ If your TV is asleep, adding a video wakes it, waits for it to boot, foregrounds
 
 Worth knowing before you commit:
 
-- **Pair Lounge if you can.** Without it, auto-advance runs on a duration estimate that any pause or seek on the TV puts out of sync.
+- **Pair with SmartTube if you can.** Without it, auto-advance runs on a duration estimate that any pause or seek on the TV puts out of sync.
 - **Livestreams never auto-advance.** No fixed duration, so the queue sits on one until you skip. Marked with a `● LIVE` badge.
 - **Leaving SmartTube stops the queue.** Open Netflix or press Home and it stops sending videos. Nothing is lost — go back to SmartTube and press Skip.
 - **The queue is in-memory.** Restart the container and it's empty. Your pairing is saved; the queue deliberately isn't.

@@ -24,7 +24,7 @@ Symptoms are grouped roughly in the order you'd hit them: installing, pairing, t
 
 **The queue stops advancing.** Check SmartTube is still the foreground app. Backing out of it stops the queue by design. Re-open SmartTube and hit Skip.
 
-**Auto-advance is early or late.** You're in the no-Lounge fallback, running on a duration estimate. Pair Lounge to fix it properly, or use Skip to realign.
+**Auto-advance is early or late.** Nothing is linked to SmartTube, so the app is working off an estimated video length. Pair with SmartTube to fix it properly, or use Skip to realign.
 
 **The volume and mute buttons do nothing.** HDMI-CEC volume control is switched off somewhere in the chain. Check it on the TV, on the receiver or soundbar if you have one, and on the streaming device (**Settings → Display & Sound → HDMI-CEC**). Your manufacturer probably calls CEC something else entirely — see [docs/CONFIGURATION.md](CONFIGURATION.md#volume-and-mute).
 

@@ -120,6 +120,9 @@
     margin: 0 0 0.25rem;
     color: var(--phos-bright);
   }
+  /* Aside inside a .card-sub — a note that shouldn't compete with the
+     instruction it follows. */
+  .hint { opacity: 0.7; }
   .card-sub {
     font-size: 0.78rem;
     color: var(--phos-dim);
@@ -698,13 +701,17 @@
     <ul id="queue-list" class="qlist" hidden></ul>
   </section>
 
-  <!-- ── Lounge pair: only shown after TV-pair if Lounge isn't paired ──── -->
+  <!-- ── SmartTube pair: only shown after TV-pair if it isn't linked ───── -->
+  <!-- Labelled "SmartTube" throughout, not "YouTube Lounge": Lounge is the
+       protocol's name and means nothing to someone setting this up. What they
+       are doing is linking this page to the SmartTube app. -->
   <section id="card-lounge" class="card" hidden>
-    <h2 class="card-title">▌ Pair YouTube Lounge</h2>
-    <p class="card-sub">For accurate playback sync (real position, real pause/play). On the TV, open SmartTube → Settings → "Link with TV code". Paste the 12-digit code below.</p>
+    <h2 class="card-title">▌ Pair with SmartTube</h2>
+    <p class="card-sub">Optional, but worth it — it gives the real playback position, so the progress bar is accurate and videos advance exactly when they end. Without it the app works off an estimated length.</p>
+    <p class="card-sub">On the TV: <strong>SmartTube → Settings → Remote control</strong>. A 12-digit code appears — type it below. <span class="hint">(Older SmartTube builds called this "Link with TV code".)</span></p>
     <label for="lounge-code">12-digit code</label>
     <input id="lounge-code" class="code-input" type="text" maxlength="14" autocomplete="off" placeholder="123 456 789 012">
-    <button id="btn-lounge-pair">Pair Lounge</button>
+    <button id="btn-lounge-pair">Pair with SmartTube</button>
     <div id="toast-lounge" class="toast"></div>
   </section>
 
@@ -714,7 +721,7 @@
     <dl class="meta">
       <dt>Connected to</dt><dd id="meta-host">—</dd>
       <dt>TV power</dt><dd id="meta-power">—</dd>
-      <dt>Playback sync</dt><dd id="meta-lounge">—</dd>
+      <dt>SmartTube link</dt><dd id="meta-lounge">—</dd>
     </dl>
     <div class="beta-diag">
       <p class="card-sub">
@@ -792,7 +799,7 @@
   };
 
   // queue cards (now/add/queue/meta) all show together when paired.
-  // The lounge-pair card is shown only when configured but not lounge-paired.
+  // The SmartTube-pair card is shown only when configured but not yet linked.
   function showPaired(loungePaired) {
     cards.host.hidden = true; cards.code.hidden = true;
     cards.now.hidden = false; cards.add.hidden = false;
@@ -846,13 +853,13 @@
       line.textContent = "PAIRING…";
     } else if (s.configured) {
       pulse.className = "pulse";
-      // Lounge state suffix — only show when something looks off (paired
-      // but disconnected). When everything's fine, header stays clean.
+      // SmartTube-link suffix — only shown when something looks off. When
+      // everything's fine the header stays clean.
       let suffix = "";
       if (s.lounge_paired === false) {
-        suffix = " · LOUNGE NOT PAIRED";
+        suffix = " · SMARTTUBE NOT PAIRED";
       } else if (s.lounge_paired && !s.lounge_connected) {
-        suffix = " · LOUNGE OFFLINE";
+        suffix = " · SMARTTUBE OFFLINE";
       }
       line.textContent = `LINKED · ${s.host}${suffix}`;
     } else {
@@ -1777,7 +1784,7 @@
     const btn = $("btn-lounge-pair"); btn.disabled = true;
     try {
       await api("/api/lounge/pair", { method: "POST", body: { code } });
-      toast($("toast-lounge"), "Lounge paired.", "ok");
+      toast($("toast-lounge"), "Paired with SmartTube.", "ok");
       $("lounge-code").value = "";
       await refreshStatus();
     } catch (e) {

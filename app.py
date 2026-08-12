@@ -1662,7 +1662,8 @@ class LoungePairReq(BaseModel):
 @app.post("/api/lounge/pair")
 async def lounge_pair(req: LoungePairReq):
     """Pair with SmartTube via a 12-digit YouTube Lounge code (shown by
-    SmartTube's "Link with TV code" screen). Persists the resulting auth
+    SmartTube's Settings -> Remote control screen; older builds called it
+    "Link with TV code"). Persists the resulting auth
     token to /data/lounge.json and starts the Lounge monitor.
 
     Refuses once a token exists, mirroring the pair_start guard: otherwise any
