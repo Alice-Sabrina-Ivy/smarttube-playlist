@@ -33,11 +33,15 @@ POST   /api/lounge/pair    {code}         12-digit code from SmartTube; 409 if a
 
 ```
 GET    /api/diagnostics                   passive report: reads state, sends nothing
-POST   /api/selftest                      start a device self-test; 202 + run id
+POST   /api/selftest                      start a device self-test; 200 + run id
 GET    /api/selftest                      progress while running, full report when done
 ```
 
-`POST /api/selftest` returns immediately — the run takes about three minutes — so poll the `GET` for progress. It returns **409** while a run is in flight, and `/api/queue` and `/api/play` also return 409 for the duration: the self-test sends its own commands to the TV, and two senders at once is the double-play failure this project guards hardest against.
+`POST /api/selftest` returns **200** immediately with `run_id`, `eta_s` and the probe list — the run itself takes about three minutes — so poll the `GET` for progress and, once `status` is `done`, the full report.
+
+It returns **409** while a run is already in flight, and so does **every endpoint that moves the TV**: `/api/queue`, `/api/play`, `/api/skip`, `/api/pause`, `/api/resume`, `/api/seek` and `/api/volume/*`. The self-test sends its own commands, and two senders at once is the double-play failure this project guards hardest against. `/api/clear` stays available — it only empties the queue and sends nothing to the TV.
+
+It also returns 409 if a video is already mid-launch when you press the button, since that launch is itself a sender.
 
 Set `SELF_TEST=0` to remove the button and make `POST` return 503.
 

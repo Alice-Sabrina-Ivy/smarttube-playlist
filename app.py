@@ -262,34 +262,45 @@ def _redact_secrets(text: str) -> str:
     return _SECRET_QS_RE.sub(r"\1=<redacted>", text)
 
 
-class _RedactingFilter(logging.Filter):
-    """Scrub secrets from log records, including formatted tracebacks.
+class _RedactingFormatter(logging.Formatter):
+    """Scrub secrets from the FULLY RENDERED log line, tracebacks included.
 
-    Applied to the root logger's handlers so it also covers pyytlounge's own
-    logging and any library that echoes a request URL into an exception.
+    Redacting at format time rather than in a Filter is deliberate, and both
+    reasons are load-bearing:
+
+    1. A Filter runs before formatting, so it can never touch a rendered
+       traceback — which is exactly where a leaked URL shows up.
+    2. Inspecting `record.args` / `exc.args` for strings misses the case that
+       matters most: aiohttp's ClientResponseError keeps a RequestInfo OBJECT
+       in args[0], and the URL only becomes text when the formatter calls its
+       __str__. A string-typed check sails straight past it.
+
+    Wraps whatever formatter the handler already had, so log layout is
+    unchanged.
     """
 
-    def filter(self, record: logging.LogRecord) -> bool:
+    def __init__(self, inner: logging.Formatter):
+        super().__init__()
+        self._inner = inner
+
+    def format(self, record: logging.LogRecord) -> str:
         try:
-            if isinstance(record.msg, str):
-                record.msg = _redact_secrets(record.msg)
-            if record.args:
-                record.args = tuple(
-                    _redact_secrets(a) if isinstance(a, str) else a
-                    for a in (record.args if isinstance(record.args, tuple)
-                              else (record.args,))
-                )
-            if record.exc_info and record.exc_info[1] is not None:
-                exc = record.exc_info[1]
-                if exc.args and isinstance(exc.args[0], str):
-                    exc.args = (_redact_secrets(exc.args[0]),) + exc.args[1:]
+            return _redact_secrets(self._inner.format(record))
         except Exception:
-            pass  # logging must never raise
-        return True
+            return self._inner.format(record)  # logging must never raise
 
 
-for _h in logging.getLogger().handlers:
-    _h.addFilter(_RedactingFilter())
+def _install_log_redaction() -> None:
+    """Wrap every root handler's formatter. Called after basicConfig, which is
+    what installs the handler in the first place — attaching earlier would
+    silently wrap nothing."""
+    for handler in logging.getLogger().handlers:
+        current = handler.formatter or logging.Formatter()
+        if not isinstance(current, _RedactingFormatter):
+            handler.setFormatter(_RedactingFormatter(current))
+
+
+_install_log_redaction()
 
 
 def _record_device_event(kind: str, value) -> None:
@@ -1841,6 +1852,11 @@ SELF_TEST_ENABLED = os.environ.get("SELF_TEST", "1").strip().lower() not in (
 # something still playing to act on.
 SELF_TEST_VIDEO_SHORT = os.environ.get("SELF_TEST_VIDEO", "jNQXAC9IVRw")
 SELF_TEST_VIDEO_LONG = os.environ.get("SELF_TEST_VIDEO_LONG", "aqz-KE-bpKQ")
+# Used to tell OUR playback apart from somebody else's. The idle guard re-reads
+# live state, which is right — an add can land mid-run — but the probes start
+# their clip outside the queue, so without this the run reads its own video as
+# a stranger's viewing and stands down from the measurements it exists to take.
+_SELF_TEST_VIDEO_IDS = frozenset((SELF_TEST_VIDEO_SHORT, SELF_TEST_VIDEO_LONG))
 
 # Wake candidates tried in order. WAKE_KEYCODE first so a tester who already
 # set it gets their answer confirmed rather than buried behind three others.
@@ -2186,7 +2202,6 @@ async def _probe_deep_link_play(ctx: dict) -> dict:
     separately: did SmartTube come to the foreground, and did Lounge ever
     report it actually playing our video.
     """
-    _require_idle(ctx)
     remote = state.remote
     if remote is None:
         raise _ProbeSkip("no remote connection")
@@ -2199,6 +2214,7 @@ async def _probe_deep_link_play(ctx: dict) -> dict:
             "the wake probe already started this video with the same deep "
             "link; see wake_intent for the launch timing"
         )
+    _require_idle(ctx)
 
     vid = SELF_TEST_VIDEO_SHORT
     deep_link = f"vnd.youtube.launch://www.youtube.com/watch?v={vid}"
@@ -2418,8 +2434,8 @@ async def _probe_idle_return(ctx: dict) -> dict:
     }
 
 
-def _tv_is_busy() -> bool:
-    """Is anything playing right now — ours or not?
+def _tv_is_busy(ignore_video_ids: frozenset = frozenset()) -> bool:
+    """Is anything playing right now that isn't ours?
 
     Two clauses, and the second is the one a queue-only check misses: a video
     started from the TV's own remote, or one our queue ceded via the
@@ -2440,9 +2456,15 @@ def _tv_is_busy() -> bool:
     if remote is None or not bool(getattr(remote, "is_on", False)):
         return False
     lng = qstate.lounge or {}
+    video_id = lng.get("video_id")
+    # Matching by video id rather than by "has the run launched anything yet"
+    # keeps the guard live: a guest's video landing mid-run still stops the
+    # probes, because it is a different id.
+    if video_id and video_id in ignore_video_ids:
+        return False
     return bool(
         lng.get("available")
-        and lng.get("video_id")
+        and video_id
         and lng.get("current_time") is not None
         and lng.get("state") == "Playing"
     )
@@ -2457,7 +2479,7 @@ def _require_idle(ctx: dict) -> None:
     to METADATA_TIMEOUT_S) and lands mid-run, taking ownership of the queue
     while a stale snapshot still says idle.
     """
-    if ctx.get("was_busy") or _tv_is_busy():
+    if ctx.get("was_busy") or _tv_is_busy(ignore_video_ids=_SELF_TEST_VIDEO_IDS):
         raise _ProbeSkip(
             "something is playing or queued; skipped so the test doesn't "
             "interrupt it"
@@ -2498,6 +2520,8 @@ async def _run_self_test(run_id: str) -> None:
     loop = asyncio.get_running_loop()
     started = loop.time()
     writes_at_start = _client_write_count
+    # No ignore-list at the START of a run: if a probe video is already
+    # playing then someone really is watching it, and it is not ours yet.
     ctx: dict = {"was_busy": _tv_is_busy()}
 
     try:

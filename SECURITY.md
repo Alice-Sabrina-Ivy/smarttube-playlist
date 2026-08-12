@@ -16,7 +16,9 @@ It is **not** built to be exposed to the internet, and no amount of configuratio
 
 ### What an unauthenticated caller can do
 
-Anyone who can reach the page can queue, skip, pause, reorder and clear videos, seek, change volume if an AVR is configured, wake the TV, and read what's playing. They cannot read files, run commands, or reach anything on your network beyond this service.
+Anyone who can reach the page can queue, skip, pause, reorder and clear videos, seek, change the volume, wake the TV, and read what's playing. They cannot read files, run commands, or reach anything on your network beyond this service.
+
+On **beta** builds they can also start the device self-test, which drives the TV for about three minutes — it plays a short clip, exercises pause/resume and volume, then returns the TV to its screensaver — and refuses everyone else's playback requests while it runs. It never powers the device off. Set `SELF_TEST=0` to remove it.
 
 ### Don't port-forward it
 

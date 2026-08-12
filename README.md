@@ -8,6 +8,12 @@ No accounts to create and no third-party service to sign up for.
 > exists for testing on hardware nobody here owns. Asked to help test?
 > Start with **[docs/BETA-TESTING.md](docs/BETA-TESTING.md)**.
 > For the stable version, use [`main`](https://github.com/Alice-Sabrina-Ivy/smarttube-playlist/tree/main).
+>
+> **Installing fresh from this branch?** The setup below downloads a
+> `docker-compose.yml` pinned to `:latest`, which is the stable image. Change
+> its `image:` line to `ghcr.io/alice-sabrina-ivy/smarttube-playlist:beta`
+> before you start the container, or you'll be testing the wrong build — the
+> self-test button won't be there.
 
 > **Not affiliated with Google, YouTube, or the SmartTube project.** This is an independent hobby project that talks to software you already run.
 
