@@ -2,7 +2,7 @@
 
 A small, LAN-only web page that lets anyone on your home network paste a YouTube link and have it play on **SmartTube** on your **Google TV**. Several people can add videos at once; the queue plays through them in order.
 
-No Home Assistant. No Google Cast. No accounts to create and no third-party service to sign up for.
+No accounts to create and no third-party service to sign up for.
 
 > **Not affiliated with Google, YouTube, or the SmartTube project.** This is an independent hobby project that talks to software you already run.
 
@@ -45,7 +45,8 @@ This is the easier alternative: one page on your LAN, anyone pastes a link, the 
 
 ## What you'll need
 
-- A **Google TV** device with **[SmartTube](https://smarttubeapp.github.io/)** installed — don't have it? [See below](#never-heard-of-smarttube). Other Android TV hardware is untested — see [Project status](#project-status--work-in-progress).
+- A **Google TV** device — verified on the Google TV Streamer and Chromecast with Google TV. Other Android TV hardware most likely works but is unconfirmed; see [Project status](#project-status--work-in-progress).
+- **[SmartTube](https://smarttubeapp.github.io/)** installed on it. It's a separate project from this one, it isn't on the Play Store, and you install it yourself — **[Never heard of SmartTube?](#never-heard-of-smarttube)** walks you through it.
 - A computer that can run Docker and stays on while you're watching — a PC, a Mac, a NAS, a Raspberry Pi (64-bit OS), whatever you have.
 - Both on the **same network** as the TV.
 - **An internet connection** on that computer — video titles and lengths come from YouTube, and playback commands relay through YouTube's servers. Only the web page itself is LAN-only.
