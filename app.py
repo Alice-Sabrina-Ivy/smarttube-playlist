@@ -126,7 +126,8 @@ SMARTTUBE_PACKAGE = os.environ.get("SMARTTUBE_PACKAGE", "org.smarttube.stable")
 SCREENSAVER_PACKAGES = frozenset(
     p.strip() for p in os.environ.get(
         "SCREENSAVER_PACKAGES",
-        "com.google.android.apps.tv.dreamx,com.google.android.backdrop",
+        "com.google.android.apps.tv.dreamx,com.google.android.backdrop,"
+        "com.android.dreams.basic",
     ).split(",") if p.strip()
 )
 # Keycode used to dismiss a foreground screensaver. HOME is the most
@@ -225,6 +226,8 @@ _device_log: deque = deque(maxlen=DEVICE_LOG_MAX)
 KNOWN_BENIGN_PACKAGES = frozenset({
     "com.google.android.tvlauncher",         # Android TV launcher
     "com.google.android.apps.tv.launcherx",  # Google TV launcher
+    "com.google.android.leanbacklauncher",   # older Android TV launcher; ships
+    "com.google.android.leanbacklauncher.recommendations",  # on Shield too
     "com.android.tv.settings",
     "com.google.android.katniss",            # Assistant / search overlay
     "android",                               # the system app-chooser dialog
@@ -1618,6 +1621,24 @@ def _require_paired() -> None:
         raise HTTPException(503, "not paired — visit the web UI to pair")
 
 
+def _diagnostic_warnings() -> list:
+    """Conditions that make a report misleading if not called out."""
+    out = []
+    if state.remote is not None and not _get_current_app():
+        out.append(
+            "current_app is empty. This is derived from the remote protocol's "
+            "IME feature; if IME is disabled on the device, foreground-app "
+            "detection stops working and the screensaver-dismiss, kill-switch "
+            "and SmartTube-foreground checks all silently degrade."
+        )
+    if state.remote is not None and not _is_lounge_paired():
+        out.append(
+            "Lounge is not paired, so playback position and end-of-video "
+            "detection fall back to a scraped-duration timer."
+        )
+    return out
+
+
 @app.get("/api/diagnostics")
 async def diagnostics():
     """One pasteable report for someone beta testing on hardware we don't own.
@@ -1666,6 +1687,13 @@ async def diagnostics():
         # dismiss. On new hardware this is usually the screensaver, and usually
         # the reason a video won't start.
         "unrecognised_foreground_packages": suspects,
+        # current_app is not a first-class protocol property: androidtvremote2
+        # derives it from the IME feature. With IME disabled it is permanently
+        # empty, which silently degrades the kill-switch, suppress_lounge,
+        # screensaver detection and the SmartTube-foreground check all at once,
+        # with no error raised anywhere. Say so rather than reporting a device
+        # that merely looks idle.
+        "warnings": _diagnostic_warnings(),
         "events": list(_device_log),
     }
 

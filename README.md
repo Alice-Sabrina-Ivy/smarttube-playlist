@@ -235,6 +235,7 @@ The README covers getting it running. Everything else lives here:
 | | |
 |---|---|
 | **[docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md)** | Symptoms and fixes, from install errors to playback oddities |
+| **[docs/BETA-TESTING.md](docs/BETA-TESTING.md)** | Testing on hardware nobody here owns — what to run, what to report |
 | **[docs/INSTALL-SMARTTUBE.md](docs/INSTALL-SMARTTUBE.md)** | Installing SmartTube on the TV, and which devices can run it |
 | **[docs/QR-CODE.md](docs/QR-CODE.md)** | Make a QR code so guests scan straight to the page |
 | **[docs/ADVANCED-SETUP.md](docs/ADVANCED-SETUP.md)** | Linux, NAS and homelab installs: Docker Engine, Portainer, where data lives, port binding, reverse proxies, building from source |
