@@ -20,14 +20,14 @@ Beta builds report their version as `1.01` so it's obvious which one you're runn
 
 ## The easy way: one button
 
-The status card at the bottom of the page has a **🔬 Run device self-test** button. Press it and it works through everything below by itself — about three minutes, with a progress list and a countdown so you can see it moving. When it finishes, **📄 Show the report** reveals the JSON and **📋 Copy report** puts it on your clipboard.
+The status card at the bottom of the page has a **🔬 Run device self-test** button. Press it and it works through everything below by itself — about five minutes, with a progress list and a countdown so you can see it moving. It waits properly on the slow parts rather than guessing. When it finishes, **📄 Show the report** reveals the JSON and **📋 Copy report** puts it on your clipboard.
 
 Two things worth knowing before you press it:
 
 - **It drives your TV.** It starts a 19-second test video, tries pause, resume and volume, then hands the TV back to the screensaver. Don't run it while someone's watching something — it skips those steps if the queue is busy, but it's simpler to run it on an idle TV.
-- **To test waking, turn the TV off first** with your own remote, then run it from your phone. The wake checks skip themselves when the TV is already on. Nothing in the self-test ever puts your TV to sleep — that's deliberate, since a device that ignores wake commands is exactly what we're looking for and we'd have no way to bring it back.
+- **To test waking, put the device to sleep first** — then run it from your phone. If you use a separate box (Shield, Chromecast, Apple TV…), **send the box to sleep, not just the TV**: switching off the picture leaves the box awake, the app sees it as on, and both wake checks skip themselves. On a Shield, hold the power button on its remote or use the sleep tile, and check the box's own light. Nothing in the self-test ever puts your device to sleep for you — that's deliberate, since a device that ignores wake commands is exactly what we're looking for and we'd have no way to bring it back.
 
-At the end the report has a `questions_for_the_tester` section — a few things the app genuinely can't observe, like whether the volume actually changed. Fill those in before sending if you can; blank ones are fine too.
+When it finishes, the page shows **a few short questions** — things the app genuinely cannot see, like whether the volume actually changed on your speakers. Answer what you can before copying; your answers go into the report automatically. These matter more than they look: several results are ambiguous without them, and "the app saw no change" is equally consistent with "it worked perfectly" and "it can never work."
 
 ## The passive report
 
@@ -43,14 +43,19 @@ Three passes. Each one is useful on its own, so send what you have rather than w
 
 **1. Pair it.** Enter the TV's address, then the 6-character code. If pairing fails outright, stop and say so — nothing else can work without it.
 
+**1b. Then pair with SmartTube too.** On the TV: **SmartTube → Settings → Remote control**, which shows a 12-digit code. Type it into the *Pair with SmartTube* card on the page.
+
+Please don't skip this. It's optional for daily use but not for testing: without it the app can't see the real playback position, so three of the twelve checks can't run at all and two more come back as "started it, no idea what happened next." It takes about a minute and roughly doubles what the report can tell us.
+
 **2. Catch the screensaver.** Leave the device alone until the screensaver appears, don't touch the remote, then open the page from your phone and hit **📋 Copy diagnostics** (the passive one — it won't disturb the screensaver).
 
 This is the single most valuable thing you can send. We need to know what package your screensaver reports as: screensavers silently swallow app-launch requests, so if the app doesn't recognise yours, videos never start and nothing errors.
 
 **3. Run the self-test twice.**
 
-- Once with the **TV off** (turn it off with your own remote first, then press the button from your phone). This is the only way to answer whether your device wakes over the network, and which keycode does it.
-- Once with the **TV on and idle**. This covers playback, pause/resume, volume, and where the device lands when the app hands the TV back.
+- Once with the **device asleep** (send it to sleep with its own remote first — the box, not just the TV picture — then press the button from your phone). This is the only way to answer whether your device wakes over the network, and which keycode does it. It's also the slowest run, because it waits on each wake attempt for as long as the app itself would.
+- Once with the **device on and idle**. This covers playback, pause/resume, volume, and where the device lands when the app hands the TV back.
+- If you can spare a third: leave it untouched until the **screensaver** appears, then run the self-test (not Copy diagnostics) from your phone. That's the only way we learn what your screensaver is called, and an unrecognised one is the most common reason videos never start on a device we've never seen.
 
 Send both reports. Then tell us anything you saw on the screen that the app couldn't — that's the half we're missing.
 

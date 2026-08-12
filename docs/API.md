@@ -35,6 +35,7 @@ POST   /api/lounge/pair    {code}         12-digit code from SmartTube; 409 if a
 GET    /api/diagnostics                   passive report: reads state, sends nothing
 POST   /api/selftest                      start a device self-test; 200 + run id
 GET    /api/selftest                      progress while running, full report when done
+POST   /api/selftest/answers   {answers}  fold the tester's answers into the report
 ```
 
 `POST /api/selftest` returns **200** immediately with `run_id`, `eta_s` and the probe list — the run itself takes about three minutes — so poll the `GET` for progress and, once `status` is `done`, the full report.

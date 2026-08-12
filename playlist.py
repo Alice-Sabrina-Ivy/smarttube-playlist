@@ -708,7 +708,14 @@ class QueueController:
         async with self._lock:
             observed_video = self.state.lounge.get("video_id")
             expected_video = self.state.current.video_id if self.state.current else None
-        if expected_video and observed_video != expected_video:
+        # Both sides must be known AND match. Requiring only `expected_video`
+        # to be truthy let the None case through: with nothing of ours playing
+        # — a stalled queue after the external-switch cede, or the beta
+        # self-test which plays outside the queue by design — a foreign
+        # video's end advanced OUR queue. "We don't own anything" is not a
+        # reason to start something.
+        if observed_video is None or expected_video is None or (
+                observed_video != expected_video):
             log.info(
                 "Lounge finished for %s but current expects %s — ignoring",
                 observed_video, expected_video,
