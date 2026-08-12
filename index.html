@@ -746,8 +746,10 @@
       <p class="card-sub" id="st-intro" style="margin-top:0.9rem">
         <strong>Device self-test.</strong> Everything above, plus live checks
         against your TV: it starts a 19-second test video, tries pause, resume
-        and volume, then hands the TV back. Takes about
-        <span id="st-eta-intro">5 minutes</span> — please don&#39;t use the page
+        and volume, then hands the TV back. The countdown shows the worst
+        case and usually finishes well ahead of it — the sleep run is the slow
+        one, because it waits out every wake attempt properly. Takes about
+        <span id="st-eta-intro">3–8 minutes</span> — please don&#39;t use the page
         while it runs.
         <br><br>
         <strong>To test waking:</strong> put your streaming device to sleep
@@ -1852,8 +1854,9 @@
         return;
       }
       if (s.total_budget_s) {
-        const m = Math.round(s.total_budget_s / 60);
-        $("st-eta-intro").textContent = `${m} minute${m === 1 ? "" : "s"}`;
+        // Budgets are worst case; a healthy device finishes well ahead.
+        const m = Math.ceil(s.total_budget_s / 60);
+        $("st-eta-intro").textContent = `${m} minutes at most`;
       }
       if (s.status === "running") {
         $("st-panel").hidden = false;

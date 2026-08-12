@@ -131,7 +131,7 @@ SCREENSAVER_PACKAGES = frozenset(
     p.strip() for p in os.environ.get(
         "SCREENSAVER_PACKAGES",
         "com.google.android.apps.tv.dreamx,com.google.android.backdrop,"
-        "com.android.dreams.basic",
+        "com.android.dreams.basic,com.neilturner.aerialviews",
     ).split(",") if p.strip()
 )
 # Keycode used to dismiss a foreground screensaver. HOME is the most
@@ -248,6 +248,13 @@ KNOWN_BENIGN_PACKAGES = frozenset({
     "com.android.tv.settings",
     "com.google.android.katniss",            # Assistant / search overlay
     "android",                               # the system app-chooser dialog
+    "com.google.android.tvrecommendations",  # recommendations service; can
+                                             # flash foreground on older ATV
+    "com.android.systemui",                  # transient system surfaces
+    # com.android.vending (Play Store) is deliberately NOT here: it appearing
+    # right after a launch attempt means the configured SMARTTUBE_PACKAGE is
+    # not installed under that id (the store listing opened instead) — its
+    # presence in the events log is a diagnostic signal, not noise.
 })
 
 
@@ -829,6 +836,21 @@ async def _on_lounge_event(event_type: str, observation: LoungeObservation) -> N
     sticky (updated only by current_app callback transitions) so routine
     Lounge events while SmartTube is genuinely foreground are never
     suppressed by transient current_app reads."""
+    # Capture session-level transitions in the device log BEFORE the
+    # suppression gate — the report needs the raw truth. Connect/disconnect
+    # timestamps separate SmartTube's own behaviour (its Lounge connection
+    # self-launching the app, waking Shields at night — upstream #3170) from
+    # anything we sent; the FINISHED line carries position/duration so the
+    # known ~40-minute mid-video process-kill on Shield (upstream #5951) has a
+    # recognisable signature instead of looking like our timer misfiring.
+    if event_type in ("lounge.connected", "lounge.disconnected"):
+        _record_device_event(event_type, state.suppress_lounge and "(suppressed)" or "")
+    elif event_type == "lounge.finished":
+        _record_device_event(
+            "lounge_finished",
+            f"{observation.video_id}@{observation.current_time}/{observation.duration}",
+        )
+
     if state.suppress_lounge:
         await queue_controller.on_lounge_event(
             event_type, LoungeObservation().to_dict(),
@@ -1723,9 +1745,16 @@ def _negotiated_features() -> Optional[list]:
         active = getattr(proto, "_active_features", None)
         if active is None:
             return None
-        return sorted(
-            f.name for f in type(active) if f in active and f.name
-        )
+        return {
+            "negotiated": sorted(
+                f.name for f in type(active) if f in active and f.name
+            ),
+            # The raw bitmask matters on its own: a missing KEY bit is the
+            # documented cause of "every keycode silently dead" (remedy is
+            # device-side: clear the Android TV Remote Service app's storage
+            # and re-pair), and a missing IME bit explains empty current_app.
+            "raw": int(active),
+        }
     except Exception:
         return None
 
@@ -2035,6 +2064,17 @@ SELF_TEST_IDLE_TIMEOUT = 8.0           # IDLE_KEYCODE -> whatever it lands on
 # The short probe clip is ~19s. Waiting it out is the only way to observe an
 # end-of-video, which is the entire auto-advance mechanism.
 SELF_TEST_FINISH_TIMEOUT = 40.0
+# How long after a successful wake we sample for the device becoming USABLE.
+# is_on flips within ~1s on instant-on hardware while the OS is still deaf;
+# SHIELD Experience before 9.2 documents "remote stops responding for 60
+# seconds after wake from sleep" (NVIDIA 9.2 release notes). 75s covers that
+# window with margin, and the sampling breaks out on the first sign of life —
+# a healthy device costs seconds, and only the sleep run pays at all.
+SELF_TEST_READINESS_TIMEOUT = 75.0
+# The screensaver suspect protocol: how long an unrecognised foreground
+# package gets to prove a launch Intent landed before we conclude it was
+# swallowed (the defining screensaver behaviour, per the dreamx finding).
+SELF_TEST_SUSPECT_TIMEOUT = 8.0
 SELF_TEST_FOREGROUND_SAMPLES = 10      # current_app liveness sampling
 SELF_TEST_FOREGROUND_INTERVAL = 0.5
 SELF_TEST_POLL = 0.5                   # how often a probe re-reads device state
@@ -2205,6 +2245,48 @@ async def _await_playback_observed(vid: str, timeout: float) -> Optional[float]:
     return None
 
 
+async def _sample_post_wake_readiness(ctx: dict) -> dict:
+    """After a wake: how long until the device is actually usable?
+
+    `is_on` is a liar on instant-on hardware — it flips within ~1s while the
+    OS is still booting, and on pre-9.2 SHIELD Experience the device then
+    ignores the network for up to 60s ("remote stops responding for 60 seconds
+    after wake from sleep", NVIDIA's own release notes). Our WAKE_DELAY=15
+    expires inside that window, so a launch sent on schedule is silently
+    swallowed and would previously have been misread as a deep-link failure.
+
+    Strictly read-only: samples current_app, sends nothing. Breaks out on the
+    first non-empty read, so a healthy device costs seconds.
+    """
+    loop = asyncio.get_running_loop()
+    t0 = loop.time()
+    readable_after = None
+    deadline = t0 + SELF_TEST_READINESS_TIMEOUT
+    while loop.time() < deadline:
+        if _get_current_app():
+            readable_after = round(loop.time() - t0, 2)
+            break
+        await asyncio.sleep(SELF_TEST_POLL)
+    if readable_after is not None:
+        ctx["current_app_usable"] = True
+    ctx["post_wake_readiness_s"] = readable_after
+    return {
+        "current_app_readable_after_wake_s": readable_after,
+        "readiness_sample_limit_s": SELF_TEST_READINESS_TIMEOUT,
+        "configured_wake_delay_s": WAKE_DELAY,
+        "wake_delay_sufficient": (
+            readable_after is not None and readable_after <= WAKE_DELAY
+        ),
+        "readiness_note": (
+            "How long after waking the device became usable, measured from "
+            "the wake, not from the keypress. null means it never did within "
+            "the window: either foreground detection is off on this device "
+            "(see the foreground probe) or it ignores the network for a while "
+            "after waking — documented on SHIELD Experience before 9.2."
+        ),
+    }
+
+
 async def _probe_launch_intent_wakes(ctx: dict) -> dict:
     """THE question: does an app-launch Intent by itself wake a sleeping device?
 
@@ -2278,13 +2360,18 @@ async def _probe_launch_intent_wakes(ctx: dict) -> dict:
     # it would be a second signal for the same video), `played` stayed unset,
     # and swap and transport then skipped too.
     observed_s = None
+    readiness = {}
     if woke:
+        # Readiness first: it usually resolves in seconds and the playback
+        # wait below then measures a device we know is listening.
+        readiness = await _sample_post_wake_readiness(ctx)
         observed_s = await _await_playback_observed(
             SELF_TEST_VIDEO_SHORT, SELF_TEST_PLAY_TIMEOUT,
         )
         ctx["played"] = observed_s is not None
 
     return {
+        **readiness,
         "device_was_off": True,
         "wake_key_sent": None,
         "woke": woke,
@@ -2386,7 +2473,9 @@ async def _probe_wake_keycodes(ctx: dict) -> dict:
             ctx["woke_by_key"] = key
             break
 
+    readiness = await _sample_post_wake_readiness(ctx) if winner else {}
     return {
+        **readiness,
         "attempts": attempts,
         "woke_with": winner,
         "configured_wake_keycode": WAKE_KEYCODE,
@@ -2415,13 +2504,93 @@ async def _probe_screensaver(ctx: dict) -> dict:
     if not current:
         raise _ProbeSkip("no foreground app reported right now")
     if current not in SCREENSAVER_PACKAGES:
+        if current in KNOWN_BENIGN_PACKAGES or current == SMARTTUBE_PACKAGE:
+            return {
+                "screensaver_active": False,
+                "foreground": current,
+                "note": (
+                    "No screensaver was up when the test ran. To capture "
+                    "yours, leave the device untouched until the screensaver "
+                    "appears and run the self-test again from a phone."
+                ),
+            }
+        # An UNRECOGNISED, non-launcher package in the foreground — and the
+        # guide explicitly asks for a run with the screensaver up, so in that
+        # flow this package IS the screensaver. Previously this returned
+        # "no screensaver was up… run again", an unresolvable loop on exactly
+        # the hardware the beta exists for. Measure it instead: send the
+        # launch Intent once; a screensaver swallows it (the defining failure
+        # mode, verified on dreamx), a real app plays it.
+        _require_idle(ctx)
+        deep_link = (
+            f"vnd.youtube.launch://www.youtube.com/watch?v={SELF_TEST_VIDEO_SHORT}"
+        )
+        state.remote.send_launch_app_command(deep_link)
+        _record_device_event(
+            "selftest_launch_sent", f"screensaver-suspect probe ({current})"
+        )
+        # Ours to clean up either way: if the Intent lands late (slow device)
+        # the idle probe still hands the TV back.
+        ctx["launched"] = True
+        ctx["screensaver_suspect_tested"] = True
+
+        loop = asyncio.get_running_loop()
+        landed = None
+        deadline = loop.time() + SELF_TEST_SUSPECT_TIMEOUT
+        while loop.time() < deadline:
+            if _get_current_app() == SMARTTUBE_PACKAGE:
+                landed = "foreground"
+                break
+            mon = state.lounge_monitor
+            if mon is not None:
+                obs = mon.observation
+                if (obs.video_id == SELF_TEST_VIDEO_SHORT
+                        and obs.current_time is not None):
+                    landed = "lounge"
+                    break
+            await asyncio.sleep(SELF_TEST_POLL)
+
+        if landed:
+            ctx["played"] = True
+            return {
+                "screensaver_active": False,
+                "suspect_package": current,
+                "intent_swallowed": False,
+                "intent_landed_via": landed,
+                "note": (
+                    f"{current} was in the foreground but did NOT swallow the "
+                    "launch Intent — a video started, so it behaves like a "
+                    "real app. Do NOT add it to SCREENSAVER_PACKAGES."
+                ),
+            }
+
+        # Swallowed. Only now is the dismiss key justified — sending it on
+        # the landed branch would HOME someone out of a live app.
+        state.remote.send_key_command(SCREENSAVER_DISMISS_KEY)
+        _record_device_event(
+            "selftest_dismiss_sent", f"{SCREENSAVER_DISMISS_KEY} at {current}"
+        )
+        deadline = loop.time() + max(SCREENSAVER_DISMISS_DELAY, 3.0)
+        after = current
+        while loop.time() < deadline:
+            after = _get_current_app() or ""
+            if after and after != current:
+                break
+            await asyncio.sleep(0.2)
         return {
-            "screensaver_active": False,
-            "foreground": current,
+            "screensaver_active": True,
+            "screensaver_package": current,
+            "recognised": False,
+            "intent_swallowed": True,
+            "dismiss_key": SCREENSAVER_DISMISS_KEY,
+            "dismissed": bool(after) and after != current,
+            "foreground_after": after,
             "note": (
-                "No screensaver was up when the test ran. To capture yours, "
-                "leave the device untouched until the screensaver appears and "
-                "run the self-test again from a phone."
+                f"MEASURED, not guessed: {current} swallowed a launch Intent "
+                "— the defining screensaver behaviour — and `dismissed` says "
+                "whether our key clears it. Adding this package to "
+                "SCREENSAVER_PACKAGES is the change that makes videos start "
+                "on this device."
             ),
         }
 
@@ -2455,6 +2624,12 @@ async def _probe_deep_link_play(ctx: dict) -> dict:
     remote = state.remote
     if remote is None:
         raise _ProbeSkip("no remote connection")
+    if ctx.get("screensaver_suspect_tested"):
+        raise _ProbeSkip(
+            "the screensaver probe already exercised the deep link this run — "
+            "see its intent_swallowed result. Firing it again would be two "
+            "play signals for one video."
+        )
     if ctx.get("woke_by_intent"):
         # The wake probe already deep-linked this exact video seconds ago.
         # Sending it again is two play signals for one video — the shape
@@ -2868,9 +3043,9 @@ _SELF_TEST_PROBES = (
     ("snapshot", "Reading device + config", 1.0, _probe_snapshot),
     ("foreground", "Checking foreground-app detection", 6.0, _probe_foreground_readability),
     ("metadata", "Checking YouTube reachability", 16.0, _probe_metadata),
-    ("wake_intent", "Testing wake by launch Intent", 32.0, _probe_launch_intent_wakes),
-    ("wake_keys", "Sweeping wake keycodes", 95.0, _probe_wake_keycodes),
-    ("screensaver", "Identifying the screensaver", 5.0, _probe_screensaver),
+    ("wake_intent", "Testing wake by launch Intent", 130.0, _probe_launch_intent_wakes),
+    ("wake_keys", "Sweeping wake keycodes", 170.0, _probe_wake_keycodes),
+    ("screensaver", "Identifying the screensaver", 17.0, _probe_screensaver),
     ("play", "Starting a test video", 21.0, _probe_deep_link_play),
     ("swap", "Swapping video via Lounge", 16.0, _probe_lounge_swap),
     ("transport", "Testing pause and resume", 13.0, _probe_transport),
@@ -2968,6 +3143,23 @@ def _suggested_configuration(probes: list) -> dict:
             f"screensaver ({ss.get('screensaver_package')}). Try "
             "SCREENSAVER_DISMISS_KEY=BACK."
         )
+    # A suspect the screensaver probe MEASURED (it swallowed a launch
+    # Intent) outranks one merely seen in the foreground log — and must not
+    # be suggested twice at two confidence levels.
+    if ss.get("intent_swallowed") and ss.get("screensaver_package"):
+        measured_pkg = ss["screensaver_package"]
+        env.append({
+            "var": "SCREENSAVER_PACKAGES",
+            "value": ",".join(sorted(SCREENSAVER_PACKAGES | {measured_pkg})),
+            "because": (
+                f"{measured_pkg} swallowed a launch Intent — measured, the "
+                "defining screensaver behaviour — so until it is listed, "
+                "videos silently fail to start whenever it is on screen"
+            ),
+            "from_probe": "screensaver",
+            "confidence": "measured",
+        })
+        suspects = [pkg for pkg in suspects if pkg != measured_pkg]
     for pkg in suspects:
         env.append({
             "var": "SCREENSAVER_PACKAGES",
@@ -3008,16 +3200,31 @@ def _suggested_configuration(probes: list) -> dict:
                 "constant": const_name, "current_s": const,
                 "observed_s": observed, "from_probe": pid,
             })
-    if detail("wake_intent").get("seconds") and WAKE_DELAY < detail(
-            "wake_intent")["seconds"]:
+    # Prefer the READINESS measurement (time until the device was usable)
+    # over the is_on flip: instant-on hardware reports on within ~1s while
+    # still deaf, so the flip understates and readiness is the number
+    # WAKE_DELAY actually has to cover.
+    readiness = (
+        detail("wake_intent").get("current_app_readable_after_wake_s")
+        or detail("wake_keys").get("current_app_readable_after_wake_s")
+    )
+    wake_secs = detail("wake_intent").get("seconds")
+    basis, from_probe = None, None
+    if readiness is not None and readiness > WAKE_DELAY:
+        basis, from_probe = readiness, "wake readiness sampling"
+    elif isinstance(wake_secs, (int, float)) and wake_secs > WAKE_DELAY:
+        basis, from_probe = wake_secs, "wake_intent"
+    if basis is not None:
         env.append({
             "var": "WAKE_DELAY",
-            "value": str(round(detail("wake_intent")["seconds"] + 5)),
+            "value": str(round(basis + 5)),
             "because": (
-                "this device took longer to wake than WAKE_DELAY allows, so "
-                "play commands may be arriving before it is ready"
+                "this device took longer to become usable after waking than "
+                "WAKE_DELAY allows, so play commands were arriving before it "
+                "could hear them"
             ),
-            "from_probe": "wake_intent",
+            "from_probe": from_probe,
+            "confidence": "measured",
         })
 
     return {
@@ -3030,6 +3237,81 @@ def _suggested_configuration(probes: list) -> dict:
             "constants_that_look_too_short is a code change, not a setting."
         ) if (env or slow) else "Nothing to change — the defaults fit this device.",
     }
+
+
+def _device_hints(probes: list) -> list:
+    """Device-specific interpretation, written into the report itself.
+
+    Everything here is sourced research, keyed on what the device reports —
+    so a Shield report arrives pre-interpreted instead of needing us to
+    remember the folklore. Nothing in here sends anything.
+    """
+    by_id = {p["id"]: p for p in probes}
+
+    def detail(pid):
+        d = by_id.get(pid, {}).get("detail")
+        return d if isinstance(d, dict) else {}
+
+    info = {}
+    try:
+        info = dict(getattr(state.remote, "device_info", None) or {})
+    except Exception:
+        pass
+    ident = f"{info.get('manufacturer', '')} {info.get('model', '')}".lower()
+    hints = []
+
+    if "nvidia" in ident or "shield" in ident:
+        intent_woke = detail("wake_intent").get("woke")
+        attempts = detail("wake_keys").get("attempts") or []
+        swept_and_failed = bool(attempts) and not detail("wake_keys").get("woke_with")
+        if swept_and_failed and not intent_woke:
+            hints.append(
+                "Shield + no wake: this is almost always Settings > Remotes & "
+                "accessories > Simplified wake buttons — BOTH toggles must be "
+                "OFF. Every reported Shield wake failure with this protocol "
+                "was fixed there; none needed a different keycode. Keep "
+                "WAKE_KEYCODE=POWER."
+            )
+        readiness = (
+            detail("wake_intent").get("current_app_readable_after_wake_s")
+            or detail("wake_keys").get("current_app_readable_after_wake_s")
+        )
+        if readiness is not None and readiness > WAKE_DELAY:
+            hints.append(
+                f"Shield woke but took {readiness}s to become usable — "
+                f"longer than WAKE_DELAY={WAKE_DELAY:g}. SHIELD Experience "
+                "before 9.2 documents 'remote stops responding for 60 seconds "
+                "after wake from sleep'; updating the firmware to 9.2+ is the "
+                "real fix, WAKE_DELAY is the workaround. Note: sw_version in "
+                "this report is the Android TV Remote Service app version, "
+                "NOT the firmware — read Settings > Device Preferences > "
+                "About for the Experience version."
+            )
+        if detail("volume").get("volume_info_moved") is False:
+            hints.append(
+                "Shield volume is governed by Settings > Display & Sound > "
+                "Volume control. 2019 models default to HDMI-CEC (works with "
+                "no local change visible — same as our verified devices); "
+                "2015/2017 default to Digital (a change WOULD have been "
+                "visible in volume_info, so no-change there is a real "
+                "failure). IR mode relays network volume out the remote's IR "
+                "blaster — it works only when the blaster faces the "
+                "amplifier, so treat it as unreliable rather than impossible."
+            )
+
+    cand = detail("play").get("smarttube_package_candidate") or ""
+    if "teamsmart" in cand or "liskovsoft" in cand:
+        hints.append(
+            f"This install runs a LEGACY SmartTube id ({cand}). SmartTube's "
+            "signing key was compromised around Nov 2025 and the app was "
+            "re-released under new ids; the in-app updater cannot cross the "
+            "rename, so long-time installs stay on the old id forever. "
+            "Recommend a fresh install of current stable (32.10s or later) "
+            "rather than pointing SMARTTUBE_PACKAGE at the legacy id — "
+            "intent-launched videos also played unauthenticated before "
+            "31.94s, which breaks age-restricted playback and watch history."
+        )
+    return hints
 
 
 def _self_test_verdict(probes: list, ctx: dict) -> dict:
@@ -3170,6 +3452,9 @@ async def _run_self_test(run_id: str) -> None:
             "suggested_configuration": _suggested_configuration(
                 _self_test["probes"]
             ),
+            # Sourced, device-keyed interpretation — a Shield report explains
+            # itself instead of needing the folklore remembered.
+            "device_hints": _device_hints(_self_test["probes"]),
             "kind": "smarttube-playlist self-test",
             "version": VERSION,
             "channel": "beta",
@@ -3189,7 +3474,7 @@ async def _run_self_test(run_id: str) -> None:
             ],
             "questions_for_the_tester": [
                 {"id": qid, "question": prompt,
-                 "answer": (_self_test_answers.get(qid) or "").strip()}
+                 "answer": (_question_answers().get(qid) or "").strip()}
                 for qid, prompt in _SELF_TEST_QUESTIONS
             ],
         }
@@ -3268,6 +3553,27 @@ class SelfTestAnswers(BaseModel):
     answers: dict
 
 
+def _question_answers() -> dict:
+    """Tester answers, with device_model prefilled from the protocol.
+
+    The device already told us its manufacturer and model; asking someone to
+    type "NVIDIA SHIELD Android TV" by hand is how blanks happen. Their own
+    typed answer always wins.
+    """
+    answers = dict(_self_test_answers)
+    if not (answers.get("device_model") or "").strip():
+        try:
+            info = dict(getattr(state.remote, "device_info", None) or {})
+            guess = " ".join(
+                x for x in (info.get("manufacturer"), info.get("model")) if x
+            )
+            if guess:
+                answers["device_model"] = guess
+        except Exception:
+            pass
+    return answers
+
+
 @app.post("/api/selftest/answers")
 async def selftest_answers(req: SelfTestAnswers):
     """Fold the tester's answers into the finished report.
@@ -3287,7 +3593,7 @@ async def selftest_answers(req: SelfTestAnswers):
     if isinstance(report, dict) and "questions_for_the_tester" in report:
         report["questions_for_the_tester"] = [
             {"id": qid, "question": prompt,
-             "answer": (_self_test_answers.get(qid) or "").strip()}
+             "answer": (_question_answers().get(qid) or "").strip()}
             for qid, prompt in _SELF_TEST_QUESTIONS
         ]
     return {"saved": len(_self_test_answers)}
@@ -3307,7 +3613,7 @@ async def selftest_status():
         "eta_s": round(_self_test["eta_s"], 1),
         "questions": [
             {"id": qid, "question": prompt,
-             "answer": _self_test_answers.get(qid, "")}
+             "answer": _question_answers().get(qid, "")}
             for qid, prompt in _SELF_TEST_QUESTIONS
         ],
         "probes": [
