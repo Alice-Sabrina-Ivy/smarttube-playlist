@@ -66,6 +66,22 @@ Python 3.12. The frontend is a single `index.html` — vanilla HTML/CSS/JS, no b
 | `ratelimit.py` | Per-IP rate limiting |
 | `index.html` | The entire frontend |
 
+## Releasing
+
+Versions are **MAJOR.MINOR** (`v1.0`, `v1.1`, `v2.0`). `VERSION` at the repo root is the single source of truth: the app reads it and serves it at `/api/status`, the UI footer renders it, and the Dockerfile copies it into the image, so a running container can always say what it is.
+
+```bash
+python scripts/release.py --minor      # 1.0 -> 1.1
+python scripts/release.py --major      # 1.3 -> 2.0
+python scripts/release.py --set 2.5    # explicit
+python scripts/release.py --check      # verify VERSION, footer and tag agree
+python scripts/release.py --dry-run --minor
+```
+
+The script bumps `VERSION`, syncs the footer, commits, tags and pushes. Everything after that is CI: the image is built multi-arch and tagged `1.1`, `1` and `latest` in GHCR, then a GitHub Release is created with notes generated from the commits since the previous tag.
+
+Old releases and old image tags are never touched — GitHub lists releases newest-first automatically and keeps them all, so anyone can pin `:1.0` indefinitely. There is no manifest to maintain.
+
 ## Contributing
 
 Bug reports are welcome, especially with logs at `LOG_LEVEL=DEBUG` and a note about which TV hardware you're on — device coverage beyond Google TV is the biggest open question in the project.

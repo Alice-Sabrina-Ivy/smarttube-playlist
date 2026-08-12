@@ -13,6 +13,7 @@
 venv
 _keytest
 tools
+scripts
 tests
 pytest.ini
 requirements-dev.txt

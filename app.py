@@ -73,6 +73,21 @@ if _resolve_log_level(_RAW_LOG_LEVEL) != (_RAW_LOG_LEVEL or "").strip().upper():
         "LOG_LEVEL=%r is not a recognised level; using INFO", _RAW_LOG_LEVEL
     )
 
+# Single source of version truth. release.py writes VERSION, the Dockerfile
+# copies it into the image, and /api/status serves it — so a running container
+# can always say what it is. Falls back rather than crashing if the file is
+# missing, since a stale image is still more useful than a dead one.
+def _read_version() -> str:
+    try:
+        return (Path(__file__).resolve().parent / "VERSION").read_text(
+            encoding="utf-8"
+        ).strip() or "unknown"
+    except OSError:
+        return "unknown"
+
+
+VERSION = _read_version()
+
 DATA_DIR = Path(os.environ.get("DATA_DIR", "/data"))
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 CERT_FILE = DATA_DIR / "cert.pem"
@@ -1334,6 +1349,7 @@ async def status():
     lounge_paired = LOUNGE_AUTH_FILE.exists()
     lounge_connected = bool(state.lounge_monitor and state.lounge_monitor.is_connected)
     return {
+        "version": VERSION,
         "configured": paired,
         "host": state.host,
         "pairing_in_progress": state.pairing_in_progress,

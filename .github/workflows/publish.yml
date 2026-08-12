@@ -3,8 +3,10 @@ name: Publish container image
 # Builds a multi-arch image and pushes it to GitHub Container Registry.
 #
 #   push to main   -> ghcr.io/<owner>/smarttube-playlist:main
-#   tag v1.2.3     -> :1.2.3, :1.2, :latest
+#   tag v1.1       -> :1.1, :1, :latest  + a GitHub Release
 #   pull request   -> build only, never pushed (validates the Dockerfile)
+#
+# Versions are MAJOR.MINOR (v1.0, v1.1, v2.0), cut by scripts/release.py.
 #
 # arm64 is built because the main audience runs this on ARM NAS boxes and
 # single-board machines. Both arches use prebuilt manylinux wheels for
@@ -17,7 +19,7 @@ name: Publish container image
 on:
   push:
     branches: [main]
-    tags: ['v*.*.*']
+    tags: ['v*.*']
   pull_request:
     branches: [main]
   workflow_dispatch:
@@ -60,14 +62,19 @@ jobs:
         uses: docker/metadata-action@v5
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          # type=match, not type=semver: our tags are MAJOR.MINOR (v1.0),
+          # which is not valid semver, and the semver extractor rejects it.
+          # The regex pulls "1.1" and "1" out of a tag like v1.1, giving users
+          # both an exact pin and a floating major.
+          #
           # `latest` is emitted for BOTH a push to the default branch and a
           # release tag. The default-branch case matters: docker-compose.yml
           # pulls :latest, so without it the very first publish would leave
           # every new user's `docker compose up -d` failing with
-          # "manifest unknown" until the first vX.Y.Z tag was cut.
+          # "manifest unknown" until the first tag was cut.
           tags: |
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
+            type=match,pattern=v(\d+\.\d+),group=1
+            type=match,pattern=v(\d+),group=1
             type=ref,event=branch
             type=ref,event=pr
             type=raw,value=latest,enable={{is_default_branch}}
@@ -83,3 +90,49 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+  # Runs only for tags, and only once the image is actually pushed — a release
+  # that points at an image nobody can pull is worse than no release.
+  release:
+    needs: build-and-push
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # full history so the notes can diff against the last tag
+
+      - name: Create the GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          VERSION="${TAG#v}"
+          IMAGE="ghcr.io/$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')"
+
+          # Past releases are never touched: GitHub keeps them all and lists
+          # them newest-first, and every old image tag stays pullable.
+          {
+            echo "## Install or update"
+            echo
+            echo '```bash'
+            echo "docker pull ${IMAGE}:${VERSION}"
+            echo '```'
+            echo
+            echo "Or pin the major version with \`${IMAGE}:${VERSION%%.*}\`, or track"
+            echo "the newest with \`${IMAGE}:latest\`. Older versions stay available."
+            echo
+            echo "Already running it? \`docker compose pull && docker compose up -d\`"
+            echo "Your pairing is kept."
+          } > notes.md
+
+          gh release create "$TAG" \
+            --title "$TAG" \
+            --notes-file notes.md \
+            --generate-notes
+

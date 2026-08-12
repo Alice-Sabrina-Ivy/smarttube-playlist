@@ -685,7 +685,7 @@
     </dl>
   </section>
 
-  <footer>SmartTube Playlist · v1.0 · <a href="https://opensource.org/licenses/MIT" target="_blank" rel="noopener noreferrer">MIT</a> · <a href="https://github.com/Alice-Sabrina-Ivy" target="_blank" rel="noopener noreferrer">Alice Sabrina Ivy</a></footer>
+  <footer>SmartTube Playlist · <span id="app-version">v1.0</span> · <a href="https://opensource.org/licenses/MIT" target="_blank" rel="noopener noreferrer">MIT</a> · <a href="https://github.com/Alice-Sabrina-Ivy" target="_blank" rel="noopener noreferrer">Alice Sabrina Ivy</a></footer>
 </div>
 
 <!-- ── Seek modal (opens via the "Seek" button on the now-playing card) ── -->
@@ -794,6 +794,9 @@
       line.textContent = "NOT CONFIGURED";
     }
     $("meta-host").textContent  = s.host || "—";
+    // Keep the footer honest: the static value in the markup is only a
+    // fallback for anyone reading the source.
+    if (s.version) $("app-version").textContent = "v" + s.version;
     $("meta-power").textContent =
       s.tv_on === true  ? "ON"  :
       s.tv_on === false ? "OFF (will wake)" :
