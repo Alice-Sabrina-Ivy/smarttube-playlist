@@ -4,6 +4,11 @@ A small, LAN-only web page that lets anyone on your home network paste a YouTube
 
 No accounts to create and no third-party service to sign up for.
 
+> ⚠️ **This is the `beta` branch.** It carries a device diagnostics report and
+> exists for testing on hardware nobody here owns. Asked to help test?
+> Start with **[docs/BETA-TESTING.md](docs/BETA-TESTING.md)**.
+> For the stable version, use [`main`](https://github.com/Alice-Sabrina-Ivy/smarttube-playlist/tree/main).
+
 > **Not affiliated with Google, YouTube, or the SmartTube project.** This is an independent hobby project that talks to software you already run.
 
 ![The web UI: a "Now playing" card with thumbnail, progress bar and playback controls, a box for pasting a YouTube link, the upcoming queue, and a TV status panel](docs/screenshot.png)
