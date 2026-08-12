@@ -8,15 +8,13 @@ No accounts to create and no third-party service to sign up for.
 
 ![The web UI: a "Now playing" card with thumbnail, progress bar and playback controls, a box for pasting a YouTube link, the upcoming queue, and a TV status panel](docs/screenshot.png)
 
-*Volume buttons need HDMI-CEC volume control enabled on your TV — see below.*
+*Volume and mute work on both tested devices — see [Volume and mute](#volume-and-mute).*
 
 ---
 
 ## Project status — work in progress
 
-This works, and it's used daily on the setup it was built for. It is not finished, and it has only ever been proven on one kind of hardware.
-
-**What's supported today:**
+This works, and it's used daily on the setup it was built for. It is not finished, and it has only been proven on the two devices below.
 
 **Verified on real hardware:**
 
@@ -196,6 +194,52 @@ Your answers persist to the `data` folder, so this is a one-time job.
 - The page updates live for everyone with it open — adds, removes, skips, and advances show up without refreshing.
 
 If your TV is asleep, adding a video wakes it, waits for it to boot, foregrounds SmartTube, and plays. That whole sequence takes about 15–20 seconds on most TVs.
+
+---
+
+## Give your guests a QR code
+
+Reading an IP address out loud at a party doesn't work. Make a QR code of the page, and guests scan it with their phone camera — no app to install, nothing to type, nobody asking you how to spell it.
+
+**The address to encode** is the one other devices use — the LAN address, **not** `localhost`. It looks like this:
+
+```
+http://192.168.1.50:38420
+```
+
+⚠️ **That is an example, not your address.** Copying it will not work. Use your own, which you can find under [Letting phones and tablets reach it](#letting-phones-and-tablets-reach-it) — same numbers you'd type into a phone browser.
+
+### The easy way
+
+Go to **[goqr.me](https://goqr.me/)**, pick **URL**, paste your address, and download the PNG. Free, no sign-up, no account.
+
+Any QR generator works — use whichever you like. And there's nothing sensitive about pasting your address into one: an address like `192.168.1.50` is private to your home network and means nothing to anyone outside it.
+
+### Or make it offline (advanced)
+
+If you'd rather not use a website, generate it from a terminal. Replace the example address with your own:
+
+```bash
+# macOS / Linux
+brew install qrencode                                   # or: apt install qrencode
+qrencode -o queue.png "http://192.168.1.50:38420"
+
+# Any OS, with Python
+pip install "qrcode[pil]"
+qr "http://192.168.1.50:38420" > queue.png
+
+# Check it scans without making a file at all:
+qr --ascii "http://192.168.1.50:38420"
+```
+
+### Then put it where people are
+
+Print it and tape it by the TV, stick it on the fridge, or prop it on the coffee table. Guests scan it, the queue opens, they paste a link. That's the whole interaction.
+
+**Two things will break it:**
+
+- **The host computer's address changing.** If your router hands that machine a different address later, the code points nowhere. Give the host a permanent address (a *DHCP reservation*), the same as suggested for the TV in [What you'll need](#what-youll-need). Better still, encode a name instead of numbers — something like `http://mynas:38420` keeps working even when addresses change, and names like that are accepted.
+- **Guests not being on your Wi-Fi.** A phone on mobile data, or a guest network that can't reach your main one, won't load the page. That separation might be deliberate — see [Security](#security-in-one-paragraph).
 
 ---
 
