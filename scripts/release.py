@@ -176,7 +176,13 @@ def main() -> int:
         write_version(new)
         sync_footer(new)
         run("git", "add", "VERSION", "index.html")
-        run("git", "commit", "-m", f"Release {tag}")
+        # Nothing staged is a legitimate case, not an error: the very first
+        # release tags a VERSION that already exists, and re-tagging an
+        # unchanged version would otherwise die on "nothing to commit".
+        if run("git", "diff", "--cached", "--name-only"):
+            run("git", "commit", "-m", f"Release {tag}")
+        else:
+            print(f"VERSION and footer already say {new} — tagging HEAD as-is")
         run("git", "tag", "-a", tag, "-m", f"Release {tag}")
         run("git", "push", "origin", "HEAD")
         run("git", "push", "origin", tag)
