@@ -14,7 +14,7 @@ No accounts to create and no third-party service to sign up for.
 
 ## Project status — work in progress
 
-This works, and it's used daily on the setup it was built for. It is not finished, and it has only been proven on the two devices below.
+Used daily on the setup it was built for, but not finished, and only proven on the two devices below.
 
 **Verified on real hardware:**
 
@@ -23,13 +23,13 @@ This works, and it's used daily on the setup it was built for. It is not finishe
 | Google TV Streamer (4K) | ✓ | ✓ | ✓ | ✓ (via HDMI-CEC) |
 | Chromecast with Google TV (4K) | ✓ | ✓ | ✓ | ✓ (device's own output — that TV has no CEC) |
 
-Everything in that table was exercised end to end on the actual devices, including pairing, YouTube Lounge, pause/resume, auto-advance, the wake-from-sleep sequence, and returning the TV to its screensaver.
+Each was exercised end to end: pairing, Lounge, pause/resume, auto-advance, wake-from-sleep, and returning the TV to its screensaver.
 
-**Other Google TV and Android TV hardware** — Nvidia Shield, onn., Xiaomi and the rest — uses the same Android TV Remote v2 protocol and will most likely work, but nobody has confirmed it. Fire TV runs Fire OS and may not expose the Remote service at all. Tried one? Please [open an issue](https://github.com/Alice-Sabrina-Ivy/smarttube-playlist/issues) and say what happened, working or not.
+**Other Android TV hardware** — Nvidia Shield, onn., Xiaomi — uses the same protocol and will most likely work, but nobody has confirmed it. Fire TV runs Fire OS and may not expose the Remote service at all. Tried one? [Open an issue](https://github.com/Alice-Sabrina-Ivy/smarttube-playlist/issues) either way.
 
 Where this is heading: see [Roadmap](#roadmap).
 
-Expect rough edges, occasional breaking changes between versions, and issues that take a while to get answered.
+Expect rough edges, occasional breaking changes, and slow replies to issues.
 
 ---
 
@@ -54,15 +54,15 @@ This is the easier alternative: one page on your LAN, anyone pastes a link, the 
 
 ### Never heard of SmartTube?
 
-[SmartTube](https://smarttubeapp.github.io/) is a free, ad-free YouTube app for TV devices. It plays the same YouTube you already know, without the adverts. It's a separate project from this one, and it's what this app sends your videos to — so you need it on the TV first.
+[SmartTube](https://smarttubeapp.github.io/) is a free, ad-free YouTube app for TV devices — the same YouTube, without the adverts. It's a separate project, and it's what this app sends your videos to, so it needs to be on the TV first.
 
-**What can run it:** Android TV and Google TV devices — Chromecast with Google TV, Nvidia Shield, Xiaomi Mi Box, onn. boxes, and most Android TV set-top boxes and built-in Android TVs.
+**Runs on:** Android TV and Google TV devices — Chromecast with Google TV, Nvidia Shield, Xiaomi Mi Box, onn. boxes, and most Android TV boxes and built-in Android TVs.
 
-**What can't:** phones and tablets, Samsung (Tizen) and LG (webOS) TVs, Apple TV, and Roku. Fire TV sits in between — SmartTube supports older Fire TV devices but not the newest ones, and this app may not work with Fire TV regardless. See [Project status](#project-status--work-in-progress).
+**Doesn't run on:** phones and tablets, Samsung (Tizen) and LG (webOS) TVs, Apple TV, Roku. Fire TV is in between — SmartTube supports older ones, and this app may not work with Fire TV regardless.
 
-**Installing it.** SmartTube is **not on the Play Store** and never has been — you install it yourself. Its developer warns that copies floating around app stores and APK sites may contain malware, so only use the official source.
+**Installing it.** SmartTube is **not on the Play Store** — you install it yourself, and only from the official source: its developer warns that copies on app stores and APK sites may contain malware.
 
-The easiest route, done entirely on the TV:
+Easiest route, done entirely on the TV:
 
 1. From the Play Store on your TV, install **Downloader by AFTVnews**.
 2. Open Downloader and type this into its address box:
@@ -71,10 +71,10 @@ The easiest route, done entirely on the TV:
    kutt.to/stn_stable
    ```
 
-3. It downloads the official APK. Accept the prompts — Android will ask you to allow installs from Downloader — then install.
-4. Open SmartTube once and play something, just to confirm it works.
+3. It downloads the official APK. Accept the prompts — Android asks you to allow installs from Downloader — then install.
+4. Open SmartTube once and play something, to confirm it works.
 
-Other methods (USB stick, "Send Files to TV", ADB) are documented at [smarttubeapp.github.io](https://smarttubeapp.github.io/).
+Other methods (USB stick, "Send Files to TV", ADB) are at [smarttubeapp.github.io](https://smarttubeapp.github.io/).
 
 ---
 
@@ -293,41 +293,9 @@ To stop it: `docker compose down`. To remove it entirely, stop it and delete the
 
 ---
 
-## Troubleshooting
+## Something not working?
 
-**`manifest unknown` or `denied` when starting.** Docker couldn't download the image. Check you're online and try `docker compose pull`. If it still fails, [open an issue](https://github.com/Alice-Sabrina-Ivy/smarttube-playlist/issues).
-
-**`no configuration file provided: not found`.** Either the terminal isn't in the folder holding `docker-compose.yml`, or the file is really called `docker-compose.yml.txt` — Windows hides the extension. Type `dir` (Windows) or `ls` (Mac) to see the real filenames.
-
-**`error during connect` or `port is already allocated`.** The first means Docker Desktop hasn't finished starting — wait for **Engine running** and re-run. The second means something else is using port 38420 — change the left-hand number in `docker-compose.yml` to e.g. `38421:8000` and re-run.
-
-**Other devices can't open the page (Docker Desktop).** Firewall. See [Letting phones and tablets reach it](#letting-phones-and-tablets-reach-it). Confirm it works at `http://localhost:38420` on the host first — if that fails, it's not the firewall.
-
-**Pairing fails immediately.** Is the TV actually on and awake? Then confirm it's on the same network and ports 6466/6467 are reachable. Some Google TV devices have the Remote Service enabled but firewalled until a power cycle.
-
-**`InvalidAuth` on startup.** The pairing certificate was rejected — the TV revoked it, or the files got out of sync. Set `RESET_PAIRING: "1"` in `docker-compose.yml`, restart, pair again, then take the flag back out.
-
-**HTTP 500 with `PermissionError: '/data/cert.pem'`.** The data directory isn't writable by the container's user. The entrypoint chowns it to UID 1000 at startup, so this normally self-heals — unless you added a `user:` line to `docker-compose.yml`, which prevents the chown. Either remove that line or pre-create the directory with the right owner: `sudo chown -R 1000:1000 ./data`.
-
-**The video opens in stock YouTube instead of SmartTube.** Either SmartTube isn't installed, or stock YouTube is registered as the default handler for YouTube links. Open SmartTube once manually and pick "always" if Android offers.
-
-**TV wakes but nothing plays.** Raise `WAKE_DELAY`. SmartTube has to be foregrounded *after* the TV is genuinely awake, and some TVs report themselves ready well before they are.
-
-**The queue stops advancing.** Check SmartTube is still the foreground app. Backing out of it stops the queue by design. Re-open SmartTube and hit Skip.
-
-**Auto-advance is early or late.** You're in the no-Lounge fallback, running on a duration estimate. Pair Lounge to fix it properly, or use Skip to realign.
-
-**The volume and mute buttons do nothing.** HDMI-CEC volume control is switched off somewhere in the chain. Check it on the TV, on the receiver or soundbar if you have one, and on the streaming device (**Settings → Display & Sound → HDMI-CEC**). Your manufacturer probably calls CEC something else entirely — see [docs/CONFIGURATION.md](docs/CONFIGURATION.md#volume-and-mute).
-
-**A video shows a 10:00 duration that's obviously wrong,** or its title shows as a jumble of letters. The lookup to YouTube failed, so it fell back to an assumed 10 minutes. This isn't cosmetic: that fake length drives auto-advance, so a long video gets skipped 10 minutes in. Look for `metadata fetch failed` in the logs; if it happens often, your connection is slow to reach YouTube — raise `METADATA_TIMEOUT_S` (see [docs/CONFIGURATION.md](docs/CONFIGURATION.md)).
-
-**Reading the logs:**
-
-```bash
-docker compose logs -f
-```
-
-On Docker Desktop you can also click the container and open the **Logs** tab.
+**[docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md)** covers the common ones — the image not downloading, pairing failing, the page not opening on phones, volume buttons doing nothing, and wrong video lengths.
 
 ---
 
@@ -337,6 +305,7 @@ The README covers getting it running. Everything else lives here:
 
 | | |
 |---|---|
+| **[docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md)** | Symptoms and fixes, from install errors to playback oddities |
 | **[docs/ADVANCED-SETUP.md](docs/ADVANCED-SETUP.md)** | Linux, NAS and homelab installs: Docker Engine, Portainer, where data lives, port binding, reverse proxies, building from source |
 | **[SECURITY.md](SECURITY.md)** | Threat model, what the no-auth design means, DNS-rebinding and CSRF protection, reverse proxies, resetting a pairing |
 | **[docs/CONFIGURATION.md](docs/CONFIGURATION.md)** | Every environment variable, volume control, timezones |
