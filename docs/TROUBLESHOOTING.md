@@ -8,6 +8,8 @@ Symptoms are grouped roughly in the order you'd hit them: installing, pairing, t
 
 **`no configuration file provided: not found`.** Either the terminal isn't in the folder holding `docker-compose.yml`, or the file is really called `docker-compose.yml.txt` — Windows hides the extension. Type `dir` (Windows) or `ls` (Mac) to see the real filenames.
 
+**Docker Desktop hangs on "Docker Engine starting…" (Windows).** Give it five minutes on a first launch, then **restart the PC** — the installer asks for a reboot and skipping it is the usual cause. If it still won't start, check Task Manager → Performance → CPU shows **Virtualization: Enabled**; if not, enable it in the BIOS/UEFI (Intel **VT-x**, AMD **SVM Mode**). Last resort: `wsl --update` in PowerShell.
+
 **`error during connect` or `port is already allocated`.** The first means Docker Desktop hasn't finished starting — wait for **Engine running** and re-run. The second means something else is using port 38420 — change the left-hand number in `docker-compose.yml` to e.g. `38421:8000` and re-run.
 
 **Other devices can't open the page (Docker Desktop).** Firewall. See [Letting phones and tablets reach it](../README.md#letting-phones-and-tablets-reach-it). Confirm it works at `http://localhost:38420` on the host first — if that fails, it's not the firewall.

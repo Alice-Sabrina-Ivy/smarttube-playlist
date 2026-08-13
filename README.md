@@ -86,7 +86,11 @@ If you just want to try it, start with **Option A**. You can move it to a NAS la
 
 Run the installer and launch it. Wait until the bottom-left says **Engine running**. On Windows it may ask to install WSL 2 and reboot — let it.
 
-> **Stuck on "Docker Engine starting…"?** Give it five minutes; the first launch is the slow one. If it never turns green, the usual cause is that **hardware virtualization is switched off in your BIOS/UEFI** — Docker can't turn it on for you. Reboot into BIOS setup and enable it: Intel calls it **VT-x** or *Virtualization Technology*, AMD calls it **SVM Mode**. On Windows you can check first in Task Manager → Performance → CPU, where **Virtualization** should read *Enabled*. Failing that, reboot the PC (the installer asks for it and it's easy to skip), then run `wsl --update` in PowerShell.
+> **Stuck on "Docker Engine starting…"?** (Windows) Give it five minutes — the first launch is the slow one. Then, in order:
+>
+> 1. **Restart the PC.** The installer asks for this and it's easy to skip. It fixes this more often than everything else combined.
+> 2. **Check virtualization is on:** Task Manager → Performance → CPU, where **Virtualization** should read *Enabled*. If it says disabled, you'll need to turn it on in your BIOS/UEFI — Intel calls it **VT-x** or *Virtualization Technology*, AMD calls it **SVM Mode**. Docker can't turn it on for you.
+> 3. Run `wsl --update` in PowerShell, then restart Docker Desktop.
 
 **2. Make a folder for it.**
 
