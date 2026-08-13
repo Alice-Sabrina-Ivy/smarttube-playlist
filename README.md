@@ -86,6 +86,8 @@ If you just want to try it, start with **Option A**. You can move it to a NAS la
 
 Run the installer and launch it. Wait until the bottom-left says **Engine running**. On Windows it may ask to install WSL 2 and reboot — let it.
 
+> **Stuck on "Docker Engine starting…"?** Give it five minutes; the first launch is the slow one. If it never turns green, the usual cause is that **hardware virtualization is switched off in your BIOS/UEFI** — Docker can't turn it on for you. Reboot into BIOS setup and enable it: Intel calls it **VT-x** or *Virtualization Technology*, AMD calls it **SVM Mode**. On Windows you can check first in Task Manager → Performance → CPU, where **Virtualization** should read *Enabled*. Failing that, reboot the PC (the installer asks for it and it's easy to skip), then run `wsl --update` in PowerShell.
+
 **2. Make a folder for it.**
 
 Anywhere, e.g. `Documents\smarttube-playlist`. Everything lives here, including your TV pairing.
