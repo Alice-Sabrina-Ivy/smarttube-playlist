@@ -251,6 +251,12 @@ KNOWN_BENIGN_PACKAGES = frozenset({
     "com.google.android.tvrecommendations",  # recommendations service; can
                                              # flash foreground on older ATV
     "com.android.systemui",                  # transient system surfaces
+    # Bell's Fibe TV app, and the HOME target on a Bell Streamer — so it is
+    # both a normal foreground app and the device's home screen. Listed
+    # because _looks_like_a_launcher can't catch it: nothing in the name says
+    # "launcher", so without this a Bell report would hand the tester a
+    # pasteable SCREENSAVER_PACKAGES line containing their own home screen.
+    "com.quickplay.android.bellmediaplayer",
     # com.android.vending (Play Store) is deliberately NOT here: it appearing
     # right after a launch attempt means the configured SMARTTUBE_PACKAGE is
     # not installed under that id (the store listing opened instead) — its
@@ -2491,6 +2497,20 @@ async def _probe_wake_keycodes(ctx: dict) -> dict:
     }
 
 
+def _looks_like_a_launcher(pkg: str) -> bool:
+    """Cheap name heuristic for "this is a home screen, not a screensaver".
+
+    We cannot enumerate every carrier's launcher — a Bell, Rogers or Sky box
+    ships its own — but launchers are named like launchers, and the cost of
+    being wrong is asymmetric: calling a screensaver a launcher just means we
+    ask the tester, while calling a LAUNCHER a screensaver puts it in
+    SCREENSAVER_PACKAGES and fires a dismiss key every time anyone sits on
+    their own home screen.
+    """
+    p = (pkg or "").lower()
+    return any(t in p for t in ("launcher", ".home", "homescreen", "tvhome"))
+
+
 async def _probe_screensaver(ctx: dict) -> dict:
     """What is this device's screensaver called, and does our dismiss key work?
 
@@ -2550,6 +2570,7 @@ async def _probe_screensaver(ctx: dict) -> dict:
                     break
             await asyncio.sleep(SELF_TEST_POLL)
 
+        looks_launcher = _looks_like_a_launcher(current)
         if landed:
             ctx["played"] = True
             return {
@@ -2564,8 +2585,15 @@ async def _probe_screensaver(ctx: dict) -> dict:
                 ),
             }
 
-        # Swallowed. Only now is the dismiss key justified — sending it on
-        # the landed branch would HOME someone out of a live app.
+        # Swallowed. A LAUNCHER that swallows an Intent is a different and
+        # more likely story than a screensaver: it usually means SmartTube
+        # isn't installed under the configured package id, so Android had
+        # nothing to hand the Intent to and the home screen simply stayed put.
+        # Branding it a screensaver would be a confident wrong answer with a
+        # harmful fix attached.
+        #
+        # Only now is the dismiss key justified — sending it on the landed
+        # branch would HOME someone out of a live app.
         state.remote.send_key_command(SCREENSAVER_DISMISS_KEY)
         _record_device_event(
             "selftest_dismiss_sent", f"{SCREENSAVER_DISMISS_KEY} at {current}"
@@ -2577,6 +2605,29 @@ async def _probe_screensaver(ctx: dict) -> dict:
             if after and after != current:
                 break
             await asyncio.sleep(0.2)
+        if looks_launcher:
+            return {
+                "screensaver_active": False,
+                "suspect_package": current,
+                "likely_role": "launcher",
+                "intent_swallowed": True,
+                "dismiss_key": SCREENSAVER_DISMISS_KEY,
+                "dismissed": bool(after) and after != current,
+                "foreground_after": after,
+                "note": (
+                    f"{current} looks like this device's HOME SCREEN, and it "
+                    "swallowed a launch Intent. That usually means SmartTube "
+                    "is not installed under the package id this app is "
+                    "configured for — Android had nothing to hand the Intent "
+                    "to, so the home screen stayed put. Check "
+                    "smarttube_package_candidate and the tester's SmartTube "
+                    "build. Deliberately NOT suggested for "
+                    "SCREENSAVER_PACKAGES: a launcher listed there makes "
+                    "every play send a pointless dismiss key at the home "
+                    "screen. If this really is the screensaver, say so and "
+                    "we'll add it by hand."
+                ),
+            }
         return {
             "screensaver_active": True,
             "screensaver_package": current,
@@ -3061,46 +3112,226 @@ _SELF_TEST_PROBES = (
 # the TV's own speakers or a receiver — because that distinguishes the device
 # attenuating its own output from it relaying a CEC command downstream, and
 # those need different advice.
+def _hints_shield(detail) -> list:
+    """NVIDIA Shield interpretation. Sourced; see CLAUDE.md."""
+    hints = []
+    intent_woke = detail("wake_intent").get("woke")
+    attempts = detail("wake_keys").get("attempts") or []
+    swept_and_failed = bool(attempts) and not detail("wake_keys").get("woke_with")
+    if swept_and_failed and not intent_woke:
+        hints.append(
+            "Shield + no wake: this is almost always Settings > Remotes & "
+            "accessories > Simplified wake buttons — BOTH toggles must be "
+            "OFF. Every reported Shield wake failure with this protocol "
+            "was fixed there; none needed a different keycode. Keep "
+            "WAKE_KEYCODE=POWER."
+        )
+    readiness = (
+        detail("wake_intent").get("current_app_readable_after_wake_s")
+        or detail("wake_keys").get("current_app_readable_after_wake_s")
+    )
+    if readiness is not None and readiness > WAKE_DELAY:
+        hints.append(
+            f"Shield woke but took {readiness}s to become usable — "
+            f"longer than WAKE_DELAY={WAKE_DELAY:g}. SHIELD Experience "
+            "before 9.2 documents 'remote stops responding for 60 seconds "
+            "after wake from sleep'; updating the firmware to 9.2+ is the "
+            "real fix, WAKE_DELAY is the workaround. Note: sw_version in "
+            "this report is the Android TV Remote Service app version, "
+            "NOT the firmware — read Settings > Device Preferences > "
+            "About for the Experience version."
+        )
+    if detail("volume").get("volume_info_moved") is False:
+        hints.append(
+            "Shield volume is governed by Settings > Display & Sound > "
+            "Volume control. 2019 models default to HDMI-CEC (works with "
+            "no local change visible — same as our verified devices); "
+            "2015/2017 default to Digital (a change WOULD have been "
+            "visible in volume_info, so no-change there is a real "
+            "failure). IR mode relays network volume out the remote's IR "
+            "blaster — it works only when the blaster faces the "
+            "amplifier, so treat it as unreliable rather than impossible."
+        )
+    return hints
+
+
+def _hints_bell_streamer(detail) -> list:
+    """Bell Streamer (Askey STI6130) — researched, nothing hardware-verified.
+
+    Same silicon as Google's own ADT-3 developer kit with a Bell ROM and an
+    Android TV Operator Tier launcher on top. Everything here is sourced from
+    documentation and forum reports; the first real report replaces it.
+    """
+    hints = [
+        "Bell Streamer is Android TV Operator Tier on Askey STI6130 hardware "
+        "— the same board as Google's ADT-3 dev kit, with a Bell launcher on "
+        "top. Nothing about it is hardware-verified by us yet, so treat every "
+        "line in this report as new information rather than a check against "
+        "known-good behaviour."
+    ]
+    attempts = detail("wake_keys").get("attempts") or []
+    if (bool(attempts) and not detail("wake_keys").get("woke_with")
+            and not detail("wake_intent").get("woke")):
+        hints.append(
+            "Bell documents this box powering itself OFF after 30 minutes "
+            "idle — that is a deeper state than the sleep our wake path is "
+            "built for, and it may drop off Wi-Fi entirely (it is a Wi-Fi "
+            "only device, no Ethernet). Before changing any keycode, check "
+            "whether the box was merely asleep or fully off, and whether it "
+            "was still reachable at all — see remote_available in the events "
+            "log and remote_reconnects."
+        )
+    ss = detail("screensaver")
+    if ss.get("likely_role") == "launcher" or ss.get("intent_swallowed"):
+        hints.append(
+            "On this box HOME lands on Bell's own Fibe TV launcher rather "
+            "than an Android TV home screen, so our screensaver-dismiss and "
+            "idle-return keys may behave differently from every device we "
+            "have verified. Whatever package this report names as the "
+            "foreground here is genuinely new data."
+        )
+    return hints
+
+
+# Keyed by profile id. `match` is a tuple of (manufacturer_substring,
+# model_substring) AND-pairs, OR'd together; None means "don't care".
+#
+# Matching the two fields SEPARATELY is load-bearing, not fussiness: a
+# flattened "manufacturer model" string makes the token "streamer" match both
+# Google's TV Streamer and a Bell box whose model is literally "Streamer",
+# and the first profile in iteration order would silently win.
+_DEVICE_PROFILES = {
+    "google_tv_streamer": {
+        "label": "Google TV Streamer (4K)",
+        "match": ((None, "streamer"),),
+        "hints": None,
+        "verified": True,
+    },
+    "chromecast_gtv": {
+        "label": "Chromecast with Google TV",
+        "match": ((None, "chromecast"),),
+        "hints": None,
+        "verified": True,
+    },
+    "shield": {
+        "label": "NVIDIA Shield",
+        "match": (("nvidia", None), (None, "shield")),
+        "hints": _hints_shield,
+        "verified": False,
+    },
+    "bell_streamer": {
+        "label": "Bell Streamer / Bell Fibe TV box",
+        # Deliberately empty: selectable in the dropdown, never auto-detected.
+        # We have never seen what this box reports over the protocol, and a
+        # guessed match pair that fired on the wrong device would be worse
+        # than no detection at all. The pair goes in when the first report
+        # tells us what it actually says.
+        "match": (),
+        "hints": _hints_bell_streamer,
+        "verified": False,
+    },
+}
+
+
+def _detect_profile() -> Optional[str]:
+    """Best guess at the device family from what the protocol reports."""
+    try:
+        info = dict(getattr(state.remote, "device_info", None) or {})
+    except Exception:
+        return None
+    manufacturer = (info.get("manufacturer") or "").lower()
+    model = (info.get("model") or "").lower()
+    if not (manufacturer or model):
+        return None
+    for pid, prof in _DEVICE_PROFILES.items():
+        for want_mfr, want_model in prof["match"]:
+            if want_mfr and want_mfr not in manufacturer:
+                continue
+            if want_model and want_model not in model:
+                continue
+            return pid
+    return None
+
+
+# (id, prompt, profiles, choices)
+#   profiles: () = ask everyone. Otherwise only for those device profiles.
+#   choices:  () = free text. Otherwise a dropdown of (value, label).
+#
+# Scoping matters more than it looks. A tester shown two questions that
+# obviously don't apply to their hardware learns that this form isn't for
+# them, and leaves the whole thing blank — and these answers are the half the
+# app cannot measure for itself.
 _SELF_TEST_QUESTIONS = (
+    ("device_profile",
+     "Which device is this running on? We use this to ask the right "
+     "follow-up questions — pick the closest match.",
+     (),
+     tuple((pid, prof["label"]) for pid, prof in _DEVICE_PROFILES.items())
+     + (("other", "Something else / not sure"),)),
     ("device_model",
-     "Which device is this? (e.g. NVIDIA Shield TV Pro 2019)"),
+     "Which device is this? (e.g. NVIDIA Shield TV Pro 2019)",
+     (), ()),
+
     ("device_software_version",
-     "Its software version — Settings \u2192 Device Preferences \u2192 About"),
+     "Its software version — Settings \u2192 Device Preferences \u2192 About",
+     (), ()),
+
     ("did_the_device_wake",
      "If it was asleep: did it wake up by itself, and roughly how long did it "
-     "take?"),
+     "take?",
+     (), ()),
+
     ("did_the_video_play_on_screen",
-     "Did a video actually appear and play, or did the screen stay put?"),
+     "Did a video actually appear and play, or did the screen stay put?",
+     (), ()),
+
     ("did_pause_and_resume_work",
      "When the test paused, did the picture actually stop and then start "
-     "again \u2014 or did it play straight through?"),
+     "again \u2014 or did it play straight through?",
+     (), ()),
+
     ("what_got_louder",
      "During the volume check, what changed \u2014 the TV\u2019s own speakers, a "
-     "soundbar/receiver, or nothing at all? This one matters most."),
+     "soundbar/receiver, or nothing at all? This one matters most.",
+     (), ()),
+
     ("volume_mode_setting",
      "On a Shield: Settings \u2192 Display & Sound \u2192 Volume control \u2014 is it set "
-     "to HDMI-CEC, Digital, or IR?"),
+     "to HDMI-CEC, Digital, or IR?",
+     ("shield",), ()),
+
     ("simplified_wake_buttons",
      "NVIDIA Shield only — Settings → Remotes & accessories → Simplified "
      "wake buttons: were BOTH switches OFF before this run? With them on, "
      "waking over the network is impossible and every wake result below is "
-     "meaningless."),
+     "meaningless.",
+     ("shield",), ()),
+
     ("what_did_you_put_to_sleep",
      "If you ran the asleep test: did you sleep the streaming box itself, or "
-     "just switch off the TV picture?"),
+     "just switch off the TV picture?",
+     (), ()),
+
     ("smarttube_build",
-     "SmartTube → Settings → About: which build and version?"),
+     "SmartTube → Settings → About: which build and version?",
+     (), ()),
+
     ("did_the_next_video_start_by_itself",
      "Worth five minutes if you can: add TWO short videos from the page and "
      "let the first play to its end. Did the second start on its own? Nothing "
-     "in the automated test can check this."),
+     "in the automated test can check this.",
+     (), ()),
+
     ("normal_add_from_the_page",
      "Also worth doing: with the box asleep, add one video from the page the "
      "ordinary way. Did it play, and roughly how many seconds from pressing "
-     "Add to the picture appearing?"),
+     "Add to the picture appearing?",
+     (), ()),
+
     ("anything_odd_on_screen",
      "Anything you saw that the app couldn\u2019t \u2014 error messages, a chooser "
-     "dialog, the wrong app opening, odd flicker?"),
+     "dialog, the wrong app opening, odd flicker?",
+     (), ()),
 )
 
 
@@ -3160,6 +3391,19 @@ def _suggested_configuration(probes: list) -> dict:
             "confidence": "measured",
         })
         suspects = [pkg for pkg in suspects if pkg != measured_pkg]
+    # A carrier device's launcher is unrecognised by definition (we only know
+    # Google's), so it lands in `suspects` every time. Suggesting it would put
+    # a home screen in SCREENSAVER_PACKAGES.
+    launchers = [pkg for pkg in suspects if _looks_like_a_launcher(pkg)]
+    suspects = [pkg for pkg in suspects if not _looks_like_a_launcher(pkg)]
+    for pkg in launchers:
+        notes.append(
+            f"{pkg} was in the foreground and we don't recognise it, but it "
+            "looks like this device's home screen rather than a screensaver — "
+            "so it is NOT suggested for SCREENSAVER_PACKAGES. Confirm what it "
+            "is and we'll add it to the known-benign list, which only affects "
+            "reporting."
+        )
     for pkg in suspects:
         env.append({
             "var": "SCREENSAVER_PACKAGES",
@@ -3235,11 +3479,15 @@ def _suggested_configuration(probes: list) -> dict:
             "Add any env_vars_to_set to the `environment:` block of your "
             "docker-compose.yml, then `docker compose up -d`. Anything under "
             "constants_that_look_too_short is a code change, not a setting."
-        ) if (env or slow) else "Nothing to change — the defaults fit this device.",
+        ) if (env or slow) else (
+            "No settings to change, but see `notes` — something was seen that "
+            "needs a human to identify."
+            if notes else "Nothing to change — the defaults fit this device."
+        ),
     }
 
 
-def _device_hints(probes: list) -> list:
+def _device_hints(probes: list, profile: Optional[str] = None) -> list:
     """Device-specific interpretation, written into the report itself.
 
     Everything here is sourced research, keyed on what the device reports —
@@ -3252,53 +3500,17 @@ def _device_hints(probes: list) -> list:
         d = by_id.get(pid, {}).get("detail")
         return d if isinstance(d, dict) else {}
 
-    info = {}
-    try:
-        info = dict(getattr(state.remote, "device_info", None) or {})
-    except Exception:
-        pass
-    ident = f"{info.get('manufacturer', '')} {info.get('model', '')}".lower()
     hints = []
+    # The tester's declared profile wins over detection when present — they
+    # can see the box; we are reading two strings off a protocol.
+    pid = profile or _detect_profile()
+    prof = _DEVICE_PROFILES.get(pid or "")
+    if prof and prof.get("hints"):
+        hints.extend(prof["hints"](detail))
 
-    if "nvidia" in ident or "shield" in ident:
-        intent_woke = detail("wake_intent").get("woke")
-        attempts = detail("wake_keys").get("attempts") or []
-        swept_and_failed = bool(attempts) and not detail("wake_keys").get("woke_with")
-        if swept_and_failed and not intent_woke:
-            hints.append(
-                "Shield + no wake: this is almost always Settings > Remotes & "
-                "accessories > Simplified wake buttons — BOTH toggles must be "
-                "OFF. Every reported Shield wake failure with this protocol "
-                "was fixed there; none needed a different keycode. Keep "
-                "WAKE_KEYCODE=POWER."
-            )
-        readiness = (
-            detail("wake_intent").get("current_app_readable_after_wake_s")
-            or detail("wake_keys").get("current_app_readable_after_wake_s")
-        )
-        if readiness is not None and readiness > WAKE_DELAY:
-            hints.append(
-                f"Shield woke but took {readiness}s to become usable — "
-                f"longer than WAKE_DELAY={WAKE_DELAY:g}. SHIELD Experience "
-                "before 9.2 documents 'remote stops responding for 60 seconds "
-                "after wake from sleep'; updating the firmware to 9.2+ is the "
-                "real fix, WAKE_DELAY is the workaround. Note: sw_version in "
-                "this report is the Android TV Remote Service app version, "
-                "NOT the firmware — read Settings > Device Preferences > "
-                "About for the Experience version."
-            )
-        if detail("volume").get("volume_info_moved") is False:
-            hints.append(
-                "Shield volume is governed by Settings > Display & Sound > "
-                "Volume control. 2019 models default to HDMI-CEC (works with "
-                "no local change visible — same as our verified devices); "
-                "2015/2017 default to Digital (a change WOULD have been "
-                "visible in volume_info, so no-change there is a real "
-                "failure). IR mode relays network volume out the remote's IR "
-                "blaster — it works only when the blaster faces the "
-                "amplifier, so treat it as unreliable rather than impossible."
-            )
-
+    # Universal tail — NOT device-keyed. Must stay outside the profile
+    # dispatch: a non-standard SmartTube package id is most likely on exactly
+    # the devices we have no profile for.
     cand = detail("play").get("smarttube_package_candidate") or ""
     if "teamsmart" in cand or "liskovsoft" in cand:
         hints.append(
@@ -3454,7 +3666,9 @@ async def _run_self_test(run_id: str) -> None:
             ),
             # Sourced, device-keyed interpretation — a Shield report explains
             # itself instead of needing the folklore remembered.
-            "device_hints": _device_hints(_self_test["probes"]),
+            "device_hints": _device_hints(
+                _self_test["probes"], _effective_profile()
+            ),
             "kind": "smarttube-playlist self-test",
             "version": VERSION,
             "channel": "beta",
@@ -3472,11 +3686,18 @@ async def _run_self_test(run_id: str) -> None:
                 {k: v for k, v in e.items() if k != "budget_s"}
                 for e in _self_test["probes"]
             ],
-            "questions_for_the_tester": [
-                {"id": qid, "question": prompt,
-                 "answer": (_question_answers().get(qid) or "").strip()}
-                for qid, prompt in _SELF_TEST_QUESTIONS
-            ],
+            "questions_for_the_tester": _questions_payload(),
+            "device_profile": {
+                "declared": _declared_profile(),
+                "detected": _detect_profile(),
+                "effective": _effective_profile(),
+                "note": (
+                    "declared is what the tester picked; detected is what the "
+                    "protocol reported. A disagreement is itself worth "
+                    "reading — it means this device identifies as something "
+                    "we did not expect."
+                ),
+            },
         }
         _self_test["status"] = "done"
     except asyncio.CancelledError:
@@ -3553,6 +3774,49 @@ class SelfTestAnswers(BaseModel):
     answers: dict
 
 
+def _declared_profile() -> Optional[str]:
+    """What the tester picked, if anything. 'other' is a real answer."""
+    v = (_self_test_answers.get("device_profile") or "").strip()
+    return v or None
+
+
+def _effective_profile() -> Optional[str]:
+    """Declared wins over detected — they can see the box, we are reading two
+    strings off a protocol. But a declared 'other' must NOT clobber a
+    confident detection: it means "I don't recognise the list", not "the
+    detection is wrong"."""
+    declared = _declared_profile()
+    if declared and declared != "other":
+        return declared
+    return _detect_profile()
+
+
+def _questions_for(profile: Optional[str]) -> tuple:
+    """The questions worth showing this tester."""
+    return tuple(
+        q for q in _SELF_TEST_QUESTIONS
+        if not q[2] or (profile and profile in q[2])
+    )
+
+
+def _questions_payload() -> list:
+    """Questions for the UI, filtered by profile, with answers folded in.
+
+    Anything already ANSWERED is included even when the current profile
+    filters it out — a tester who answers the Shield questions and then
+    switches the dropdown must not have their typing vanish from the report.
+    """
+    answers = _question_answers()
+    shown = {q[0] for q in _questions_for(_effective_profile())}
+    return [
+        {"id": qid, "question": prompt,
+         "choices": [{"value": v, "label": l} for v, l in choices],
+         "answer": (answers.get(qid) or "").strip()}
+        for qid, prompt, _profiles, choices in _SELF_TEST_QUESTIONS
+        if qid in shown or (answers.get(qid) or "").strip()
+    ]
+
+
 def _question_answers() -> dict:
     """Tester answers, with device_model prefilled from the protocol.
 
@@ -3561,6 +3825,10 @@ def _question_answers() -> dict:
     typed answer always wins.
     """
     answers = dict(_self_test_answers)
+    if not (answers.get("device_profile") or "").strip():
+        detected = _detect_profile()
+        if detected:
+            answers["device_profile"] = detected
     if not (answers.get("device_model") or "").strip():
         try:
             info = dict(getattr(state.remote, "device_info", None) or {})
@@ -3585,17 +3853,27 @@ async def selftest_answers(req: SelfTestAnswers):
     """
     if not SELF_TEST_ENABLED:
         raise HTTPException(503, "Self-test is disabled (SELF_TEST=0)")
-    known = {qid for qid, _ in _SELF_TEST_QUESTIONS}
+    # From the FULL list, never the profile-filtered one: a tester who
+    # answers the Shield questions and then switches the dropdown would
+    # otherwise have that POST silently rejected and their typing lost.
+    known = {q[0] for q in _SELF_TEST_QUESTIONS}
     for key, value in (req.answers or {}).items():
         if key in known and isinstance(value, str):
             _self_test_answers[key] = value[:500]
     report = _self_test.get("report")
     if isinstance(report, dict) and "questions_for_the_tester" in report:
-        report["questions_for_the_tester"] = [
-            {"id": qid, "question": prompt,
-             "answer": (_question_answers().get(qid) or "").strip()}
-            for qid, prompt in _SELF_TEST_QUESTIONS
-        ]
+        report["questions_for_the_tester"] = _questions_payload()
+        # Hints are built at report time, before the tester picks anything —
+        # so recompute them once a profile arrives, or a declared Bell box
+        # would keep whatever the detection guessed at.
+        report["device_profile"] = {
+            "declared": _declared_profile(),
+            "detected": _detect_profile(),
+            "effective": _effective_profile(),
+        }
+        report["device_hints"] = _device_hints(
+            _self_test.get("probes") or [], _effective_profile(),
+        )
     return {"saved": len(_self_test_answers)}
 
 
@@ -3611,11 +3889,7 @@ async def selftest_status():
         "status": _self_test["status"],
         "run_id": _self_test["run_id"],
         "eta_s": round(_self_test["eta_s"], 1),
-        "questions": [
-            {"id": qid, "question": prompt,
-             "answer": _question_answers().get(qid, "")}
-            for qid, prompt in _SELF_TEST_QUESTIONS
-        ],
+        "questions": _questions_payload(),
         "probes": [
             {"id": p["id"], "label": p["label"], "status": p["status"],
              "seconds": p["seconds"]}

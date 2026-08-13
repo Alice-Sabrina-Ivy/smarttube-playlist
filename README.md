@@ -9,11 +9,10 @@ No accounts to create and no third-party service to sign up for.
 > Start with **[docs/BETA-TESTING.md](docs/BETA-TESTING.md)**.
 > For the stable version, use [`main`](https://github.com/Alice-Sabrina-Ivy/smarttube-playlist/tree/main).
 >
-> **Installing fresh from this branch?** The setup below downloads a
-> `docker-compose.yml` pinned to `:latest`, which is the stable image. Change
-> its `image:` line to `ghcr.io/alice-sabrina-ivy/smarttube-playlist:beta`
-> before you start the container, or you'll be testing the wrong build — the
-> self-test button won't be there.
+> **Installing fresh from this branch?** Follow Option A below — the command
+> it gives you already points at the `:beta` image. If you're using a
+> `docker-compose.yml` instead, check its `image:` line ends in `:beta`, or
+> you'll be testing the stable build and the self-test button won't be there.
 
 > **Not affiliated with Google, YouTube, or the SmartTube project.** This is an independent hobby project that talks to software you already run.
 
@@ -92,43 +91,69 @@ Run the installer and launch it. Wait until the bottom-left says **Engine runnin
 > 2. **Check virtualization is on:** Task Manager → Performance → CPU, where **Virtualization** should read *Enabled*. If it says disabled, you'll need to turn it on in your BIOS/UEFI — Intel calls it **VT-x** or *Virtualization Technology*, AMD calls it **SVM Mode**. Docker can't turn it on for you.
 > 3. Run `wsl --update` in PowerShell, then restart Docker Desktop.
 
-**2. Make a folder for it.**
+**2. What you're actually looking at.**
 
-Anywhere, e.g. `Documents\smarttube-playlist`. Everything lives here, including your TV pairing.
+Docker Desktop runs apps in their own sealed box — a *container* — so nothing gets installed into Windows or macOS proper. Its window is mostly a viewer for what's running; there's no "install an app" button in it, which is the bit that trips most people up. You create the container once, by pasting a single line, and from then on it just sits in the **Containers** tab.
 
-**3. Save the configuration file into that folder.**
+**3. Open Docker Desktop's built-in terminal.**
 
-Download [`docker-compose.yml`](docker-compose.yml) (click **Raw**, then save) into that folder. No need to edit it — the defaults work.
+Look in the **bottom-right** of the Docker Desktop window for this button:
 
-> **Windows:** first turn on File Explorer → **View → Show → File name extensions**, so you can see the real filename. It must be exactly `docker-compose.yml` — a hidden `.txt` on the end is the most common thing that goes wrong here. From Notepad, set *Save as type* to **All Files**.
+<img src="docs/docker-terminal-button.png" alt="A small dark button showing a greater-than sign followed by an underscore" height="26">
 
-**4. Open a terminal in that folder.**
+Click it. The first time, it asks whether to turn the terminal on — say yes. Then a panel slides up from the bottom.
 
-- **Windows:** right-click a blank area in the folder → **Open in Terminal**. (Windows 10: **Shift**+right-click → **Open PowerShell window here**.)
-- **Mac:** right-click the folder → **Services → New Terminal at Folder**. (Missing? Enable it in System Settings → Keyboard → Keyboard Shortcuts → Services.)
+You don't need to go looking for any folder in it. The next step works from wherever it opens.
 
-**5. Start it.**
+**4. Paste this one line and press Enter.**
 
-```bash
-docker compose up -d
+```
+docker run -d --name smarttube-playlist --restart unless-stopped -p 38420:8000 -v smarttube-data:/data ghcr.io/alice-sabrina-ivy/smarttube-playlist:beta
 ```
 
-First run downloads the image — a minute or two. You'll see `Container smarttube-playlist  Started`, and it shows green in Docker Desktop's **Containers** tab. It restarts with Docker Desktop from then on.
+It downloads for a minute or two, then prints a long line of letters and numbers. That's the container's ID, and it means it worked. Check the **Containers** tab — `smarttube-playlist` should be there, green, marked *Running*.
 
-**6. Open the page.**
+That's the whole install.
+
+<details>
+<summary>What that line actually says (optional)</summary>
+
+- `-d` — run in the background
+- `--name smarttube-playlist` — what it's called in the Containers tab
+- `--restart unless-stopped` — bring it back after a reboot
+- `-p 38420:8000` — reach it at port 38420 on this computer
+- `-v smarttube-data:/data` — keep the TV pairing in storage Docker manages, so it survives updates. Deliberately not a folder on your PC: Windows paths are the single most common thing to get wrong here.
+- the last part is the app itself, the `:beta` build
+
+</details>
+
+**5. Open the page.**
 
 <http://localhost:38420>
 
-It should load. Two short things before you pair.
+It should load.
+
+**6. One tick box so it survives a restart.**
+
+Gear icon (**Settings**, top right) → **General** → tick **Start Docker Desktop when you sign in to your computer**.
+
+The app is already set to restart itself, but it can't if Docker Desktop isn't running — and Docker Desktop doesn't start on its own until you tick this. Skip it and everything works perfectly until your next reboot, then quietly doesn't.
+
+Two short things before you pair.
 
 #### Letting phones and tablets reach it
 
-`localhost` only works on the computer running it. Everyone else needs that computer's LAN address:
+`localhost` only works on the computer running it. Everyone else needs that computer's address on your network:
 
-- **Windows:** `ipconfig` → *IPv4 Address* under your active adapter
-- **Mac:** System Settings → Network → your connection → *Details*
+- **Windows 11:** Settings → **Network & internet** → click **Wi-Fi** (or **Ethernet**) → click your network's name → scroll to **IPv4 address**
+- **Windows 10:** Settings → **Network & Internet** → **Status** → **Properties** under your connection → **IPv4 address**
+- **Mac:** System Settings → **Network** → your connection → **Details** → **TCP/IP**
 
 Then browse to `http://<that-address>:38420` from any device on the network.
+
+> **Why not `ipconfig`?** Because Docker Desktop itself adds virtual network adapters, and their addresses look completely legitimate in that output — `172.x.x.x`, or `192.168.56.1` if you've ever had VirtualBox. Picking one gives you an address that works on that PC and nowhere else, with nothing to explain why. The Settings path above only ever shows the connection you're actually using.
+>
+> **Sanity check:** the first three numbers should match your phone's. Check on the phone under Wi-Fi settings — tap your network's name. If yours reads `192.168.1.x`, the computer's should too.
 
 **Windows only:** on first run, Windows Defender Firewall asks whether to allow Docker Desktop — tick **Private networks** and allow it. Missed the prompt and nothing else can connect? *Windows Security → Firewall & network protection → Allow an app through firewall*, find Docker Desktop, tick **Private**.
 
@@ -137,6 +162,19 @@ Then browse to `http://<that-address>:38420` from any device on the network.
 It's only alive while that computer is on, awake, and running Docker Desktop. If the machine sleeps mid-video, the TV keeps playing but the queue stops advancing and the page goes dead until it wakes.
 
 Fine for trying it out, or movie night on a desktop that's already on. For something always available, move it to a NAS or Pi — Option B.
+
+#### Changing a setting later
+
+Everything in [docs/CONFIGURATION.md](docs/CONFIGURATION.md) is optional, and you can ignore it until something needs fixing. When it does, add the setting to the same command and run it again:
+
+1. **Containers** tab → the **⋮** menu next to `smarttube-playlist` → **Delete**. Your TV pairing is safe; it lives in the `smarttube-data` storage, not in the container.
+2. Paste the command again with the setting added — `-e NAME=VALUE`, before the last line. For example, to wait longer for a slow TV to wake:
+
+```
+docker run -d --name smarttube-playlist --restart unless-stopped -p 38420:8000 -v smarttube-data:/data -e WAKE_DELAY=30 ghcr.io/alice-sabrina-ivy/smarttube-playlist:beta
+```
+
+Prefer keeping settings in a file? That's what `docker-compose.yml` is for — see [Option B](#option-b--linux-nas-or-homelab). It works on Docker Desktop too; it just needs a terminal opened in the right folder, which is the step this quick path exists to avoid.
 
 **Option A is done — skip Option B entirely and go to [Pair with your TV](#pair-with-your-tv).**
 

@@ -13,8 +13,8 @@ Assumes Docker Engine and the Compose plugin are already installed.
 ```bash
 mkdir -p /opt/smarttube-playlist && cd /opt/smarttube-playlist
 curl -O https://raw.githubusercontent.com/Alice-Sabrina-Ivy/smarttube-playlist/main/docker-compose.yml
-# Beta testers: that URL is the MAIN branch's file and pins :latest. Edit the
-# image line to ...:beta afterwards, or you'll run the stable build.
+# Beta testers: swap `main` for `beta` in that URL. The beta branch's copy
+# already points at the :beta image; this one pins :latest.
 docker compose up -d
 ```
 

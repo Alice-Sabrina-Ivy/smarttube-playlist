@@ -3,7 +3,16 @@ services:
     # Prebuilt multi-arch image (linux/amd64 + linux/arm64).
     # The path is lowercase because GHCR rejects uppercase image names, even
     # though the GitHub account itself is Alice-Sabrina-Ivy.
-    image: ghcr.io/alice-sabrina-ivy/smarttube-playlist:latest
+    #
+    # ┌───────────────────────────────────────────────────────────────────┐
+    # │ THIS IS THE BETA BRANCH. The tag below is `:beta`, not `:latest`. │
+    # │                                                                   │
+    # │ DO NOT MERGE THIS LINE TO main. Every stable user's fresh install │
+    # │ reads main's copy of this file, and pointing them at :beta would  │
+    # │ hand a hardware-diagnostics build to people who just want to      │
+    # │ watch something. On a beta -> main merge, keep main's `:latest`.  │
+    # └───────────────────────────────────────────────────────────────────┘
+    image: ghcr.io/alice-sabrina-ivy/smarttube-playlist:beta
 
     # Building from source instead? Comment out `image:` above, uncomment
     # `build: .` below, and run `docker compose up -d --build` from the repo

@@ -295,7 +295,7 @@
     letter-spacing: normal; text-transform: none;
     color: var(--phos-dim); margin: 0 0 0.3rem;
   }
-  .st-q input {
+  .st-q input, .st-q select {
     width: 100%; margin-bottom: 0.6rem; font-size: 0.85rem; padding: 0.5rem;
   }
   #st-json {
@@ -1723,30 +1723,62 @@
     }
   }
 
-  function renderQuestions(questions) {
+  function renderQuestions(questions, force) {
     if (!questions || !questions.length) return;
     const box = $("st-qlist");
-    if (box.childElementCount) return;   // don't clobber typing on each poll
+    // Don't clobber typing on each poll — but DO re-render when the device
+    // profile changes, since that changes which questions apply.
+    if (box.childElementCount && !force) return;
+    box.innerHTML = "";
     for (const q of questions) {
       const label = document.createElement("label");
       label.textContent = q.question;
       label.setAttribute("for", "stq-" + q.id);
-      const input = document.createElement("input");
-      input.type = "text";
-      input.id = "stq-" + q.id;
-      input.dataset.qid = q.id;
-      input.value = q.answer || "";
-      input.autocomplete = "off";
-      box.append(label, input);
+
+      let field;
+      if (q.choices && q.choices.length) {
+        field = document.createElement("select");
+        for (const c of q.choices) {
+          const opt = document.createElement("option");
+          opt.value = c.value;
+          opt.textContent = c.label;
+          if (c.value === q.answer) opt.selected = true;
+          field.append(opt);
+        }
+        // Picking a device re-asks: some questions only apply to some
+        // hardware, and showing a Shield question to someone holding a
+        // different box is how you teach them to skip the whole form.
+        field.addEventListener("change", async () => {
+          await saveAnswers({ quiet: true });
+          const s = await api("/api/selftest");
+          renderQuestions(s.questions, true);
+          if (s.report) $("st-json").value = JSON.stringify(s.report, null, 2);
+        });
+      } else {
+        field = document.createElement("input");
+        field.type = "text";
+        field.value = q.answer || "";
+        field.autocomplete = "off";
+      }
+      field.id = "stq-" + q.id;
+      field.dataset.qid = q.id;
+      box.append(label, field);
     }
     $("st-questions").hidden = false;
   }
 
-  async function saveAnswers() {
+  async function saveAnswers(opts) {
     const answers = {};
-    for (const el of $("st-qlist").querySelectorAll("input[data-qid]")) {
+    // [data-qid], not input[data-qid] — the device picker is a <select>, and
+    // the narrower selector silently dropped it.
+    for (const el of $("st-qlist").querySelectorAll("[data-qid]")) {
       if (el.value.trim()) answers[el.dataset.qid] = el.value.trim();
     }
+    // The picker always has a value, so it must not by itself count as
+    // "they filled something in" — otherwise the honest "nothing filled in
+    // yet" nudge never fires.
+    const typed = Object.keys(answers).filter(k => k !== "device_profile");
+    if (!typed.length && !(opts && opts.quiet)) return false;
     if (!Object.keys(answers).length) return false;
     try {
       await api("/api/selftest/answers", { method: "POST", body: { answers } });

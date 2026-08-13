@@ -8,13 +8,14 @@ You don't need ADB or a terminal on the TV. The beta build collects most of the 
 
 ## Get the beta build
 
-Change one line in your `docker-compose.yml`:
+**Starting from scratch?** Follow [Option A in the README](../README.md#option-a--docker-desktop-windows-or-macos) — it's one line pasted into Docker Desktop, and it already points at the beta build. Nothing to download or edit.
 
-```yaml
-image: ghcr.io/alice-sabrina-ivy/smarttube-playlist:beta
-```
+**Already running the stable version?** Two ways, depending on how you installed it:
 
-Then `docker compose pull && docker compose up -d`. Your pairing is kept.
+- *With a `docker-compose.yml`:* change its `image:` line to end in `:beta`, then `docker compose pull && docker compose up -d`.
+- *With the one-line command:* delete the container (Containers tab → **⋮** → **Delete**) and run the command again with `:beta` on the end. Your pairing survives — it lives in the `smarttube-data` storage, not in the container.
+
+Either way your TV pairing is kept.
 
 Beta builds report their version as `1.01` so it's obvious which one you're running.
 
