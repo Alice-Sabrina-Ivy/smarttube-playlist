@@ -38,27 +38,32 @@ It contains **no credentials** — no pairing certificate, no private key, no Yo
 
 The most useful thing in there is `events` — a log of what app was in the foreground over time. That's how we learn what your device calls its screensaver and its launcher, which is the single most common reason playback fails on unfamiliar hardware.
 
-## What to do, in order
+## What to do
 
-Three passes. Each one is useful on its own, so send what you have rather than waiting until the end.
+One run is enough to start. Send it, and we'll tell you whether anything else is worth your time — the report says plainly what it did and didn't establish, so we won't ask you to repeat things blind.
 
-**1. Pair it.** Enter the TV's address, then the 6-character code. If pairing fails outright, stop and say so — nothing else can work without it.
+**1. Pair the TV.** Enter its address, then the 6-character code that appears on screen.
 
-**1b. Then pair with SmartTube too.** On the TV: **SmartTube → Settings → Remote control**, which shows a 12-digit code. Type it into the *Pair with SmartTube* card on the page.
+This is also the moment of truth. It uses the same channel everything else does, so if pairing works, the rest can. If it fails outright, stop right there and tell us — that's a real answer, and it saves you the evening.
 
-Please don't skip this. It's optional for daily use but not for testing: without it the app can't see the real playback position, so three of the twelve checks can't run at all and two more come back as "started it, no idea what happened next." It takes about a minute and roughly doubles what the report can tell us.
+**2. Pair with SmartTube.** On the TV: **SmartTube → Settings → Remote control**, which shows a 12-digit code. Type it into the *Pair with SmartTube* card on the page.
 
-**2. Catch the screensaver.** Leave the device alone until the screensaver appears, don't touch the remote, then open the page from your phone and hit **📋 Copy diagnostics** (the passive one — it won't disturb the screensaver).
+Worth the minute it takes. Without it the app can't see the real playback position, so three of the thirteen checks can't run at all and two more come back as "started it, no idea what happened next."
 
-This is the single most valuable thing you can send. We need to know what package your screensaver reports as: screensavers silently swallow app-launch requests, so if the app doesn't recognise yours, videos never start and nothing errors.
+**3. Run the self-test once**, with the device **on and idle**. Pick your device from the dropdown, wait about three minutes, answer whatever questions you can be bothered with, then **📋 Copy report** and send it.
 
-**3. Run the self-test twice.**
+That's the ask. Everything below is only if we come back and say it would help.
 
-- Once with the **device asleep** (send it to sleep with its own remote first — the box, not just the TV picture — then press the button from your phone). This is the only way to answer whether your device wakes over the network, and which keycode does it. It's also the slowest run, because it waits on each wake attempt for as long as the app itself would.
-- Once with the **device on and idle**. This covers playback, pause/resume, volume, and where the device lands when the app hands the TV back.
-- If you can spare a third: leave it untouched until the **screensaver** appears, then run the self-test (not Copy diagnostics) from your phone. That's the only way we learn what your screensaver is called, and an unrecognised one is the most common reason videos never start on a device we've never seen.
+<details>
+<summary>The other two runs, if we ask for them</summary>
 
-Send the report. Then tell us anything you saw on the screen that the app couldn't — that's the half we're missing.
+**With the device asleep.** Send the box itself to sleep — not just the TV picture; on a separate streaming box those are different things and the app sees straight through the second one. Then press the button from your phone.
+
+This is the only way to answer whether your device wakes over the network, and which key does it. It's also the slow one: it waits on each attempt for as long as the app itself would, so budget up to eight minutes.
+
+**With the screensaver up.** Leave the device untouched until the screensaver appears, then run the self-test from your phone — the self-test, not Copy diagnostics. It will try to start a video while the screensaver is on screen, which is how we learn whether your screensaver swallows launch requests. That's the most common reason videos silently fail to start on hardware we've never seen.
+
+</details>
 
 **4. Optional, if you have another five minutes.** Two things no automated check can cover:
 
