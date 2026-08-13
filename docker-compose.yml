@@ -96,5 +96,8 @@ services:
       #                                              # shows the video ID as the title and assumes a
       #                                              # 10-minute length for the auto-advance timer.
 
-      # Volume control is NOT configured here. You pick your AV receiver in the
-      # web UI during setup, and the choice is saved with the TV pairing.
+      # Volume needs no configuration at all. The volume buttons relay keycodes
+      # over the same connection used to control the TV, and the streaming
+      # device turns them into HDMI-CEC commands aimed at whatever is playing
+      # the audio — or attenuates its own output. Either way there is nothing
+      # to set here, and no receiver to pick.
