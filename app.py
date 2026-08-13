@@ -240,6 +240,24 @@ _remote_reconnects = 0
 # Foreground packages that are expected and therefore not screensaver suspects.
 # Launchers are included because "sitting on the home screen" is normal, not a
 # fault — listing them keeps the suspect list short enough to act on.
+# Read from SmartTube's own build.gradle (productFlavors) — every id it
+# actually ships under, plus the legacy one it shipped under before the
+# ~Nov 2025 signing-key compromise forced a rename. The in-app updater cannot
+# cross that rename, so long-standing installs sit on the old id forever.
+#
+# NOTE the legacy id is videoMANAGER, not videotv. That distinction matters:
+# a plausible-looking corruption of it circulates, and a wrong id here would
+# have us tell a tester to configure a package that does not exist.
+KNOWN_SMARTTUBE_PACKAGES = {
+    "org.smarttube.stable": "current stable",
+    "org.smarttube.beta": "current beta",
+    "app.smarttube.fdroid": "F-Droid build",
+    "app.smarttube": "default/self-built",
+    "com.teamsmart.videomanager.tv": "LEGACY, pre-rename",
+    "com.liskovsoft.smarttubetv.beta": "LEGACY beta, pre-rename",
+}
+
+
 KNOWN_BENIGN_PACKAGES = frozenset({
     "com.google.android.tvlauncher",         # Android TV launcher
     "com.google.android.apps.tv.launcherx",  # Google TV launcher
@@ -3268,9 +3286,6 @@ _SELF_TEST_QUESTIONS = (
      (),
      tuple((pid, prof["label"]) for pid, prof in _DEVICE_PROFILES.items())
      + (("other", "Something else / not sure"),)),
-    ("device_model",
-     "Which device is this? (e.g. NVIDIA Shield TV Pro 2019)",
-     (), ()),
 
     ("device_software_version",
      "Its software version — Settings \u2192 Device Preferences \u2192 About",
@@ -3291,8 +3306,10 @@ _SELF_TEST_QUESTIONS = (
      (), ()),
 
     ("what_got_louder",
-     "During the volume check, what changed \u2014 the TV\u2019s own speakers, a "
-     "soundbar/receiver, or nothing at all? This one matters most.",
+     "\u2b50 During the volume check, what changed \u2014 the TV\u2019s own speakers, "
+     "a soundbar/receiver, or nothing at all? Everything else here is "
+     "optional; this is the one the app genuinely cannot work out for "
+     "itself.",
      (), ()),
 
     ("volume_mode_setting",
@@ -3316,17 +3333,7 @@ _SELF_TEST_QUESTIONS = (
      "SmartTube → Settings → About: which build and version?",
      (), ()),
 
-    ("did_the_next_video_start_by_itself",
-     "Worth five minutes if you can: add TWO short videos from the page and "
-     "let the first play to its end. Did the second start on its own? Nothing "
-     "in the automated test can check this.",
-     (), ()),
 
-    ("normal_add_from_the_page",
-     "Also worth doing: with the box asleep, add one video from the page the "
-     "ordinary way. Did it play, and roughly how many seconds from pressing "
-     "Add to the picture appearing?",
-     (), ()),
 
     ("anything_odd_on_screen",
      "Anything you saw that the app couldn\u2019t \u2014 error messages, a chooser "
@@ -3512,16 +3519,36 @@ def _device_hints(probes: list, profile: Optional[str] = None) -> list:
     # dispatch: a non-standard SmartTube package id is most likely on exactly
     # the devices we have no profile for.
     cand = detail("play").get("smarttube_package_candidate") or ""
-    if "teamsmart" in cand or "liskovsoft" in cand:
+    if cand in KNOWN_SMARTTUBE_PACKAGES and cand != SMARTTUBE_PACKAGE:
+        which = KNOWN_SMARTTUBE_PACKAGES[cand]
+        if "LEGACY" in which:
+            hints.append(
+                f"This install runs a LEGACY SmartTube id ({cand}). "
+                "SmartTube's signing key was compromised around Nov 2025 and "
+                "the app was re-released under new ids; the in-app updater "
+                "cannot cross the rename, so long-time installs stay on the "
+                "old id forever. Recommend a fresh install of current stable "
+                "(32.10s or later) rather than pointing SMARTTUBE_PACKAGE at "
+                "the legacy id — intent-launched videos also played "
+                "unauthenticated before 31.94s, which breaks age-restricted "
+                "playback and watch history."
+            )
+        else:
+            hints.append(
+                f"SmartTube IS installed here, as the {which} "
+                f"({cand}) — but this app is configured for "
+                f"{SMARTTUBE_PACKAGE}, so every foreground check compares "
+                "against a package that isn't there. One-line fix: set "
+                f"SMARTTUBE_PACKAGE={cand}. Nothing is wrong with the "
+                "install itself."
+            )
+    elif cand:
         hints.append(
-            f"This install runs a LEGACY SmartTube id ({cand}). SmartTube's "
-            "signing key was compromised around Nov 2025 and the app was "
-            "re-released under new ids; the in-app updater cannot cross the "
-            "rename, so long-time installs stay on the old id forever. "
-            "Recommend a fresh install of current stable (32.10s or later) "
-            "rather than pointing SMARTTUBE_PACKAGE at the legacy id — "
-            "intent-launched videos also played unauthenticated before "
-            "31.94s, which breaks age-restricted playback and watch history."
+            f"The launch Intent opened {cand}, which is not any SmartTube id "
+            "we know of. If that IS SmartTube, tell us the id and we'll add "
+            "it; if it's the stock YouTube app, Android picked the wrong "
+            "default handler — open SmartTube once by hand and choose "
+            "'always' when the chooser appears."
         )
     return hints
 

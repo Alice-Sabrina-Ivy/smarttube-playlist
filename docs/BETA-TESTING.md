@@ -58,7 +58,14 @@ This is the single most valuable thing you can send. We need to know what packag
 - Once with the **device on and idle**. This covers playback, pause/resume, volume, and where the device lands when the app hands the TV back.
 - If you can spare a third: leave it untouched until the **screensaver** appears, then run the self-test (not Copy diagnostics) from your phone. That's the only way we learn what your screensaver is called, and an unrecognised one is the most common reason videos never start on a device we've never seen.
 
-Send both reports. Then tell us anything you saw on the screen that the app couldn't — that's the half we're missing.
+Send the report. Then tell us anything you saw on the screen that the app couldn't — that's the half we're missing.
+
+**4. Optional, if you have another five minutes.** Two things no automated check can cover:
+
+- Add **two** short videos from the page and let the first play to its end. Did the second start by itself? That's the whole auto-advance mechanism, and it can only be seen from the sofa.
+- With the device asleep, add one video the ordinary way — not the self-test. Did it play, and roughly how long from pressing Add to the picture appearing? Anything over a minute tells us a timing default is wrong for your hardware.
+
+Neither is required. The report is worth sending without them.
 
 ## Known device-specific settings
 
