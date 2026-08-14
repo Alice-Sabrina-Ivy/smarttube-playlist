@@ -1392,6 +1392,12 @@ async def lifespan(_app: FastAPI):
     host = cfg.get("host")
     startup_retry_task: Optional[asyncio.Task] = None
     if host and CERT_FILE.exists() and KEY_FILE.exists():
+        # Remember the configured address even if we cannot reach it. Without
+        # this the UI can only say "can't reach your TV" without naming which
+        # address it is failing on — and that address IS the answer when a
+        # DHCP lease has moved the device. _attempt_startup_connect sets it
+        # too, but only on success.
+        state.host = host
         connected = await _attempt_startup_connect(host)
         if not connected:
             # If the TV was unreachable at startup (typical after a power
@@ -1551,11 +1557,21 @@ async def status():
             current_app = state.remote.current_app
         except Exception:
             current_app = None
+    # `configured` answers "is there a live connection", which the UI was
+    # rendering as "have you set this up" — so a paired install with an
+    # unreachable TV showed NOT CONFIGURED, offered a pairing form that can
+    # only 409, and advised deleting a perfectly good certificate. Report the
+    # credentials separately so the two states can be told apart.
+    credentials_present = _is_tv_paired()
     lounge_paired = LOUNGE_AUTH_FILE.exists()
     lounge_connected = bool(state.lounge_monitor and state.lounge_monitor.is_connected)
     return {
         "version": VERSION,
         "configured": paired,
+        # True when cert/key/config are all on disk. `configured && not
+        # credentials_present` is impossible; the interesting case is the
+        # reverse — paired, but we cannot reach the device right now.
+        "credentials_present": credentials_present,
         "host": state.host,
         "pairing_in_progress": state.pairing_in_progress,
         "tv_on": is_on,
@@ -1569,6 +1585,66 @@ async def status():
         # available whenever the TV is. Whether the device actually honours it
         # depends on its CEC volume setting, which we can't read without ADB.
         "volume_available": state.remote is not None,
+    }
+
+
+class TvAddressReq(BaseModel):
+    host: str
+
+
+@app.post("/api/tv/address")
+async def tv_address(req: TvAddressReq):
+    """Point an existing pairing at a new address, without re-pairing.
+
+    A DHCP lease change used to take the service down with no way back from
+    the UI: the certificate is still valid — it is bound to the device, not
+    its address — but `/api/pair/start` refuses because the credential files
+    exist, so recovering meant editing config.json inside the container.
+
+    Deliberately NOT treated like the removed `/api/reset` and
+    `/api/lounge/unpair` endpoints, which were dropped as one-shot LAN-side
+    denials of service. The difference is reversibility: those destroyed
+    credentials permanently, whereas a wrong address here is fixed by
+    entering the right one — and the UI keeps this form on screen precisely
+    when the device is unreachable, so a mistake is always recoverable
+    through the same control that caused it.
+    """
+    if not _is_tv_paired():
+        raise HTTPException(
+            409, "Not paired yet — use the pairing flow instead.",
+        )
+    host = (req.host or "").strip()
+    if not host:
+        raise HTTPException(400, "Enter the TV's address.")
+    try:
+        ipaddress.ip_address(host)
+    except ValueError:
+        # Hostnames are accepted too; only obvious junk is refused. Anything
+        # that resolves is the user's business, and a wrong value here is
+        # recoverable by entering a right one.
+        if any(c in host for c in " \t/\\?#") or len(host) > 253:
+            raise HTTPException(400, "That doesn't look like an address.")
+
+    previous = state.host
+    state.host = host
+    save_config({"host": host})
+    log.info("TV address changed from %s to %s; reconnecting", previous, host)
+    _record_device_event("tv_address_changed", f"{previous} -> {host}")
+
+    # Drop any existing connection and rebuild against the new address. The
+    # certificate is reused untouched.
+    if await _reconnect_remote():
+        return {"ok": True, "host": host, "connected": True}
+    # The retry loop keeps trying in the background, so a typo isn't fatal —
+    # but say so rather than reporting success.
+    return {
+        "ok": True,
+        "host": host,
+        "connected": False,
+        "detail": (
+            "Address saved, but the TV didn't answer there. Check it and try "
+            "again — this won't affect your pairing."
+        ),
     }
 
 

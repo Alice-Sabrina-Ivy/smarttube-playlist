@@ -646,6 +646,30 @@
   </header>
 
   <!-- ── Pair: enter host ─────────────────────────────────────────────── -->
+  <!-- Shown when the credentials are on disk but we cannot reach the device.
+       Previously this state rendered the pairing card, which can only 409 and
+       which advised deleting a certificate that was never the problem. -->
+  <section id="card-unreachable" class="card" hidden>
+    <h2 class="card-title">▌ Can&#39;t reach your TV</h2>
+    <p class="card-sub">
+      Your pairing is fine — the TV just isn&#39;t answering at
+      <strong id="unreachable-host">its saved address</strong>. It keeps
+      retrying in the background, so if the TV is simply off or asleep, turn
+      it on and this will clear by itself.
+    </p>
+    <p class="card-sub">
+      Still stuck? The usual cause is that the TV&#39;s address changed —
+      routers hand out a different one after a reboot. Check it on the TV
+      under <strong>Settings → Network &amp; Internet</strong>, then enter it
+      here. <span class="hint">This doesn&#39;t re-pair anything; your
+      certificate stays as it is.</span>
+    </p>
+    <label for="new-host">TV address</label>
+    <input id="new-host" type="text" inputmode="decimal" placeholder="192.168.1.69" autocomplete="off">
+    <button id="btn-update-host">Update address</button>
+    <div id="toast-unreachable" class="toast"></div>
+  </section>
+
   <section id="card-pair-host" class="card" hidden>
     <h2 class="card-title">▌ Pair a TV</h2>
     <p class="card-sub">First-time setup. Enter the IP address of your Google TV / Android TV device.</p>
@@ -832,6 +856,7 @@
   const $ = id => document.getElementById(id);
   const cards = {
     host:   $("card-pair-host"),
+    unreachable: $("card-unreachable"),
     code:   $("card-pair-code"),
     now:    $("card-now"),
     add:    $("card-add"),
@@ -904,6 +929,11 @@
         suffix = " · SMARTTUBE OFFLINE";
       }
       line.textContent = `LINKED · ${s.host}${suffix}`;
+    } else if (s.credentials_present) {
+      // Paired, but no live connection. Distinct from never having set it up,
+      // and the difference matters: nothing here needs re-pairing.
+      pulse.className = "pulse warn";
+      line.textContent = `PAIRED · CAN'T REACH ${s.host || "TV"} · RETRYING`;
     } else {
       pulse.className = "pulse off";
       line.textContent = "NOT CONFIGURED";
@@ -937,6 +967,14 @@
       setStatus(s);
       if (s.pairing_in_progress)      showCard("code");
       else if (s.configured)          { showPaired(s.lounge_paired); ensureSSE(); }
+      else if (s.credentials_present) {
+        // Prefill with the address we're failing on, so correcting a changed
+        // last octet is a two-character edit rather than a retype.
+        const el = $("new-host");
+        if (document.activeElement !== el && !el.value) el.value = s.host || "";
+        $("unreachable-host").textContent = s.host || "its saved address";
+        showCard("unreachable");
+      }
       else                            showCard("host");
     } catch (e) {
       $("status-line").textContent = "API UNREACHABLE";
@@ -1911,6 +1949,28 @@
       }
     } catch (e) { /* self-test is beta-only; a 404 here is expected on stable */ }
   })();
+
+  $("btn-update-host").addEventListener("click", async () => {
+    const host = $("new-host").value.trim();
+    if (!host) return toast($("toast-unreachable"), "Enter the TV's address.", "err");
+    const btn = $("btn-update-host"); btn.disabled = true;
+    try {
+      const r = await api("/api/tv/address", { method: "POST", body: { host } });
+      if (r.connected) {
+        toast($("toast-unreachable"), "Connected. You're back.", "ok");
+      } else {
+        // Saved but still unreachable — say so plainly rather than claiming
+        // success, and leave the form up so it can be corrected again.
+        toast($("toast-unreachable"), r.detail || "Saved, but no answer there.", "err");
+      }
+      await refreshStatus();
+    } catch (e) {
+      toast($("toast-unreachable"), e.message, "err");
+    } finally { btn.disabled = false; }
+  });
+  $("new-host").addEventListener("keydown", e => {
+    if (e.key === "Enter") $("btn-update-host").click();
+  });
 
   $("btn-lounge-pair").addEventListener("click", async () => {
     const code = $("lounge-code").value.trim();
