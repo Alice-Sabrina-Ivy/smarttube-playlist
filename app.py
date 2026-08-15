@@ -290,11 +290,36 @@ KNOWN_BENIGN_PACKAGES = frozenset({
 _SECRET_QS_RE = re.compile(
     r"(?i)\b(loungeIdToken|SID|gsessionid|access_token|token)=[^&\s'\")]+"
 )
+# Secrets also appear in PROSE, without an equals sign, and that form is the
+# one that actually leaked: pyytlounge logs `"Refreshed auth, lounge id token
+# %s"` at INFO on every token refresh. A query-string-only pattern misses it
+# entirely — caught 2026-08-15 by reading a real dev-server log rather than by
+# any test, because every test fed it URL-shaped input.
+#
+# Deliberately greedy about what follows the label: tokens, screen ids and
+# session ids are all long opaque strings, so anything 16+ chars of token
+# alphabet after one of these labels is redacted. Over-redacting a log line is
+# free; under-redacting one puts playback control in a paste.
+_SECRET_PROSE_RE = re.compile(
+    r"(?i)\b("
+    # "lounge id token X" AND "lounge id X" — pyytlounge logs both, and the
+    # value is the same secret either way.
+    r"lounge[ _]?id(?:[ _]?token)?|loungeIdToken|"
+    r"refresh[ _]?token|access[ _]?token|auth[ _]?token|"
+    r"screen[ _]?id|session[ _]?id"
+    r")(\s*[:=]?\s+)([A-Za-z0-9_\-]{16,})"
+)
 
 
 def _redact_secrets(text: str) -> str:
-    """Strip credential-bearing query parameters out of arbitrary text."""
-    return _SECRET_QS_RE.sub(r"\1=<redacted>", text)
+    """Strip credentials out of arbitrary text.
+
+    Two shapes, because secrets reach us in two: as query parameters on a
+    request URL (aiohttp errors stringify the whole URL), and as bare values
+    in a log message following a human label.
+    """
+    text = _SECRET_QS_RE.sub(r"\1=<redacted>", text)
+    return _SECRET_PROSE_RE.sub(r"\1\2<redacted>", text)
 
 
 class _RedactingFormatter(logging.Formatter):
