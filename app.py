@@ -981,6 +981,20 @@ async def _start_lounge_monitor() -> None:
         #       session open). The stuck-ct detector forcing
         #       reconnects under this condition would yank the user
         #       out of whatever they're doing on the TV.
+        # SAFETY COUPLING, easy to break by accident: `suppress_lounge` is
+        # written ONLY from current_app callbacks, which require a remote. With
+        # no remote it is permanently False, so this gate's third clause is
+        # stuck open — and refreshing while SmartTube is backgrounded
+        # auto-foregrounds it (the comment above explains why that is
+        # actively harmful). What saves us today is the FIRST clause:
+        # `_require_paired()` 503s /api/queue when state.remote is None, so
+        # `current` can never be set without a remote and the gate stays shut.
+        #
+        # Anything that lets the queue run without a paired remote — a
+        # Lounge-only mode, say — must disable this refresh loop outright, or
+        # it will yank the user out of whatever app they are in every 3
+        # seconds, forever. Pinned by
+        # test_the_refresh_gate_depends_on_pairing_to_stay_shut.
         should_refresh=lambda: (
             queue_controller.state.current is not None
             and not queue_controller.state.paused
