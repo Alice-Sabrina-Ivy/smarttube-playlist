@@ -47,7 +47,7 @@ The reason is a single component: **Android TV Remote Service**, which Google pr
 | **Chromecast with Google TV (4K)** | ✅ | Verified end to end |
 | **NVIDIA Shield** (all models) | ✅ probably | Same protocol; Home Assistant documents Shield-specific remote behaviour, which only makes sense if it works. Not yet confirmed by us |
 | **Android TV / Google TV** with the Play Store — onn., Xiaomi, Sony, Philips, TCL, Hisense, Nokia | ✅ probably | Carries the Remote Service by default |
-| **Amazon Fire TV** (any model) | ❌ | Fire OS swaps Google's services for Amazon's and **has no Android TV Remote Service**. SmartTube itself runs fine there — this app can't reach it. The only alternative is ADB, which would mean this service holding a shell-level key to your TV; it deliberately doesn't. Own one and want to help rule it in or out? [Open an issue](https://github.com/Alice-Sabrina-Ivy/smarttube-playlist/issues) |
+| **Amazon Fire TV** (any model) | ❌ | SmartTube runs fine there, but Fire OS has **no Android TV Remote Service**, so this app can't drive it. Amazon's own LAN remote protocol exists — it just can't launch a *specific video* into SmartTube, or tell us which app is on screen, and both are load-bearing here. Own one and want to help? [Open an issue](https://github.com/Alice-Sabrina-Ivy/smarttube-playlist/issues) — a couple of measurements would settle it for good |
 | **Roku**, incl. Roku TVs | ❌ | Not Android. Can't install SmartTube at all |
 | **Apple TV, Samsung (Tizen), LG (webOS)** | ❌ | Not Android |
 | **Older Chromecast dongles** (1st–3rd gen, Ultra, Audio) | ❌ | Cast receivers, not Android TV — only *Chromecast with Google TV* qualifies |
