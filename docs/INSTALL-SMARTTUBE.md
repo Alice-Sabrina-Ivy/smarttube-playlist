@@ -6,7 +6,9 @@
 
 **Runs on:** Android TV and Google TV devices — Chromecast with Google TV, Nvidia Shield, Xiaomi Mi Box, onn. boxes, and most Android TV boxes and built-in Android TVs.
 
-**Doesn't run on:** phones and tablets, Samsung (Tizen) and LG (webOS) TVs, Apple TV, Roku. Fire TV is in between — SmartTube supports older ones, and this app may not work with Fire TV regardless.
+**Doesn't run on:** phones and tablets, Samsung (Tizen) and LG (webOS) TVs, Apple TV, Roku.
+
+**Fire TV is the awkward one.** SmartTube itself runs on Fire TV models released before October 2025 — but *this* app still can't drive it, because Fire OS ships Amazon's remote stack instead of Google's Android TV Remote Service, and that service is what we connect to. So SmartTube working there is not enough. See [Will it work with my device?](../README.md#will-it-work-with-my-device).
 
 **Installing it.** SmartTube is **not on the Play Store** — you install it yourself, and only from the official source: its developer warns that copies on app stores and APK sites may contain malware.
 

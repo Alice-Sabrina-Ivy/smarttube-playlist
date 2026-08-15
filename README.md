@@ -35,7 +35,28 @@ Used daily on the setup it was built for, but not finished, and only proven on t
 
 Each exercised end to end: pairing, Lounge, pause/resume, auto-advance, wake-from-sleep, screensaver return.
 
-**Other Android TV hardware** — Nvidia Shield, onn., Xiaomi — uses the same protocol and will most likely work, but nobody has confirmed it. Fire TV runs Fire OS and may not expose the Remote service at all. Tried one? [Open an issue](https://github.com/Alice-Sabrina-Ivy/smarttube-playlist/issues) either way.
+### Will it work with my device?
+
+**One test answers it, in about thirty seconds, before you install anything.** Open Google's own **Google TV** app on your phone, tap the remote icon, and try to control your device with it. That app speaks the exact protocol this service uses. If it can drive your device, so can this. If it can't, nothing here will help.
+
+The reason is a single component: **Android TV Remote Service**, which Google pre-installs on Android TV and Google TV devices. It's the whole requirement.
+
+| Device | Works? | |
+|---|---|---|
+| **Google TV Streamer (4K)** | ✅ | Verified end to end |
+| **Chromecast with Google TV (4K)** | ✅ | Verified end to end |
+| **NVIDIA Shield** (all models) | ✅ probably | Same protocol; Home Assistant documents Shield-specific remote behaviour, which only makes sense if it works. Not yet confirmed by us |
+| **Android TV / Google TV** with the Play Store — onn., Xiaomi, Sony, Philips, TCL, Hisense, Nokia | ✅ probably | Carries the Remote Service by default |
+| **Amazon Fire TV** (any model) | ❌ | Fire OS swaps Google's services for Amazon's and **has no Android TV Remote Service**. SmartTube itself runs fine there — this app can't reach it |
+| **Roku**, incl. Roku TVs | ❌ | Not Android. Can't install SmartTube at all |
+| **Apple TV, Samsung (Tizen), LG (webOS)** | ❌ | Not Android |
+| **Older Chromecast dongles** (1st–3rd gen, Ultra, Audio) | ❌ | Cast receivers, not Android TV — only *Chromecast with Google TV* qualifies |
+| **Carrier boxes** (Bell, Sky, Rogers…) | ❓ | Depends. Many are Android TV underneath and should work; do the phone-app test |
+| **AOSP boxes with no Play Store** | ❓ | Probably not, and this is the trap below |
+
+> **Careful:** SmartTube advertises that it works *without* Google services. This app needs more than SmartTube does — it needs Google's Remote Service specifically. So "SmartTube runs on my box" does **not** mean this will. The phone-app test is the one that settles it.
+
+Tried a device that isn't listed? [Open an issue](https://github.com/Alice-Sabrina-Ivy/smarttube-playlist/issues) either way — a No is as useful as a Yes.
 
 Where this is heading: see [Roadmap](#roadmap).
 
@@ -308,7 +329,7 @@ The README covers getting it running. Everything else lives here:
 
 No dates — spare-time project.
 
-- **Verified support for other sticks and boxes** — Nvidia Shield, onn./Xiaomi, possibly Fire TV.
+- **Verified support for other sticks and boxes** — Nvidia Shield, onn./Xiaomi, carrier boxes. (Not Fire TV: Fire OS has no Android TV Remote Service, so it is out of reach regardless of SmartTube supporting it.)
 - **Volume where HDMI-CEC isn't available** — those users currently get none.
 
 Got one of the untested devices? [Open an issue](https://github.com/Alice-Sabrina-Ivy/smarttube-playlist/issues) either way.
