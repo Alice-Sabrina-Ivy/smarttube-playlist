@@ -45,10 +45,16 @@ services:
       # ---------------------------------------------------------------
 
       # --- Re-pairing ---
-      # Set to "1" and restart to clear the TV certificate and Lounge token,
-      # returning to the setup screen. Fires ONCE: a container can't unset its
-      # own env var, so a marker file in /data stops it wiping your new pairing
-      # on every subsequent reboot. Take this back out once you've re-paired.
+      # Uncomment, restart, and this clears the TV certificate and Lounge
+      # token, dropping you back on the setup screen.
+      #
+      # You can then leave it exactly as it is. It fires ONCE and never again:
+      # a container can't unset its own environment variable, so instead the
+      # first run writes a marker into /data and every later start sees it and
+      # does nothing. Your new pairing is safe.
+      #
+      # The only reason to comment it back out is if you want to reset a
+      # SECOND time later — clearing it deletes the marker and re-arms it.
       # RESET_PAIRING: "1"
 
       # --- Reverse proxies ---

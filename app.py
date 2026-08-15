@@ -429,10 +429,13 @@ def _apply_reset_if_requested() -> None:
         return
 
     if RESET_MARKER.exists():
-        log.warning(
-            "RESET_PAIRING is still set but the reset has already run. "
-            "Remove RESET_PAIRING from the container's environment and "
-            "restart. Ignoring so your new pairing survives."
+        # Deliberately not nagging: leaving the flag set is a supported
+        # end state, and the marker is what makes it safe. Telling people to
+        # go and undo it invents work this code exists to avoid.
+        log.info(
+            "RESET_PAIRING is set but the reset has already run; ignoring so "
+            "your pairing survives. Nothing to do — clear the flag only if "
+            "you want to arm another reset later."
         )
         return
 

@@ -18,7 +18,7 @@ Symptoms are grouped roughly in the order you'd hit them: installing, pairing, t
 
 **The page says "Can't reach your TV", or the header shows PAIRED · CAN'T REACH.** Your pairing is fine — the device just isn't answering. If it's off or asleep, turn it on and this clears itself. If it stays stuck, its address almost certainly changed (routers hand out a new one after a reboot): check it on the TV under Settings → Network & Internet, then type it into the box on that screen. Nothing is re-paired. Worth setting a DHCP reservation for the TV afterwards so it can't drift again.
 
-**`InvalidAuth` on startup.** The pairing certificate was rejected — the TV revoked it, or the files got out of sync. Set `RESET_PAIRING: "1"` in `docker-compose.yml`, restart, pair again, then take the flag back out.
+**`InvalidAuth` on startup.** The pairing certificate was rejected — the TV revoked it, or the files got out of sync. Set `RESET_PAIRING: "1"` in `docker-compose.yml` and restart, then pair again. You can leave the flag set — it only fires once, and won't touch your new pairing.
 
 **HTTP 500 with `PermissionError: '/data/cert.pem'`.** The data directory isn't writable by the container's user. The entrypoint chowns it to UID 1000 at startup, so this normally self-heals — unless you added a `user:` line to `docker-compose.yml`, which prevents the chown. Either remove that line or pre-create the directory with the right owner: `sudo chown -R 1000:1000 ./data`.
 

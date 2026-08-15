@@ -34,7 +34,7 @@ services:
 | `METADATA_TIMEOUT_S` | `15.0` | YouTube watch-page fetch timeout. The page is 1.1–1.6 MiB; too low and the scrape fails, giving the video a wrong title and a 10-minute assumed length that cuts long videos short |
 | `DATA_DIR` | `/data` | Where pairing state is stored **inside** the container. Change the volume mount instead |
 | `ALLOWED_HOSTS` | (unset) | Comma-separated hostnames to accept in the `Host` header. Only needed behind a reverse proxy on a real domain — see [SECURITY.md](../SECURITY.md) |
-| `RESET_PAIRING` | (unset) | Set to `1` to clear all pairing on the next start. Fires **once** — see [SECURITY.md](../SECURITY.md#resetting-the-pairing) |
+| `RESET_PAIRING` | (unset) | Set to `1` to clear all pairing on the next start. Fires **once**, then ignores itself — safe to leave set. Clear it only if you want to arm a second reset. See [SECURITY.md](../SECURITY.md#resetting-the-pairing) |
 
 ## Volume and mute
 
