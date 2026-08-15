@@ -650,8 +650,12 @@ def _on_is_on_changed(is_on: bool) -> None:
 
 async def _handle_is_on_change(is_on: bool) -> None:
     _record_device_event("is_on", is_on)
-    await queue_controller.update_tv_on(is_on)
-    if not is_on:
+    # Gate the destructive branch on a real transition. androidtvremote2
+    # re-emits the current power state whenever it reconnects, and
+    # tv_off_reset() clears the queue — so a connection blip while the TV was
+    # off used to throw away whatever the user had just queued.
+    changed = await queue_controller.update_tv_on(is_on)
+    if not is_on and changed:
         # Invalidate the cached foreground app — once the TV's off, we
         # don't know what it'll boot into next. Without this, the post-wake
         # `current_app` callback (TV typically lands at the launcher, not
@@ -1407,7 +1411,8 @@ async def lifespan(_app: FastAPI):
             # outage where the NAS recovers before the TV), schedule a
             # background retry. Without this we'd be stuck in a fake
             # "NOT CONFIGURED" state until someone restarts the container.
-            startup_retry_task = asyncio.create_task(
+            global _startup_retry_task
+            startup_retry_task = _startup_retry_task = asyncio.create_task(
                 _retry_startup_connect_until_success(host)
             )
     else:
@@ -1628,27 +1633,57 @@ async def tv_address(req: TvAddressReq):
         if any(c in host for c in " \t/\\?#") or len(host) > 253:
             raise HTTPException(400, "That doesn't look like an address.")
 
-    previous = state.host
-    state.host = host
-    save_config({"host": host})
-    log.info("TV address changed from %s to %s; reconnecting", previous, host)
-    _record_device_event("tv_address_changed", f"{previous} -> {host}")
+    global _startup_retry_task
+    if _tv_address_lock.locked():
+        raise HTTPException(409, "Another address change is already running.")
 
-    # Drop any existing connection and rebuild against the new address. The
-    # certificate is reused untouched.
-    if await _reconnect_remote():
-        return {"ok": True, "host": host, "connected": True}
-    # The retry loop keeps trying in the background, so a typo isn't fatal —
-    # but say so rather than reporting success.
-    return {
-        "ok": True,
-        "host": host,
-        "connected": False,
-        "detail": (
-            "Address saved, but the TV didn't answer there. Check it and try "
-            "again — this won't affect your pairing."
-        ),
-    }
+    async with _tv_address_lock:
+        previous = state.host
+        state.host = host
+        save_config({"host": host})
+        log.info("TV address changed from %s to %s; reconnecting", previous, host)
+        _record_device_event("tv_address_changed", f"{previous} -> {host}")
+
+        # Stop the old retry loop before tearing anything down — otherwise it
+        # races the reconnect below and can revive the previous address.
+        if _startup_retry_task is not None and not _startup_retry_task.done():
+            _startup_retry_task.cancel()
+            _startup_retry_task = None
+
+        # Drop the existing connection and rebuild against the new address.
+        # The certificate is reused untouched.
+        try:
+            connected = await asyncio.wait_for(
+                _reconnect_remote(), timeout=TV_ADDRESS_CONNECT_TIMEOUT,
+            )
+        except asyncio.TimeoutError:
+            # androidtvremote2 puts no overall timeout on its connect, so a
+            # hostname that resolves slowly would hang this request open.
+            log.warning("Connect to %s timed out after %.0fs",
+                        host, TV_ADDRESS_CONNECT_TIMEOUT)
+            connected = False
+
+        if connected:
+            return {"ok": True, "host": host, "connected": True}
+
+        # ALWAYS leave something retrying. _reconnect_remote has already
+        # nulled state.remote and cancelled the library's own reconnect task,
+        # so without this a wrong address means nothing is trying at all and
+        # the only recovery is restarting the container — which is exactly
+        # the one-shot denial of service this endpoint is supposed not to be.
+        _startup_retry_task = asyncio.create_task(
+            _retry_startup_connect_until_success(host)
+        )
+        return {
+            "ok": True,
+            "host": host,
+            "connected": False,
+            "detail": (
+                "Address saved, but the TV didn't answer there. It'll keep "
+                "retrying in the background, and you can enter a different "
+                "address any time — your pairing is untouched."
+            ),
+        }
 
 
 @app.post("/api/pair/start")
@@ -2181,6 +2216,10 @@ SELF_TEST_SUSPECT_TIMEOUT = 8.0
 SELF_TEST_FOREGROUND_SAMPLES = 10      # current_app liveness sampling
 SELF_TEST_FOREGROUND_INTERVAL = 0.5
 SELF_TEST_POLL = 0.5                   # how often a probe re-reads device state
+# Bound on /api/tv/address's reconnect. androidtvremote2 wraps
+# loop.create_connection with no overall timeout of its own, so without this a
+# slow-resolving hostname holds the request open indefinitely.
+TV_ADDRESS_CONNECT_TIMEOUT = 12.0
 
 
 class _ProbeSkip(Exception):
@@ -2196,6 +2235,16 @@ class _ProbeUnmeasurable(Exception):
     failure would send someone chasing a bug that isn't there.
     """
 
+
+# The background reconnect loop. Owned by the lifespan, but /api/tv/address
+# needs to re-arm it: _reconnect_remote tears down state.remote AND cancels
+# androidtvremote2's own keep_reconnecting task before it knows the new
+# address is good, so a failed change would otherwise leave nothing retrying
+# at all — turning a typo into "restart the container".
+_startup_retry_task: Optional[asyncio.Task] = None
+# One address change at a time. Two interleaved calls can each tear down the
+# other's fresh connection.
+_tv_address_lock = asyncio.Lock()
 
 _self_test_active = False
 _self_test_task: Optional[asyncio.Task] = None
@@ -2778,8 +2827,18 @@ async def _probe_deep_link_play(ctx: dict) -> dict:
             "see its intent_swallowed result. Firing it again would be two "
             "play signals for one video."
         )
-    if ctx.get("woke_by_intent"):
-        # The wake probe already deep-linked this exact video seconds ago.
+    remote_now = state.remote
+    if ctx.get("device_was_off") and remote_now is not None and not bool(
+            getattr(remote_now, "is_on", False)):
+        raise _ProbeSkip(
+            "the device never woke, so there is nothing to play into. See "
+            "wake_intent and wake_keys."
+        )
+    if "woke_by_intent" in ctx:
+        # Set at all means the wake probe already sent this exact deep link —
+        # True or False. Checking truthiness let a FAILED wake fall through
+        # and fire a second identical Intent, which is two play signals for
+        # one video and destroys the attribution of any late wake.
         # Sending it again is two play signals for one video — the shape
         # invariant 1 exists to prevent — and the timing would read as a
         # cold-start measurement when it is really a re-fire.
@@ -2818,7 +2877,7 @@ async def _probe_deep_link_play(ctx: dict) -> dict:
 
     mon = state.lounge_monitor
     obs = mon.observation if mon is not None else None
-    ctx["played"] = lounge_seconds is not None
+    ctx["played"] = bool(ctx.get("played")) or lounge_seconds is not None
 
     # If SmartTube never came to the foreground, name what did. The Intent
     # resolves to whatever handles vnd.youtube.launch:// regardless of our
@@ -2959,9 +3018,28 @@ async def _probe_end_of_video(ctx: dict) -> dict:
 
     vid = SELF_TEST_VIDEO_SHORT
     loop = asyncio.get_running_loop()
-    t0 = loop.time()
     await mon.play_video(vid, None)
     ctx["launched"] = True
+
+    # Wait for OUR clip to actually be playing before watching for an ending.
+    # The probe runs straight after swap/transport left the LONG clip going,
+    # and SmartTube fires Paused -> Stopped -> Playing for the OLD video
+    # during a swap (recorded in playlist.py). Without this phase the very
+    # next Stopped — belonging to the previous video — reads as "our 19s clip
+    # ended after 1.5s", which is a confident wrong answer about the only
+    # auto-advance coverage in the whole test.
+    start_deadline = loop.time() + SELF_TEST_SWAP_TIMEOUT
+    while loop.time() < start_deadline:
+        obs = mon.observation
+        if obs.video_id == vid and obs.state == "Playing":
+            break
+        await asyncio.sleep(SELF_TEST_POLL)
+    else:
+        raise _ProbeUnmeasurable(
+            "the test clip never started playing, so there was no ending to "
+            "watch for. That is itself worth reporting."
+        )
+    t0 = loop.time()
 
     # Sample the whole way through: a frozen current_time is itself the
     # finding (it means the duration timer is the only thing that could ever
@@ -2982,9 +3060,11 @@ async def _probe_end_of_video(ctx: dict) -> dict:
                 samples.append(round(obs.current_time, 1))
             if obs.state and (not states or states[-1] != obs.state):
                 states.append(obs.state)
-        if obs.state in ("Stopped", "Ended"):
-            ended_at = round(loop.time() - t0, 2)
-            break
+            # Inside the video_id guard on purpose: a Stopped belonging to
+            # a different video is not our clip ending.
+            if obs.state in ("Stopped", "Ended"):
+                ended_at = round(loop.time() - t0, 2)
+                break
         await asyncio.sleep(SELF_TEST_POLL)
 
     obs = mon.observation
@@ -2992,7 +3072,9 @@ async def _probe_end_of_video(ctx: dict) -> dict:
         duration is not None and last_ct is not None
         and (duration - last_ct) <= 5.0
     )
-    ctx["played"] = bool(samples)
+    # Monotonic: an earlier probe may already have confirmed playback, and a
+    # failure here must not erase that. Same shape as the play probe.
+    ctx["played"] = bool(ctx.get("played")) or bool(samples)
     return {
         "video_id": vid,
         "duration_reported": duration,
@@ -3197,8 +3279,13 @@ _SELF_TEST_PROBES = (
     ("play", "Starting a test video", 21.0, _probe_deep_link_play),
     ("swap", "Swapping video via Lounge", 16.0, _probe_lounge_swap),
     ("transport", "Testing pause and resume", 13.0, _probe_transport),
-    ("finish", "Watching a video reach its end", 43.0, _probe_end_of_video),
+    # Volume BEFORE finish, deliberately: the finish probe waits for the clip
+    # to end, so running volume after it fires the keys at a silent device.
+    # "Audio must be PLAYING" is one of the three confounds _keytest's CEC
+    # probe documents, and "what got louder?" is the one question only the
+    # tester can answer.
     ("volume", "Testing volume keys", 11.0, _probe_volume),
+    ("finish", "Watching a video reach its end", 43.0, _probe_end_of_video),
     ("idle", "Handing the TV back", 10.0, _probe_idle_return),
     ("snapshot_after", "Re-reading device state", 7.0, _probe_snapshot_after),
 )
@@ -3300,13 +3387,13 @@ def _hints_bell_streamer(detail) -> list:
 _DEVICE_PROFILES = {
     "google_tv_streamer": {
         "label": "Google TV Streamer (4K)",
-        "match": ((None, "streamer"),),
+        "match": (("google", "streamer"),),
         "hints": None,
         "verified": True,
     },
     "chromecast_gtv": {
         "label": "Chromecast with Google TV",
-        "match": ((None, "chromecast"),),
+        "match": (("google", "chromecast"),),
         "hints": None,
         "verified": True,
     },
@@ -3363,8 +3450,9 @@ _SELF_TEST_QUESTIONS = (
      "Which device is this running on? We use this to ask the right "
      "follow-up questions — pick the closest match.",
      (),
-     tuple((pid, prof["label"]) for pid, prof in _DEVICE_PROFILES.items())
-     + (("other", "Something else / not sure"),)),
+     ((("", "\u2014 choose your device \u2014"),)
+      + tuple((pid, prof["label"]) for pid, prof in _DEVICE_PROFILES.items())
+      + (("other", "Something else / not sure"),))),
 
     ("device_software_version",
      "Its software version — Settings \u2192 Device Preferences \u2192 About",
@@ -3506,15 +3594,32 @@ def _suggested_configuration(probes: list) -> dict:
 
     cand = detail("play").get("smarttube_package_candidate")
     if cand and cand != SMARTTUBE_PACKAGE:
-        env.append({
-            "var": "SMARTTUBE_PACKAGE", "value": cand,
-            "because": (
-                f"the deep link opened {cand}, not the configured "
-                f"{SMARTTUBE_PACKAGE} — foreground checks are comparing "
-                "against the wrong package"
-            ),
-            "from_probe": "play",
-        })
+        if cand in KNOWN_SMARTTUBE_PACKAGES:
+            env.append({
+                "var": "SMARTTUBE_PACKAGE", "value": cand,
+                "because": (
+                    f"the deep link opened {cand} \u2014 a real SmartTube id "
+                    f"\u2014 not the configured {SMARTTUBE_PACKAGE}, so every "
+                    "foreground check is comparing against a package that "
+                    "isn't there"
+                ),
+                "from_probe": "play",
+                "confidence": "measured",
+            })
+        else:
+            # Emphatically NOT a pasteable env var: this is just the last
+            # foreground package that wasn't ours. com.android.vending shows
+            # up here when the configured package isn't installed, and
+            # setting SMARTTUBE_PACKAGE to the Play Store would break every
+            # foreground check for good.
+            notes.append(
+                f"The launch opened {cand}, which is not a SmartTube id we "
+                "recognise. Do NOT set SMARTTUBE_PACKAGE to it without "
+                "checking: if it is com.android.vending that is the Play "
+                "Store opening because the configured package isn't "
+                "installed, and if it is the stock YouTube app then Android "
+                "has the wrong default handler. Tell us what it is."
+            )
 
     # Timings that beat our own constants.
     slow = []
@@ -3963,9 +4068,15 @@ async def selftest_answers(req: SelfTestAnswers):
     # answers the Shield questions and then switches the dropdown would
     # otherwise have that POST silently rejected and their typing lost.
     known = {q[0] for q in _SELF_TEST_QUESTIONS}
+    valid_profiles = set(_DEVICE_PROFILES) | {"other", ""}
     for key, value in (req.answers or {}).items():
-        if key in known and isinstance(value, str):
-            _self_test_answers[key] = value[:500]
+        if key not in known or not isinstance(value, str):
+            continue
+        if key == "device_profile" and value not in valid_profiles:
+            # An unknown profile id would win over detection and then match no
+            # profile at all, silently disabling every device hint.
+            raise HTTPException(400, f"Unknown device profile: {value!r}")
+        _self_test_answers[key] = value[:500]
     report = _self_test.get("report")
     if isinstance(report, dict) and "questions_for_the_tester" in report:
         report["questions_for_the_tester"] = _questions_payload()

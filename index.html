@@ -1877,6 +1877,14 @@
   }
 
   $("btn-selftest").addEventListener("click", async () => {
+    // Starting a run clears the previous report AND every answer typed into
+    // it. If one is still on screen unsent, say so rather than eating it.
+    if ($("st-json").value && !confirm(
+          "Start a new test? This discards the finished report above, "
+          + "including any answers you typed. Copy it first if you haven't "
+          + "sent it.")) {
+      return;
+    }
     const btn = $("btn-selftest"); btn.disabled = true;
     $("st-out").hidden = true; $("btn-st-show").hidden = true;
     try {
@@ -1946,6 +1954,14 @@
         $("btn-selftest").disabled = true;
         stRender(s);
         stTimer = setInterval(stPoll, 1000);
+      } else if (s.report) {
+        // A finished run survives a reload. The server still holds the whole
+        // report; only this page had forgotten it. Without this the tester's
+        // phone locking its screen loses the run — and the one visible
+        // control ("Run device self-test") would silently destroy it.
+        $("st-panel").hidden = false;
+        $("st-json").value = JSON.stringify(s.report, null, 2);
+        stRender(s);
       }
     } catch (e) { /* self-test is beta-only; a 404 here is expected on stable */ }
   })();

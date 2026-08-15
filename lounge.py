@@ -220,7 +220,9 @@ class LoungeMonitor:
         if not digits:
             raise ValueError("empty pairing code")
 
-        async with YtLoungeApi(device_name) as api:
+        async with YtLoungeApi(
+            device_name, logger=log.getChild("pyytlounge"),
+        ) as api:
             ok = await api.pair(digits)
             if not ok or not api.linked():
                 raise RuntimeError("pair returned False or session not linked")
@@ -335,7 +337,19 @@ class LoungeMonitor:
             return
         # YtLoungeApi requires async-context-manager init. We manually enter
         # the context so the api lives across the lifetime of the session.
-        api = YtLoungeApi(self.device_name, event_listener=self._listener)
+        api = YtLoungeApi(
+            self.device_name,
+            event_listener=self._listener,
+            # Not optional. Left to itself pyytlounge builds
+            # logging.Logger(...) through the constructor, whose parent is
+            # None — so it never propagates to root, our redacting formatter
+            # never sees it, and its records fall through to
+            # logging.lastResort (stderr). It logs the Lounge token verbatim
+            # at INFO and its exception tracebacks carry request URLs with the
+            # token in the query string. A child of our logger propagates
+            # normally and gets redacted like everything else.
+            logger=log.getChild("pyytlounge"),
+        )
         await api.__aenter__()
         try:
             api.load_auth_state(self._auth)

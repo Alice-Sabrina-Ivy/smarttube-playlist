@@ -79,7 +79,7 @@ services:
       # WAKE_POLL: "0.5"                             # how often to re-check while waking
 
       # --- Screensaver handling ---
-      # SCREENSAVER_PACKAGES: "com.google.android.apps.tv.dreamx,com.google.android.backdrop"
+      # SCREENSAVER_PACKAGES: "com.google.android.apps.tv.dreamx,com.google.android.backdrop,com.android.dreams.basic,com.neilturner.aerialviews"
       #                                              # comma-list of packages treated as screensavers.
       #                                              # When one is foreground at add time, we send
       #                                              # SCREENSAVER_DISMISS_KEY to dismiss it (the

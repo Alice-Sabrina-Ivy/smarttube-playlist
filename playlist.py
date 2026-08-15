@@ -397,14 +397,23 @@ class QueueController:
         """Synchronous snapshot for read-only endpoints. Safe under GIL for this shape."""
         return self.state.snapshot()
 
-    async def update_tv_on(self, is_on: bool) -> None:
-        """Set TV power state and broadcast a fresh snapshot. No-op if unchanged."""
+    async def update_tv_on(self, is_on: bool) -> bool:
+        """Set TV power state and broadcast a fresh snapshot. No-op if unchanged.
+
+        Returns True only when the value actually CHANGED. Callers need that:
+        the TV-off handler wipes the queue, and the library re-emits the
+        current power state on every reconnect — so acting on the value
+        rather than the transition throws away a video the user queued while
+        the TV was off, which is exactly when they are most likely to queue
+        one.
+        """
         async with self._lock:
             if self.state.tv_on == is_on:
-                return
+                return False
             self.state.tv_on = is_on
             snap = self.state.snapshot()
         await self._broadcaster.publish("tv_power", snap)
+        return True
 
     async def set_waking(self, waking: bool) -> None:
         """Toggle the cold-boot 'waking TV' flag. Drives the UI's
@@ -798,7 +807,17 @@ class QueueController:
             self._timer_body(gen, float(item.duration_s))
         )
 
-    async def _timer_body(self, gen: int, seconds: float) -> None:
+    # How many times the duration timer may defer to Lounge before advancing
+    # anyway. Each deferral re-reads current_time, so a device whose position
+    # genuinely advances converges long before this. It only bites when the
+    # position is FROZEN — a dormant player that the cloud cache keeps
+    # reporting at a fixed ct (invariant 4) — where deferring forever means
+    # the queue silently stops advancing and the duration fallback, which
+    # exists precisely for "Lounge cannot be trusted here", never fires.
+    MAX_LOUNGE_DEFERRALS = 12
+
+    async def _timer_body(self, gen: int, seconds: float,
+                          deferrals: int = 0) -> None:
         try:
             await self._sleeper(seconds)
         except asyncio.CancelledError:
@@ -834,7 +853,17 @@ class QueueController:
             except (TypeError, ValueError):
                 lng_dur_f = float(seconds)
             remaining = lng_dur_f - lng_ct
-            if remaining > 5.0:
+            if remaining > 5.0 and deferrals >= self.MAX_LOUNGE_DEFERRALS:
+                # Position is not moving. Deferring again would strand the
+                # queue for good, so fall through and let the duration
+                # fallback do its job.
+                log.warning(
+                    "Duration timer for %s has deferred to Lounge %d times "
+                    "and it still reports %.1fs remaining (ct=%.1f) — the "
+                    "position looks frozen, advancing anyway",
+                    current_video_id, deferrals, remaining, lng_ct,
+                )
+            elif remaining > 5.0:
                 log.info(
                     "Duration timer fired for %s but Lounge reports %.1fs remaining; "
                     "rescheduling (lng_ct=%.1f lng_dur=%.1f)",
@@ -849,7 +878,8 @@ class QueueController:
                     self._timer_gen += 1
                     next_gen = self._timer_gen
                     self._timer_task = asyncio.create_task(
-                        self._timer_body(next_gen, remaining + 5.0)
+                        self._timer_body(next_gen, remaining + 5.0,
+                                         deferrals + 1)
                     )
                 return
             log.info(
