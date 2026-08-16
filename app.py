@@ -2164,7 +2164,18 @@ def _build_diagnostics() -> dict:
 
 @app.get("/api/diagnostics")
 async def diagnostics():
-    """The passive report, unchanged: reads state, sends nothing to the TV."""
+    """The passive report: reads state, sends nothing to the TV.
+
+    Gated on SELF_TEST despite being read-only, because "sends nothing" is
+    only half the question. What it RETURNS is this machine's LAN address,
+    the device model and firmware, how old the Lounge token is and the
+    recent event log — to any unauthenticated caller that can reach the
+    service, which is everyone on the network by design. That is a fine
+    trade on a beta build whose entire purpose is producing a report to
+    paste to us. It is not something to leave on for every stable install.
+    """
+    if not SELF_TEST_ENABLED:
+        raise HTTPException(503, "Diagnostics are disabled (SELF_TEST=0)")
     return _build_diagnostics()
 
 
