@@ -4,7 +4,15 @@ services:
     # The path is lowercase because GHCR rejects uppercase image names, even
     # though the GitHub account itself is Alice-Sabrina-Ivy.
     #
-    image: ghcr.io/alice-sabrina-ivy/smarttube-playlist:latest
+    # ┌───────────────────────────────────────────────────────────────────┐
+    # │ THIS IS THE BETA BRANCH. The tag below is `:beta`, not `:latest`. │
+    # │                                                                   │
+    # │ DO NOT MERGE THIS LINE TO main. Every :latest user's fresh install│
+    # │ reads main's copy of this file, and pointing them at :beta would  │
+    # │ hand a hardware-diagnostics build to people who just want to      │
+    # │ watch something. On a beta -> main merge, keep main's `:latest`.  │
+    # └───────────────────────────────────────────────────────────────────┘
+    image: ghcr.io/alice-sabrina-ivy/smarttube-playlist:beta
 
     # Building from source instead? Comment out `image:` above, uncomment
     # `build: .` below, and run `docker compose up -d --build` from the repo
@@ -37,20 +45,27 @@ services:
       # ---------------------------------------------------------------
 
       # --- Device diagnostics ---
-      # Off by default, and set explicitly here so the switch is somewhere
-      # you would look for it rather than buried in a default.
+      # Puts the "Run device self-test" button at the bottom of the page. It
+      # takes over the TV for a few minutes, measures what this device
+      # actually does, and produces one report to paste back to us.
       #
-      # "1" adds a "Run device self-test" button to the bottom of the page
-      # and enables /api/diagnostics. The self-test takes over the TV for a
-      # few minutes — it plays a short clip, tries pause/resume and volume,
-      # then hands the TV back — and anyone who can reach the page can press
-      # it. /api/diagnostics reports this machine's LAN address, your device
-      # model and firmware, and a recent event log, to any caller.
+      # Set it to "0" to hide the button and make the endpoint refuse.
+      # Nothing else about the app changes.
       #
-      # Turn it on if you are helping test on unusual hardware, or if you
-      # are debugging something and we have asked you for a report. See
-      # docs/BETA-TESTING.md.
-      SELF_TEST: "0"
+      # ┌───────────────────────────────────────────────────────────────────┐
+      # │ On a beta -> main merge this becomes "0". Everyone on :latest     │
+      # │ should not be handed a button that hijacks their TV.              │
+      # │                                                                   │
+      # │ app.py's DEFAULT is "0" on BOTH branches and must stay that way.  │
+      # │ It used to be "1" here, and that could not survive: if beta       │
+      # │ changes a source default and main never touches it, the next      │
+      # │ promotion merges CLEAN and main silently inherits it. What makes  │
+      # │ the :beta IMAGE default-on is publish.yml passing SELF_TEST=1     │
+      # │ (and CHANNEL=beta) as build args, so a tester who pulls :beta     │
+      # │ still gets the button with no flags. This line is only for        │
+      # │ compose users, whose explicit value overrides the image.          │
+      # └───────────────────────────────────────────────────────────────────┘
+      SELF_TEST: "1"
 
       # --- Re-pairing ---
       # Uncomment, restart, and this clears the TV certificate and Lounge
