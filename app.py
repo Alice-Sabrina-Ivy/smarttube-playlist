@@ -2164,7 +2164,18 @@ def _build_diagnostics() -> dict:
 
 @app.get("/api/diagnostics")
 async def diagnostics():
-    """The passive report, unchanged: reads state, sends nothing to the TV."""
+    """The passive report: reads state, sends nothing to the TV.
+
+    Gated on SELF_TEST despite being read-only, because "sends nothing" is
+    only half the question. What it RETURNS is this machine's LAN address,
+    the device model and firmware, how old the Lounge token is and the
+    recent event log — to any unauthenticated caller that can reach the
+    service, which is everyone on the network by design. That is a fine
+    trade on a beta build whose entire purpose is producing a report to
+    paste to us. It is not something to leave on for every stable install.
+    """
+    if not SELF_TEST_ENABLED:
+        raise HTTPException(503, "Diagnostics are disabled (SELF_TEST=0)")
     return _build_diagnostics()
 
 
@@ -2197,10 +2208,19 @@ async def diagnostics():
 #     one pressed the button — the disruptive probes skip themselves when the
 #     queue has a current item.
 
-# Off switch for an operator who doesn't want a guest-pressable button that
-# moves the TV. Default on: the whole point of the beta build is that the
-# tester shouldn't have to configure anything.
-SELF_TEST_ENABLED = os.environ.get("SELF_TEST", "1").strip().lower() not in (
+# Off switch for the device diagnostics: the self-test button, which moves
+# the TV, and /api/diagnostics, which hands this machine's LAN address,
+# device model, firmware and recent event log to any caller on the network.
+#
+# DEFAULT OFF here, and deliberately default ON on the `beta` branch. Beta's
+# install instructions are a `docker run` line in the README rather than a
+# compose file, so a default of "0" there would silently remove the button
+# from every tester who followed them — and it would read as the feature
+# never having been built rather than as a setting being off. That one-line
+# difference between the branches is intentional; a beta -> main merge must
+# preserve it, and docker-compose.yml on both sides sets the value
+# explicitly so nothing depends on remembering this.
+SELF_TEST_ENABLED = os.environ.get("SELF_TEST", "0").strip().lower() not in (
     "0", "false", "no", "off",
 )
 

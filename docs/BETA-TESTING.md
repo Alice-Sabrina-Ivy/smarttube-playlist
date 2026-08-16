@@ -8,7 +8,7 @@ You don't need ADB or a terminal on the TV. The beta build collects most of the 
 
 ## Get the beta build
 
-**Starting from scratch?** Follow [Option A in the README](../README.md#option-a--docker-desktop-windows-or-macos) — it's one line pasted into Docker Desktop, and it already points at the beta build. Nothing to download or edit.
+**Starting from scratch?** Follow [Option A in the README](../README.md#option-a--docker-desktop-windows-or-macos), changing the very end of the pasted command from `:latest` to `:beta`. That one word is the entire difference — the beta image is the same app with the diagnostics turned on.
 
 **Already running the stable version?** Two ways, depending on how you installed it:
 

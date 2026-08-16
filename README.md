@@ -4,16 +4,6 @@ A small, LAN-only web page that lets anyone on your home network paste a YouTube
 
 No accounts to create and no third-party service to sign up for.
 
-> ⚠️ **This is the `beta` branch.** It carries a device diagnostics report and
-> exists for testing on hardware nobody here owns. Asked to help test?
-> Start with **[docs/BETA-TESTING.md](docs/BETA-TESTING.md)**.
-> For the stable version, use [`main`](https://github.com/Alice-Sabrina-Ivy/smarttube-playlist/tree/main).
->
-> **Installing fresh from this branch?** Follow Option A below — the command
-> it gives you already points at the `:beta` image. If you're using a
-> `docker-compose.yml` instead, check its `image:` line ends in `:beta`, or
-> you'll be testing the stable build and the self-test button won't be there.
-
 > **Not affiliated with Google, YouTube, or the SmartTube project.** This is an independent hobby project that talks to software you already run.
 
 ![The web UI: a "Now playing" card with thumbnail, progress bar and playback controls, a box for pasting a YouTube link, the upcoming queue, and a TV status panel](docs/screenshot.png)
@@ -129,7 +119,7 @@ You don't need to go looking for any folder in it. The next step works from wher
 **4. Paste this one line and press Enter.**
 
 ```
-docker run -d --name smarttube-playlist --restart unless-stopped -p 38420:8000 -v smarttube-data:/data ghcr.io/alice-sabrina-ivy/smarttube-playlist:beta
+docker run -d --name smarttube-playlist --restart unless-stopped -p 38420:8000 -v smarttube-data:/data ghcr.io/alice-sabrina-ivy/smarttube-playlist:latest
 ```
 
 It downloads for a minute or two, then prints a long line of letters and numbers. That's the container's ID, and it means it worked. Check the **Containers** tab — `smarttube-playlist` should be there, green, marked *Running*.
@@ -144,7 +134,7 @@ That's the whole install.
 - `--restart unless-stopped` — bring it back after a reboot
 - `-p 38420:8000` — reach it at port 38420 on this computer
 - `-v smarttube-data:/data` — keep the TV pairing in storage Docker manages, so it survives updates. Deliberately not a folder on your PC: Windows paths are the single most common thing to get wrong here.
-- the last part is the app itself, the `:beta` build
+- the last part is the app itself, the `:latest` build
 
 </details>
 
@@ -192,7 +182,7 @@ Everything in [docs/CONFIGURATION.md](docs/CONFIGURATION.md) is optional, and yo
 2. Paste the command again with the setting added — `-e NAME=VALUE`, before the last line. For example, to wait longer for a slow TV to wake:
 
 ```
-docker run -d --name smarttube-playlist --restart unless-stopped -p 38420:8000 -v smarttube-data:/data -e WAKE_DELAY=30 ghcr.io/alice-sabrina-ivy/smarttube-playlist:beta
+docker run -d --name smarttube-playlist --restart unless-stopped -p 38420:8000 -v smarttube-data:/data -e WAKE_DELAY=30 ghcr.io/alice-sabrina-ivy/smarttube-playlist:latest
 ```
 
 Prefer keeping settings in a file? That's what `docker-compose.yml` is for — see [Option B](#option-b--linux-nas-or-homelab). It works on Docker Desktop too; it just needs a terminal opened in the right folder, which is the step this quick path exists to avoid.
@@ -313,7 +303,7 @@ The README covers getting it running. Everything else lives here:
 | | |
 |---|---|
 | **[docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md)** | Symptoms and fixes, from install errors to playback oddities |
-| **[docs/BETA-TESTING.md](docs/BETA-TESTING.md)** | Testing on hardware nobody here owns — what to run, what to report |
+| **[docs/BETA-TESTING.md](docs/BETA-TESTING.md)** | Helping test on hardware nobody here owns: switching to the beta build, and what to send back |
 | **[docs/INSTALL-SMARTTUBE.md](docs/INSTALL-SMARTTUBE.md)** | Installing SmartTube on the TV, and which devices can run it |
 | **[docs/QR-CODE.md](docs/QR-CODE.md)** | Make a QR code so guests scan straight to the page |
 | **[docs/ADVANCED-SETUP.md](docs/ADVANCED-SETUP.md)** | Linux, NAS and homelab installs: Docker Engine, Portainer, where data lives, port binding, reverse proxies, building from source |

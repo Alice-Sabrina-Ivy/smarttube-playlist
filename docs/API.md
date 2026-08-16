@@ -29,15 +29,31 @@ POST   /api/pair/cancel                   abort an in-progress pairing
 POST   /api/lounge/pair    {code}         12-digit code from SmartTube; 409 if already paired
 ```
 
-### Beta build only
+### Recovering a TV that moved
+
+```
+POST   /api/tv/address         {host}     repoint an existing pairing at a new address
+```
+
+Always available. The pairing certificate binds to the *device*, not its
+address, so a DHCP lease change breaks the connection while leaving the
+credentials perfectly valid. This repoints them without re-pairing.
+
+### Device diagnostics
+
+Present on every build, but **off unless `SELF_TEST=1`** (see
+[CONFIGURATION.md](CONFIGURATION.md)). While disabled the first three return
+**503**:
 
 ```
 GET    /api/diagnostics                   passive report: reads state, sends nothing
 POST   /api/selftest                      start a device self-test; 200 + run id
-GET    /api/selftest                      progress while running, full report when done
 POST   /api/selftest/answers   {answers}  fold the tester's answers into the report
-POST   /api/tv/address         {host}     repoint an existing pairing at a new address
 ```
+
+`GET /api/selftest` is the exception — it always answers, reporting
+`enabled: false`, because that is the field the page reads to decide whether
+to show the button at all.
 
 `POST /api/selftest` returns **200** immediately with `run_id`, `eta_s` and the probe list — the run itself takes about three minutes — so poll the `GET` for progress and, once `status` is `done`, the full report.
 
