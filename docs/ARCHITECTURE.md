@@ -79,9 +79,11 @@ python scripts/release.py --check      # verify VERSION, footer and tag agree
 python scripts/release.py --dry-run --minor
 ```
 
-The script bumps `VERSION`, syncs the footer, commits, tags and pushes. Everything after that is CI: the image is built multi-arch and tagged `1.1`, `1` and `latest` in GHCR, then a GitHub Release is created with notes generated from the commits since the previous tag.
+Versions are `MAJOR.MINOR` with a zero-padded two-digit minor — `1.00`, `1.01`, … `1.99`, `2.00`. The padding is why `scripts/release.py` orders tags itself rather than with `git --sort=v:refname`: git follows `strverscmp`, which reads a leading zero as a fraction and ranks `v1.01` *below* `v1.0`. It also refuses the unpadded spelling, since `1.1` and `1.01` are one version but two image tags.
 
-Old releases and old image tags are never touched — GitHub lists releases newest-first automatically and keeps them all, so anyone can pin `:1.0` indefinitely. There is no manifest to maintain.
+The script bumps `VERSION`, syncs the footer, commits, tags and pushes. Everything after that is CI: the image is built multi-arch and tagged `1.01`, `1` and `latest` in GHCR, then a GitHub Release is created with notes generated from the commits since the previous tag.
+
+Old releases and old image tags are never touched — GitHub lists releases newest-first automatically and keeps them all, so anyone can pin `:1.01` indefinitely. There is no manifest to maintain.
 
 ## Contributing
 

@@ -106,7 +106,7 @@ The compose file tracks `:latest`, which follows the newest build from `main` â€
 If you'd rather only move when you choose to, pin a tag instead:
 
 ```yaml
-image: ghcr.io/alice-sabrina-ivy/smarttube-playlist:1.0   # exactly this release
+image: ghcr.io/alice-sabrina-ivy/smarttube-playlist:1.01  # exactly this release
 image: ghcr.io/alice-sabrina-ivy/smarttube-playlist:1     # newest 1.x
 ```
 
