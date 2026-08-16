@@ -2255,6 +2255,12 @@ SELF_TEST_SUSPECT_TIMEOUT = 8.0
 SELF_TEST_FOREGROUND_SAMPLES = 10      # current_app liveness sampling
 SELF_TEST_FOREGROUND_INTERVAL = 0.5
 SELF_TEST_POLL = 0.5                   # how often a probe re-reads device state
+# How often the finish probe ASKS Lounge for the position, as opposed to
+# re-reading the cached observation (SELF_TEST_POLL, above). Matches the 3s
+# REFRESH_INTERVAL that `_periodic_refresh_loop` uses in production, so the
+# probe measures the same cadence the queue would actually run on. Polling
+# every SELF_TEST_POLL instead would be ~80 requests across one 40s probe.
+SELF_TEST_NOW_PLAYING_INTERVAL = 3.0
 # Bound on /api/tv/address's reconnect. androidtvremote2 wraps
 # loop.create_connection with no overall timeout of its own, so without this a
 # slow-resolving hostname holds the request open indefinitely.
@@ -3089,7 +3095,29 @@ async def _probe_end_of_video(ctx: dict) -> dict:
     last_ct = None
     ended_at = None
     deadline = loop.time() + SELF_TEST_FINISH_TIMEOUT
+    # Ask for the position rather than waiting to be told it.
+    #
+    # Measured on the reference Google TV Streamer 2026-08-15: this probe
+    # reported position_advanced=false and ended_after_s=null on a device
+    # where auto-advance demonstrably works. `observation` only moves when
+    # SmartTube pushes (transitions only) or when `_periodic_refresh_loop`
+    # polls — and that loop is gated on the queue having a current item,
+    # which this probe deliberately never creates. So the gate was shut for
+    # the entire run and the position sat frozen at its start value.
+    #
+    # Safe to poll here specifically because the phase above already
+    # confirmed our clip is foreground and Playing; see the warning on
+    # request_now_playing().
+    next_poll = 0.0        # ask on the first pass, then on the interval
     while loop.time() < deadline:
+        if loop.time() >= next_poll:
+            next_poll = loop.time() + SELF_TEST_NOW_PLAYING_INTERVAL
+            try:
+                await mon.request_now_playing()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                pass       # a dead session is the subscribe loop's problem
         obs = mon.observation
         if obs.video_id == vid:
             if obs.duration:
@@ -3835,6 +3863,46 @@ def _self_test_verdict(probes: list, ctx: dict) -> dict:
             "A video was started but never confirmed playing. If you have not "
             "paired with SmartTube (the 12-digit code), do that and run again "
             "— without it we are guessing at what the TV actually did."
+        )
+
+    # Auto-advance is the whole reason the finish probe exists, and the
+    # verdict used to ignore it completely — so a run whose data said the end
+    # of a video was never reported still summarised as a clean bill of
+    # health. Green probe, cheerful verdict, alarming data, three different
+    # stories. Exactly the failure this verdict was written to prevent.
+    fin = detail("finish")
+    if fin.get("ended_after_s") is not None:
+        learned.append(
+            "a video reaching its end is reported, so the queue can move to "
+            "the next one by itself"
+        )
+    elif ok("finish") and fin.get("position_advanced") and fin.get(
+            "stopped_within_5s_of_end"):
+        # Measured on the reference Google TV Streamer, 2026-08-15: with
+        # NOTHING queued behind it, SmartTube pauses on the last frame rather
+        # than reporting Stopped. `lounge.finished` needs Stopped, so it
+        # never fires for a lone clip — and this probe always plays a lone
+        # clip, outside the queue, by design. A two-video queue on that same
+        # device advanced cleanly minutes later, on the duration timer.
+        #
+        # So this reading is NORMAL, and the loud version below would tell
+        # every healthy tester their report proved a bug on our side. False
+        # alarms are the exact cost this whole verdict exists to avoid.
+        learned.append(
+            "playback position is reported accurately all the way to the end "
+            "of a video (this device pauses on the last frame instead of "
+            "reporting a stop, which is normal — the queue advances on its "
+            "own timer)"
+        )
+    elif ok("finish") and fin:
+        missing.append(
+            "Auto-advance could not be confirmed: the test clip played, but "
+            "its ending was never reported"
+            + ("" if fin.get("position_advanced")
+               else ", and the playback position never moved at all")
+            + ". If this report also shows SmartTube paired and connected, "
+            "send it over exactly as it is — that combination is something "
+            "to look at on our side, not anything you can fix."
         )
 
     if not _is_lounge_paired():

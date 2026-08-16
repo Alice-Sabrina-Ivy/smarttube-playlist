@@ -202,6 +202,37 @@ class LoungeMonitor:
     def observation(self) -> LoungeObservation:
         return self._observation
 
+    async def request_now_playing(self) -> bool:
+        """Force ONE get_now_playing(), bypassing the should_refresh gate.
+
+        `observation` is a passive cache: SmartTube pushes state on
+        TRANSITIONS ONLY, so position during steady playback never arrives
+        unless somebody asks. `_periodic_refresh_loop` normally does the
+        asking, but it is gated on the queue owning a current item — and the
+        self-test plays OUTSIDE the queue by design, so during a self-test
+        that gate is shut and the observation is frozen at whatever the last
+        transition left behind.
+
+        Callers must have established that SmartTube is foregrounded and
+        playing before calling this. That is the whole reason for the gate:
+        polling against a BACKGROUNDED SmartTube auto-foregrounds it (a
+        YouTube protocol behaviour), which on a Shield can even wake the
+        device. This method deliberately cannot check that for itself, so it
+        is not a general-purpose refresh — `_probe_end_of_video` is its only
+        caller, and it waits for `state == "Playing"` first.
+        """
+        api = self._api
+        if api is None or not self._observation.available:
+            return False
+        try:
+            await api.get_now_playing()
+            return True
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.debug("Explicit get_now_playing failed", exc_info=True)
+            return False
+
     @property
     def is_paired(self) -> bool:
         return self._auth is not None
