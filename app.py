@@ -157,7 +157,59 @@ WAKE_POLL = float(os.environ.get("WAKE_POLL", "0.5"))
 # candidates worth trying on unfamiliar hardware. WAKEUP is measured to be
 # silently dropped on Google TV, which is exactly why this stays per-install
 # rather than becoming the new default.
-WAKE_KEYCODE = os.environ.get("WAKE_KEYCODE", "POWER").strip() or "POWER"
+WAKE_KEYCODE_FALLBACK = "POWER"
+
+
+def _known_keycode_names() -> Optional[frozenset]:
+    """Every KEYCODE_* name androidtvremote2 will accept, or None.
+
+    Returns None rather than raising if the library's generated protobuf
+    module ever moves: validation is a nicety, and losing it must not stop
+    the service booting.
+    """
+    try:
+        from androidtvremote2.remotemessage_pb2 import RemoteKeyCode
+        return frozenset(RemoteKeyCode.keys())
+    except Exception:  # pragma: no cover - depends on library internals
+        return None
+
+
+def _resolve_wake_keycode(raw: Optional[str]) -> str:
+    """Normalise WAKE_KEYCODE, falling back to POWER on anything unknown.
+
+    Same shape and the same reason as _resolve_log_level: a config typo must
+    never be fatal. send_key_command resolves names through a protobuf enum
+    and raises ValueError on one it doesn't recognise — and the wake send
+    sits on the only path that starts playback, so `wakeup` typed in
+    lowercase used to take out every add on the install rather than just the
+    wake.
+
+    That is not a hypothetical audience. Our own wake-failure log tells the
+    reader to "try WAKE_KEYCODE=WAKEUP or WAKE_KEYCODE=TV_POWER", so the
+    people most likely to set this var are the ones whose device already
+    won't wake — and the failure they'd get is strictly worse than the one
+    they were trying to fix.
+
+    Case and an optional KEYCODE_ prefix are accepted because both are what
+    a human types; the library wants the bare uppercase name.
+    """
+    name = (raw or "").strip().upper()
+    if name.startswith("KEYCODE_"):
+        name = name[len("KEYCODE_"):]
+    if not name:
+        return WAKE_KEYCODE_FALLBACK
+    known = _known_keycode_names()
+    if known is not None and f"KEYCODE_{name}" not in known:
+        log.warning(
+            "WAKE_KEYCODE=%r is not a keycode this device protocol knows — "
+            "falling back to %s. Valid examples: POWER, WAKEUP, TV_POWER.",
+            raw, WAKE_KEYCODE_FALLBACK,
+        )
+        return WAKE_KEYCODE_FALLBACK
+    return name
+
+
+WAKE_KEYCODE = _resolve_wake_keycode(os.environ.get("WAKE_KEYCODE"))
 # Timeouts inside tv_play's launch path. Module-level so tests can stub
 # them down to milliseconds for fast unit tests.
 # Lounge sender can be in a 5-60s exponential backoff sleep after SmartTube
@@ -1101,8 +1153,23 @@ async def tv_play(video_id: str, start_s: Optional[int] = None) -> None:
         try:
             loop = asyncio.get_running_loop()
             wake_started_at = loop.time()
-            state.remote.send_key_command(WAKE_KEYCODE)
-            _record_device_event("wake_sent", WAKE_KEYCODE)
+            try:
+                state.remote.send_key_command(WAKE_KEYCODE)
+                _record_device_event("wake_sent", WAKE_KEYCODE)
+            except Exception:
+                # Never fatal, and note the retry below has always been
+                # wrapped this way — this is the same guard on the first
+                # send, which was the one that could take the whole add
+                # down with it. An exception here (unknown keycode name,
+                # ConnectionClosed on a dead socket) used to unwind past
+                # both send_launch_app_command sites, so the user got no
+                # wake AND no deep link while the UI showed a now-playing
+                # card for a video that never started. An unsendable wake
+                # key is just a wake that had no effect: log it, and let
+                # the launch below try anyway.
+                log.warning("Wake key %s could not be sent", WAKE_KEYCODE,
+                            exc_info=True)
+                _record_device_event("wake_send_error", WAKE_KEYCODE)
             came_on = await _wait_for_tv_on(WAKE_TIMEOUT, WAKE_POLL)
             if not came_on:
                 # First POWER didn't take effect. Probable cause: the
@@ -1970,7 +2037,11 @@ def _diagnostic_environment() -> dict:
             libs[name] = "unknown"
     return {
         "version": VERSION,
-        "channel": "beta",
+        "channel": CHANNEL,
+        # A separate fact from `channel`, and both matter: the channel says
+        # which source to read the report against, this says whether the
+        # operator turned the diagnostics on. They used to be conflated.
+        "self_test_enabled": SELF_TEST_ENABLED,
         "booted_at": _BOOT_AT,
         "uptime_s": round(time.monotonic() - _BOOT_MONO, 1),
         "python": sys.version.split()[0],
@@ -2096,7 +2167,7 @@ def _build_diagnostics() -> dict:
     remote = state.remote
     return {
         "version": VERSION,
-        "channel": "beta",
+        "channel": CHANNEL,
         "tv_paired": _is_tv_paired(),
         "lounge_paired": _is_lounge_paired(),
         "lounge_connected": bool(
@@ -2212,17 +2283,40 @@ async def diagnostics():
 # the TV, and /api/diagnostics, which hands this machine's LAN address,
 # device model, firmware and recent event log to any caller on the network.
 #
-# DEFAULT OFF here, and deliberately default ON on the `beta` branch. Beta's
-# install instructions are a `docker run` line in the README rather than a
-# compose file, so a default of "0" there would silently remove the button
-# from every tester who followed them — and it would read as the feature
-# never having been built rather than as a setting being off. That one-line
-# difference between the branches is intentional; a beta -> main merge must
-# preserve it, and docker-compose.yml on both sides sets the value
-# explicitly so nothing depends on remembering this.
+# DEFAULT OFF, on every branch. The `:beta` image turns it on by baking
+# SELF_TEST=1 in as a build arg (Dockerfile / publish.yml), which preserves
+# the reason beta wants it on — beta's install instructions are a `docker run`
+# line in the README rather than a compose file, so a tester who followed them
+# must get the button without passing a flag — while removing the way that
+# used to be expressed.
+#
+# It used to be a source default of "1" on beta and "0" here, with a note
+# asking whoever merged to keep them apart. That is not something a human can
+# be asked to remember: if beta changes the line and main never touches it,
+# the next beta -> main merge is CLEAN and main silently inherits "1". No
+# conflict, no diff to review, and a guest-pressable button that hijacks the
+# TV is suddenly on for every stable user. Verified in a scratch repo, not
+# assumed. Keep this line identical on both branches.
 SELF_TEST_ENABLED = os.environ.get("SELF_TEST", "0").strip().lower() not in (
     "0", "false", "no", "off",
 )
+
+# Which build this is, for reports. Reads the environment for the same reason
+# SELF_TEST does, and that reason is worth stating: this line is IDENTICAL on
+# `main` and `beta`, and it has to be.
+#
+# The beta values used to be a source-level default that differed between the
+# branches, with a comment asking whoever merged to preserve it. Git cannot
+# help with that: if beta changes the line and main never touches it, the next
+# beta -> main merge is clean and main silently inherits beta's value —
+# switching a TV-hijacking button on for every stable user with no conflict to
+# notice. The `:beta` image bakes CHANNEL=beta and SELF_TEST=1 in as build
+# args instead (see Dockerfile / publish.yml), so the difference lives in the
+# artefact rather than in a line a merge can carry across.
+#
+# Operator overrides still win: docker's `-e` and compose `environment:` both
+# beat the image's ENV.
+CHANNEL = os.environ.get("CHANNEL", "").strip() or "stable"
 
 # Two stable, long-lived public videos. The short one is 19 seconds
 # deliberately — a probe that hijacks someone's TV should hand it back fast.
@@ -2752,6 +2846,29 @@ async def _probe_screensaver(ctx: dict) -> dict:
         # the hardware the beta exists for. Measure it instead: send the
         # launch Intent once; a screensaver swallows it (the defining failure
         # mode, verified on dreamx), a real app plays it.
+        #
+        # "Once" is per RUN, not per probe. _probe_deep_link_play already
+        # stands down for us; this is the missing mirror. Without it, a
+        # device the wake Intent woke by itself — the best outcome the sweep
+        # can find — got a second identical Intent here, restarting the clip
+        # audibly (invariant 1). The attribution goes wrong too: the
+        # landed-check below reads a Lounge observation the FIRST Intent
+        # populated and credits it to this one, so an ordinary app would be
+        # confidently reported as "not a screensaver" on someone else's
+        # evidence.
+        if ctx.get("launched"):
+            return {
+                "screensaver_active": None,
+                "foreground": current,
+                "note": (
+                    f"{current} was in the foreground and we don't recognise "
+                    "it, but a launch Intent had already gone out earlier in "
+                    "this run, so testing whether it swallows one would have "
+                    "meant sending a second play signal for the same video. "
+                    "To measure it, run this again with the device already "
+                    "awake."
+                ),
+            }
         _require_idle(ctx)
         deep_link = (
             f"vnd.youtube.launch://www.youtube.com/watch?v={SELF_TEST_VIDEO_SHORT}"
@@ -3204,6 +3321,11 @@ async def _probe_volume(ctx: dict) -> dict:
         # is indistinguishable from the normal CEC reading — a false negative
         # that reads like a real result.
         raise _ProbeSkip("device is off; volume can't be measured while asleep")
+    # Rule 3, and this probe was the one that skipped it. Volume is not a
+    # read: over CEC these keys reach whatever is doing the audio, so a
+    # dropped VOLUME_DOWN or an odd number of MUTEs leaves someone else's
+    # room offset or silent, with nothing on screen to explain why.
+    _require_idle(ctx)
 
     def _vol():
         try:
@@ -3953,6 +4075,17 @@ def _self_test_verdict(probes: list, ctx: dict) -> dict:
             "fail to start on unfamiliar hardware. Leave it untouched until "
             "the screensaver appears, then run this again from your phone."
         )
+    elif ok("screensaver") and detail("screensaver").get("screensaver_active") is None:
+        # Distinct from the above, and the remedy differs: something we don't
+        # recognise WAS on screen, we just couldn't spend a second play signal
+        # finding out what it does. Saying "no screensaver was on screen"
+        # here would be false, and the fix is the awake run, not a longer wait.
+        missing.append(
+            f"{detail('screensaver').get('foreground')} was in the foreground "
+            "and we don't recognise it, but the launch Intent had already "
+            "been spent waking the device, so we could not test whether it "
+            "swallows one. Run this again with the device already awake."
+        )
 
     return {
         "useful": bool(learned),
@@ -4031,7 +4164,7 @@ async def _run_self_test(run_id: str) -> None:
             ),
             "kind": "smarttube-playlist self-test",
             "version": VERSION,
-            "channel": "beta",
+            "channel": CHANNEL,
             "started_at": _self_test["started_at"],
             "duration_s": round(loop.time() - started, 1),
             "device_was_busy_at_start": ctx["was_busy"],

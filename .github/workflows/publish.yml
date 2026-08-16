@@ -86,6 +86,14 @@ jobs:
         with:
           context: .
           platforms: linux/amd64,linux/arm64
+          # What makes the `:beta` image a beta image. Deliberately NOT a
+          # source-level default that differs between the branches: beta and
+          # main ship byte-identical app.py and Dockerfile, so a promotion
+          # merge has nothing to carry across by accident. A wrong default
+          # here would switch a TV-hijacking button on for every stable user.
+          build-args: |
+            CHANNEL=${{ github.ref_name == 'beta' && 'beta' || 'stable' }}
+            SELF_TEST=${{ github.ref_name == 'beta' && '1' || '0' }}
           push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}

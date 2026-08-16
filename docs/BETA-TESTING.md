@@ -12,12 +12,12 @@ You don't need ADB or a terminal on the TV. The beta build collects most of the 
 
 **Already running the stable version?** Two ways, depending on how you installed it:
 
-- *With a `docker-compose.yml`:* change its `image:` line to end in `:beta`, then `docker compose pull && docker compose up -d`.
+- *With a `docker-compose.yml`:* change its `image:` line to end in `:beta`, **and change `SELF_TEST: "0"` to `SELF_TEST: "1"`** — your compose file sets that explicitly, and an explicit setting overrides what the beta image would otherwise switch on for you. Then `docker compose pull && docker compose up -d`.
 - *With the one-line command:* delete the container (Containers tab → **⋮** → **Delete**) and run the command again with `:beta` on the end. Your pairing survives — it lives in the `smarttube-data` storage, not in the container.
 
 Either way your TV pairing is kept.
 
-Beta builds report their version as `1.01` so it's obvious which one you're running.
+**How to tell it worked:** the bottom of the page gains a **🔬 Run device self-test** button. That button is the only visible difference, so if it isn't there, the switch didn't take — check the two things above rather than assuming the feature is broken. (Don't go by the version number: stable and beta both report `1.01`.)
 
 ## The easy way: one button
 

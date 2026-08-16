@@ -869,7 +869,12 @@
   // queue cards (now/add/queue/meta) all show together when paired.
   // The SmartTube-pair card is shown only when configured but not yet linked.
   function showPaired(loungePaired) {
+    // unreachable included deliberately: showCard() is what reveals it, and
+    // this is the only way back out. Leaving it off left the "Can't reach
+    // your TV" card pinned above a working queue — including immediately
+    // after the address form succeeded, which is the one flow it exists for.
     cards.host.hidden = true; cards.code.hidden = true;
+    cards.unreachable.hidden = true;
     cards.now.hidden = false; cards.add.hidden = false;
     cards.queue.hidden = false; cards.meta.hidden = false;
     cards.lounge.hidden = !!loungePaired;

@@ -83,7 +83,7 @@ Pick the path that matches you. Both end at the same place.
 | **Runs on** | Your everyday computer | An always-on box |
 | **Catch** | Only works while that computer is awake and Docker Desktop is running | You're expected to know your way around a shell |
 
-If you just want to try it, start with **Option A**. You can move it to a NAS later — copy the `data` folder across and you won't even need to re-pair.
+If you just want to try it, start with **Option A**. You can move it to a NAS later; you'll re-pair with the TV once, which takes about a minute.
 
 ---
 
@@ -219,7 +219,7 @@ This is the same mechanism as "play on TV" in the YouTube mobile app; SmartTube 
 
 **3. Done.** Paste a YouTube URL, hit **Add to queue**.
 
-Your answers persist to the `data` folder, so this is a one-time job.
+Your pairing persists to the container's storage, so this is a one-time job — it survives restarts, updates and re-creating the container.
 
 ---
 
@@ -280,13 +280,30 @@ Every setting, with what it's for: **[docs/CONFIGURATION.md](docs/CONFIGURATION.
 
 ## Updating
 
-In the folder with `docker-compose.yml`:
+Your pairing is kept either way — it lives in the storage, not in the container.
+
+**If you installed with Option A** (the one-line command), open the Docker Desktop
+terminal again and paste these three lines:
+
+```
+docker pull ghcr.io/alice-sabrina-ivy/smarttube-playlist:latest
+docker rm -f smarttube-playlist
+docker run -d --name smarttube-playlist --restart unless-stopped -p 38420:8000 -v smarttube-data:/data ghcr.io/alice-sabrina-ivy/smarttube-playlist:latest
+```
+
+The first line fetches the new build, the second removes the old container, the
+third starts a fresh one. The `docker pull` is the part that matters: without it
+the third line happily reuses the copy already on your machine, and nothing
+changes. If you added any `-e` settings to your original command, add them to
+the third line too.
+
+**If you installed with Option B**, in the folder with `docker-compose.yml`:
 
 ```bash
 docker compose pull && docker compose up -d
 ```
 
-Your pairing is kept. Stopping and removing it: [docs/ADVANCED-SETUP.md](docs/ADVANCED-SETUP.md#updating-stopping-removing).
+Stopping and removing it: [docs/ADVANCED-SETUP.md](docs/ADVANCED-SETUP.md#updating-stopping-removing).
 
 ---
 
