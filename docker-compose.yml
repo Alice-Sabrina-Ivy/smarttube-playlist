@@ -44,6 +44,28 @@ services:
       # All optional. Defaults suit most setups.
       # ---------------------------------------------------------------
 
+      # --- Device diagnostics ---
+      # Puts the "Run device self-test" button at the bottom of the page. It
+      # takes over the TV for a few minutes, measures what this device
+      # actually does, and produces one report to paste back to us.
+      #
+      # Set it to "0" to hide the button and make the endpoint refuse.
+      # Nothing else about the app changes.
+      #
+      # ┌───────────────────────────────────────────────────────────────────┐
+      # │ On a beta -> main merge this becomes "0" — stable users should    │
+      # │ not be handed a button that hijacks their TV.                     │
+      # │                                                                   │
+      # │ But do NOT flip the DEFAULT in app.py to match. It is "1" on      │
+      # │ purpose: the beta install instructions are a `docker run` line in │
+      # │ the README, not this file, so a default of "0" would silently     │
+      # │ remove the button from every tester who followed them — which is  │
+      # │ most of them, and it would look like the feature was never built. │
+      # │ Change that default only in the same commit that adds             │
+      # │ `-e SELF_TEST=1` to the beta run lines.                           │
+      # └───────────────────────────────────────────────────────────────────┘
+      SELF_TEST: "1"
+
       # --- Re-pairing ---
       # Uncomment, restart, and this clears the TV certificate and Lounge
       # token, dropping you back on the setup screen.
