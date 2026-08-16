@@ -141,7 +141,7 @@ SCREENSAVER_PACKAGES = frozenset(
 # through the Android TV Remote v2 protocol that androidtvremote2
 # (and therefore our app) uses — verified empirically with 0/3 dismiss
 # success rate for both, so they are NOT supported here.
-SCREENSAVER_DISMISS_KEY = os.environ.get("SCREENSAVER_DISMISS_KEY", "HOME").strip()
+_RAW_SCREENSAVER_DISMISS_KEY = os.environ.get("SCREENSAVER_DISMISS_KEY")
 WAKE_DELAY = float(os.environ.get("WAKE_DELAY", "15.0"))         # minimum total wake time after POWER
 WAKE_TIMEOUT = float(os.environ.get("WAKE_TIMEOUT", "30.0"))     # max time to wait for is_on=True
 WAKE_POLL = float(os.environ.get("WAKE_POLL", "0.5"))
@@ -174,6 +174,47 @@ def _known_keycode_names() -> Optional[frozenset]:
         return None
 
 
+def _resolve_keycode(raw: Optional[str], fallback: str, var: str,
+                     examples: str) -> str:
+    """Normalise a keycode env var, falling back on anything unknown.
+
+    Same shape and the same reason as _resolve_log_level: a config typo must
+    never be fatal. send_key_command resolves names through a protobuf enum
+    and raises ValueError on one it doesn't recognise, and every keycode we
+    send sits on a path that ends in playback — so a lowercase value takes
+    out far more than the key it names.
+
+    Case and an optional KEYCODE_ prefix are accepted because both are what a
+    human types; the library wants the bare uppercase name.
+    """
+    name = (raw or "").strip().upper()
+    if name.startswith("KEYCODE_"):
+        name = name[len("KEYCODE_"):]
+    if not name:
+        return fallback
+    known = _known_keycode_names()
+    if known is not None and f"KEYCODE_{name}" not in known:
+        log.warning(
+            "%s=%r is not a keycode this device protocol knows — falling "
+            "back to %s. Valid examples: %s.",
+            var, raw, fallback, examples,
+        )
+        return fallback
+    return name
+
+
+def _resolve_dismiss_keycode(raw: Optional[str]) -> str:
+    """Normalise SCREENSAVER_DISMISS_KEY. Default HOME.
+
+    docs/CONFIGURATION.md tells the reader "BACK also works", so `back` is a
+    spelling people will actually type. DPAD_CENTER and WAKEUP resolve fine
+    but are measured to be silently dropped by the remote protocol — that is
+    a device fact, not something validation can catch here.
+    """
+    return _resolve_keycode(raw, "HOME", "SCREENSAVER_DISMISS_KEY",
+                            "HOME, BACK")
+
+
 def _resolve_wake_keycode(raw: Optional[str]) -> str:
     """Normalise WAKE_KEYCODE, falling back to POWER on anything unknown.
 
@@ -193,23 +234,15 @@ def _resolve_wake_keycode(raw: Optional[str]) -> str:
     Case and an optional KEYCODE_ prefix are accepted because both are what
     a human types; the library wants the bare uppercase name.
     """
-    name = (raw or "").strip().upper()
-    if name.startswith("KEYCODE_"):
-        name = name[len("KEYCODE_"):]
-    if not name:
-        return WAKE_KEYCODE_FALLBACK
-    known = _known_keycode_names()
-    if known is not None and f"KEYCODE_{name}" not in known:
-        log.warning(
-            "WAKE_KEYCODE=%r is not a keycode this device protocol knows — "
-            "falling back to %s. Valid examples: POWER, WAKEUP, TV_POWER.",
-            raw, WAKE_KEYCODE_FALLBACK,
-        )
-        return WAKE_KEYCODE_FALLBACK
-    return name
+    return _resolve_keycode(raw, WAKE_KEYCODE_FALLBACK, "WAKE_KEYCODE",
+                            "POWER, WAKEUP, TV_POWER")
 
 
 WAKE_KEYCODE = _resolve_wake_keycode(os.environ.get("WAKE_KEYCODE"))
+# Resolved here rather than at its definition above, because the resolver 
+# it needs is defined between the two.
+SCREENSAVER_DISMISS_KEY = _resolve_dismiss_keycode(
+    _RAW_SCREENSAVER_DISMISS_KEY)
 # Timeouts inside tv_play's launch path. Module-level so tests can stub
 # them down to milliseconds for fast unit tests.
 # Lounge sender can be in a 5-60s exponential backoff sleep after SmartTube
@@ -732,7 +765,19 @@ async def _handle_is_on_change(is_on: bool) -> None:
     # tv_off_reset() clears the queue — so a connection blip while the TV was
     # off used to throw away whatever the user had just queued.
     changed = await queue_controller.update_tv_on(is_on)
-    if not is_on and changed:
+    if not is_on:
+        if not changed:
+            # A reconnect re-emitting the power state we already knew about,
+            # not the device turning off again. Change NOTHING. This has to
+            # be its own branch rather than a conjunct on the line below:
+            # gating only the destructive half left the `else` — whose whole
+            # premise is "TV came back on" — reachable while the device is
+            # off, where it re-read the library's stale current_app and undid
+            # both effects of the real off-transition. suppress_lounge
+            # flipping back to False there is the dangerous one: it lets the
+            # dormant-player cache (invariant 4) render as "currently
+            # playing" on a TV that is off.
+            return
         # Invalidate the cached foreground app — once the TV's off, we
         # don't know what it'll boot into next. Without this, the post-wake
         # `current_app` callback (TV typically lands at the launcher, not
@@ -1242,7 +1287,18 @@ async def tv_play(video_id: str, start_s: Optional[int] = None) -> None:
     if current_app in SCREENSAVER_PACKAGES:
         log.info("Dismissing screensaver (%s) via %s",
                  current_app, SCREENSAVER_DISMISS_KEY)
-        state.remote.send_key_command(SCREENSAVER_DISMISS_KEY)
+        try:
+            state.remote.send_key_command(SCREENSAVER_DISMISS_KEY)
+        except Exception:
+            # Same rule as the wake key: an undismissed screensaver is a
+            # launch that MIGHT fail, but an exception here is a launch that
+            # never happens at all — it would unwind past both deep-link
+            # sites and take out every add on the install. This is the
+            # production path for most adds, so it is the worst place to
+            # raise.
+            log.warning("Screensaver dismiss key %s could not be sent",
+                        SCREENSAVER_DISMISS_KEY, exc_info=True)
+            _record_device_event("dismiss_send_error", SCREENSAVER_DISMISS_KEY)
         # Poll for the dismiss to actually take effect, capped at
         # SCREENSAVER_DISMISS_DELAY. Polling lets us proceed early when
         # the dismiss completes (typically ~150ms via HOME) instead of
@@ -1503,7 +1559,6 @@ async def lifespan(_app: FastAPI):
 
     cfg = load_config()
     host = cfg.get("host")
-    startup_retry_task: Optional[asyncio.Task] = None
     if host and CERT_FILE.exists() and KEY_FILE.exists():
         # Remember the configured address even if we cannot reach it. Without
         # this the UI can only say "can't reach your TV" without naming which
@@ -1518,7 +1573,7 @@ async def lifespan(_app: FastAPI):
             # background retry. Without this we'd be stuck in a fake
             # "NOT CONFIGURED" state until someone restarts the container.
             global _startup_retry_task
-            startup_retry_task = _startup_retry_task = asyncio.create_task(
+            _startup_retry_task = asyncio.create_task(
                 _retry_startup_connect_until_success(host)
             )
     else:
@@ -1545,10 +1600,20 @@ async def lifespan(_app: FastAPI):
         watchdog_task.cancel()
         with contextlib.suppress(BaseException):
             await watchdog_task
-        if startup_retry_task is not None and not startup_retry_task.done():
-            startup_retry_task.cancel()
-            with contextlib.suppress(BaseException):
-                await startup_retry_task
+        # Cancel the GLOBALS, not the startup-time locals. /api/tv/address
+        # re-arms the retry loop into _startup_retry_task after a failed
+        # address change, so the local captured at boot can be a task that
+        # was already replaced — or None, if the TV was reachable at boot and
+        # the address was changed later. The residue is a retry still inside
+        # _attempt_startup_connect during teardown, assigning state.remote
+        # after disconnect() ran and leaking a live TLS socket to exit.
+        # _self_test_task was never cancelled by anything at all: a variable
+        # whose only purpose is to be cancellable.
+        for task in (_startup_retry_task, _self_test_task):
+            if task is not None and not task.done():
+                task.cancel()
+                with contextlib.suppress(BaseException):
+                    await task
         await _stop_lounge_monitor()
         await queue_controller.shutdown()
         if state.remote:
@@ -1692,10 +1757,10 @@ async def status():
         "current_app": current_app,
         "lounge_paired": lounge_paired,
         "lounge_connected": lounge_connected,
-        # null when no volume backend is configured; the string name of
-        # the backend (currently only "denon") when one is active. The
-        # frontend uses this to decide whether to render volume buttons.
-        # Volume goes over HDMI-CEC through the paired remote, so it's
+        # True whenever a TV is paired; the frontend uses it to decide
+        # whether to render the volume buttons. The four per-brand AVR
+        # backends this once described were deleted when CEC was proven —
+        # volume goes over the paired remote, so it's
         # available whenever the TV is. Whether the device actually honours it
         # depends on its CEC volume setting, which we can't read without ADB.
         "volume_available": state.remote is not None,
@@ -2756,14 +2821,27 @@ async def _probe_wake_keycodes(ctx: dict) -> dict:
         # direction.
         try:
             if bool(getattr(remote, "is_on", False)):
-                winner = (winner or attempts[-1]["key"]) if attempts else None
-                if winner:
-                    attempts[-1]["woke"] = True
-                    attempts[-1]["late"] = True
+                # Credit only an attempt that actually LEFT the machine. The
+                # send-failure path below also appends an attempt (a device
+                # asleep on WiFi can drop off the LAN entirely), and crediting
+                # a raise would put its keycode in suggested_configuration —
+                # telling the tester to configure a key that never reached the
+                # device, and costing them the one that did. Same
+                # mis-attribution class SELF_TEST_WAKE_KEY_TIMEOUT exists to
+                # prevent, reached through the error path instead of timing.
+                sent_attempts = [a for a in attempts if "error" not in a]
+                last = sent_attempts[-1] if sent_attempts else None
+                if last is not None:
+                    last["woke"] = True
+                    last["late"] = True
+                    winner = winner or last["key"]
                     # Must be set here too, not only on the fast path: it is
                     # what tells snapshot_after to re-run the foreground check
                     # now that the device is actually awake.
                     ctx["woke_by_key"] = winner
+                # Woke either way — record that even when we cannot say which
+                # key did it, so the later probes still know the device is up.
+                ctx["woke"] = True
                 break
         except Exception:
             pass

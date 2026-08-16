@@ -16,7 +16,7 @@ POST   /api/skip                          next video, or screensaver if empty
 POST   /api/pause                         pause playback and freeze auto-advance
 POST   /api/resume                        resume
 POST   /api/clear                         empty the queue, leave current playing
-POST   /api/seek           {to|by}        `to`: "1:23" / "90s" / "1h30m"; `by`: ±seconds
+POST   /api/seek           {to|by}        `to`: "1:23" / "90s" / "1h30m"; `by`: ±seconds. 503 without Lounge
 POST   /api/volume/{up|down|mute}         relays an HDMI-CEC volume keycode; 503 if
                                           no TV is paired
 GET    /api/events                        SSE stream of queue snapshots

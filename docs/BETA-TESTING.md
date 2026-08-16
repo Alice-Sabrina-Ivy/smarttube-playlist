@@ -78,17 +78,16 @@ If something doesn't work, these are the usual culprits — all on the device, n
 
 ### NVIDIA Shield
 
-- **The TV won't wake.** Settings → **Remotes & accessories** → **Simplified wake buttons**, and disable *"SHIELD 2019 Remote: Wake on power and Netflix buttons only"* and *"Controllers: Wake on NVIDIA or logo buttons only"*. With these on, the Shield ignores a power command sent over the network, so waking cannot work.
+- **The Shield won't wake.** Settings → **Remotes & accessories** → **Simplified wake buttons**, and disable *"SHIELD 2019 Remote: Wake on power and Netflix buttons only"* and *"Controllers: Wake on NVIDIA or logo buttons only"*. With these on, the Shield ignores a power command sent over the network, so waking cannot work.
 
   Every reported Shield wake failure with this protocol was fixed by those two toggles — none needed a different keycode, and Home Assistant wakes Shields with the same plain POWER we use. So if it still won't wake with both off, that's genuinely new information: run the self-test again and send the report rather than experimenting with `WAKE_KEYCODE`.
 
-- **It wakes, but the video doesn't start.** SHIELD Experience before 9.2 has a firmware bug NVIDIA fixed in early 2025: *"remote stops responding for 60 seconds after wake from sleep."* The self-test measures this window (`current_app_readable_after_wake_s`) and will suggest a `WAKE_DELAY` to bridge it — but updating the firmware is the real fix.
+- **It wakes, but the video doesn't start.** SHIELD Experience before 9.2 has a firmware bug NVIDIA fixed in early 2025: *"remote stops responding for 60 seconds after wake from sleep."* The self-test measures this window (`current_app_readable_after_wake_s`) and will suggest a `WAKE_DELAY` to bridge it — but updating the firmware is the real fix. Either way, tell us your version from Settings → Device Preferences → **About**.
 - **The connection drops every ~15 seconds right after pairing.** Known Shield quirk with this protocol. Fully reboot the Shield once after pairing the remote; it doesn't come back.
 - **Volume does nothing.** Settings → Device Preferences → **Display & Sound → Volume control**. The Shield offers three modes, and only two can work here:
   - **HDMI-CEC** (the default on 2019 models) — works, provided the TV or receiver honours CEC volume. Many TVs don't.
   - **Digital** (the default on 2015/2017 models) — works; the Shield attenuates its own output.
   - **IR** — unreliable rather than impossible. We previously said this could never work; NVIDIA's own docs corrected us — the Shield relays network volume out through the remote's IR blaster. It only works when the remote physically faces your amplifier, so if volume is flaky in IR mode, that's why. CEC or Digital are still the modes to prefer.
-- **Older firmware.** On SHIELD Experience before 9.2, the remote can stop responding for about 60 seconds after waking from sleep, which is longer than this app waits. Report your version from Settings → Device Preferences → About.
 - **Long-time SmartTube install?** SmartTube's signing key was compromised around November 2025 and the app was re-released under new application IDs. The in-app updater **cannot cross that rename**, so an install from before then still runs the legacy ID (`com.teamsmart.videomanager.tv`) — and this app won't find it. The report detects this (`smarttube_package_candidate`), but the right fix is a fresh install of current stable (32.10s or later) rather than a config change: builds before 31.94s also played link-launched videos without your account, which breaks age-restricted videos and watch history.
 - **Paired but nothing syncs after a reboot.** SmartTube's remote-control registration can silently die when the Shield reboots. On the TV: SmartTube → Settings → **Remote control** — toggle it off and back on.
 - **The Shield wakes up by itself at night.** That's SmartTube, not this app: any phone whose YouTube app is still linked to it can open the connection that self-launches SmartTube and wakes the device. Unlink old devices in SmartTube's Remote control settings.
@@ -97,6 +96,15 @@ If something doesn't work, these are the usual culprits — all on the device, n
 
 - **Volume does nothing** — HDMI-CEC volume control is usually switched off somewhere in the chain. See [CONFIGURATION.md](CONFIGURATION.md#volume-and-mute); note your TV probably calls CEC something else (*Anynet+*, *SIMPLINK*, *BRAVIA Sync*).
 - **The report shows a `current_app is empty` warning** — foreground detection isn't working, which quietly breaks several things at once. Worth reporting immediately.
+
+## When you're done
+
+Going back to the stable build:
+
+- *With a `docker-compose.yml`:* change `image:` back to end in `:latest` **and change `SELF_TEST: "1"` back to `"0"`** — that second half is the important one. Left on, the self-test button stays pressable by anyone who can reach the page. Then `docker compose pull && docker compose up -d`.
+- *With the one-line command:* delete the container and run the original command again (the one ending `:latest`). Nothing to undo — the setting lived in the beta image, not in your command.
+
+Your pairing survives either way.
 
 ## Sending it back
 

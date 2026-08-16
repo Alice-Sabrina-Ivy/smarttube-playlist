@@ -71,7 +71,7 @@ This is the easier alternative: one page on your LAN, anyone pastes a link, the 
 - **An internet connection** on that computer — video titles and lengths come from YouTube, and playback commands relay through YouTube's servers. Only the web page itself is LAN-only.
 - The TV's IP address (Settings → Network, or your router's device list).
 
-**Give the TV a permanent address** if you can — most routers call this a *DHCP reservation* or *static lease*, usually in the router's device list. Optional, but if the TV's address changes this app stops finding it, and re-pairing means setting `RESET_PAIRING: "1"` in `docker-compose.yml` and restarting (the pairing screen is hidden once a TV is paired).
+**Give the TV a permanent address** if you can — most routers call this a *DHCP reservation* or *static lease*, usually in the router's device list. Optional — if the TV's address changes, the page shows a **PAIRED · CAN'T REACH** screen with a box for typing the new one in. Nothing is re-paired, so it's a ten-second fix; a reservation just saves you doing it.
 
 ## Setup
 
@@ -215,7 +215,7 @@ On the TV: **SmartTube → Settings → Remote control**. A **12-digit code** ap
 
 This uses the same YouTube Lounge protocol the phone app's "play on TV" button uses. You'll see the name in logs and the API; the UI just calls it SmartTube, since that's the app you're actually linking to.
 
-This is the same mechanism as "play on TV" in the YouTube mobile app; SmartTube implements the receiver side. Skipping it still works, but you lose real playback position and precise end-of-video detection — see [Honest limitations](#honest-limitations).
+Skipping it still works, but you lose real playback position and precise end-of-video detection — see [Honest limitations](#honest-limitations).
 
 **3. Done.** Paste a YouTube URL, hit **Add to queue**.
 
@@ -272,7 +272,7 @@ Cross-site requests and DNS rebinding are both blocked, pairing can't be hijacke
 
 ## Configuration
 
-Everything is optional and the defaults work — most people change nothing. Set anything you do want as an environment variable in `docker-compose.yml`.
+Everything is optional and the defaults work — most people change nothing. To set one: on Option A add `-e NAME=VALUE` to the run command and run it again (see [Changing a setting later](#changing-a-setting-later)); on Option B add it under `environment:` in `docker-compose.yml`.
 
 Every setting, with what it's for: **[docs/CONFIGURATION.md](docs/CONFIGURATION.md)**.
 
@@ -337,7 +337,6 @@ The README covers getting it running. Everything else lives here:
 No dates — spare-time project.
 
 - **Verified support for other sticks and boxes** — Nvidia Shield, onn./Xiaomi, carrier boxes. (Not Fire TV: Fire OS has no Android TV Remote Service, so it is out of reach regardless of SmartTube supporting it.)
-- **Volume where HDMI-CEC isn't available** — those users currently get none.
 
 Got one of the untested devices? [Open an issue](https://github.com/Alice-Sabrina-Ivy/smarttube-playlist/issues) either way.
 

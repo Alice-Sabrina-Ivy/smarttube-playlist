@@ -86,9 +86,21 @@ def parse_canonical(text: str) -> tuple[int, int] | None:
     Strict on purpose: `1.1` is refused even though it is a perfectly good
     number, because it is a different STRING from `1.01` and the image tag is
     built from the string.
+
+    Canonical means "round-trips through format_version", which catches the
+    OVER-padded spellings too. `1.001` also parses to (1, 1), so accepting it
+    would publish a third tag for the same release — and worse, `--check`
+    would then agree with itself forever, because the tag and VERSION match
+    as strings while no v1.01 was ever cut. The regex alone only blocked the
+    under-padded direction.
     """
     m = VERSION_RX.match(text or "")
-    return (int(m.group(1)), int(m.group(2))) if m else None
+    if not m:
+        return None
+    major, minor = int(m.group(1)), int(m.group(2))
+    if format_version(major, minor) != text:
+        return None
+    return (major, minor)
 
 
 def parse_any(text: str) -> tuple[int, int] | None:

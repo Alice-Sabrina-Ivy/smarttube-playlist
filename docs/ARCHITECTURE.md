@@ -69,17 +69,17 @@ Python 3.12. The frontend is a single `index.html` — vanilla HTML/CSS/JS, no b
 
 ## Releasing
 
-Versions are **MAJOR.MINOR** (`v1.0`, `v1.1`, `v2.0`). `VERSION` at the repo root is the single source of truth: the app reads it and serves it at `/api/status`, the UI footer renders it, and the Dockerfile copies it into the image, so a running container can always say what it is.
+Versions are **MAJOR.MINOR** with a zero-padded two-digit minor — `v1.00`, `v1.01`, … `v1.99`, `v2.00`. `VERSION` at the repo root is the single source of truth: the app reads it and serves it at `/api/status`, the UI footer renders it, and the Dockerfile copies it into the image, so a running container can always say what it is.
 
 ```bash
-python scripts/release.py --minor      # 1.0 -> 1.1
-python scripts/release.py --major      # 1.3 -> 2.0
-python scripts/release.py --set 2.5    # explicit
+python scripts/release.py --minor      # 1.01 -> 1.02
+python scripts/release.py --major      # 1.13 -> 2.00
+python scripts/release.py --set 2.05   # explicit
 python scripts/release.py --check      # verify VERSION, footer and tag agree
 python scripts/release.py --dry-run --minor
 ```
 
-Versions are `MAJOR.MINOR` with a zero-padded two-digit minor — `1.00`, `1.01`, … `1.99`, `2.00`. The padding is why `scripts/release.py` orders tags itself rather than with `git --sort=v:refname`: git follows `strverscmp`, which reads a leading zero as a fraction and ranks `v1.01` *below* `v1.0`. It also refuses the unpadded spelling, since `1.1` and `1.01` are one version but two image tags.
+The padding is why `scripts/release.py` orders tags itself rather than with `git --sort=v:refname`: git follows `strverscmp`, which reads a leading zero as a fraction and ranks `v1.01` *below* `v1.0`. It also refuses the unpadded spelling, since `1.1` and `1.01` are one version but two image tags.
 
 The script bumps `VERSION`, syncs the footer, commits, tags and pushes. Everything after that is CI: the image is built multi-arch and tagged `1.01`, `1` and `latest` in GHCR, then a GitHub Release is created with notes generated from the commits since the previous tag.
 

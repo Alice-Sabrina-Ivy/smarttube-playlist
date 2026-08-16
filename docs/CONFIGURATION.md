@@ -2,7 +2,10 @@
 
 ← back to the [README](../README.md)
 
-Every setting is optional and set as an environment variable in `docker-compose.yml`. The defaults suit most setups — most people change none of these.
+Every setting is optional and set as an environment variable. The defaults suit most setups — most people change none of these.
+
+- **Installed with the one-line `docker run` command (Option A)?** Add `-e NAME=VALUE` to that command, delete the container, and run it again. Your pairing lives in the `smarttube-data` storage and survives.
+- **Using `docker-compose.yml` (Option B)?** Add it under `environment:`, as below.
 
 ```yaml
 services:

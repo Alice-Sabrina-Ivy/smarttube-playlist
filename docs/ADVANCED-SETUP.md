@@ -31,7 +31,7 @@ A Raspberry Pi needs a **64-bit** OS. Check with `uname -m` — you want `aarch6
 
 ### Where state lives
 
-`./data`, next to the compose file: the pairing certificate, the TV's address, the Lounge token, and your AV receiver choice. Back that directory up and you never have to pair again — including when moving to a different host.
+`./data`, next to the compose file: the pairing certificate and its key, the TV's address, and the Lounge token. Back that directory up and you never have to pair again — including when moving to a different host.
 
 It's created on first run and chowned to UID 1000 by the entrypoint, which runs as root just long enough to do that before dropping privileges via `gosu`. If you add a `user:` directive to the compose file the chown can't happen, and you'll need to pre-create the directory with the right ownership yourself.
 
