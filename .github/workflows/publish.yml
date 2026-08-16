@@ -91,9 +91,12 @@ jobs:
           # source-level default that differs between the branches: beta and
           # main ship byte-identical app.py and Dockerfile, so a promotion
           # merge has nothing to carry across by accident. A wrong default
-          # here would switch a TV-hijacking button on for every stable user.
+          # here would switch a TV-hijacking button on for everyone on :latest.
+          # CHANNEL carries the BRANCH name into diagnostics reports, so a
+          # pasted report says which source to read it against. Tag builds are
+          # cut from main, so they correctly report main rather than the tag.
           build-args: |
-            CHANNEL=${{ github.ref_name == 'beta' && 'beta' || 'stable' }}
+            CHANNEL=${{ github.ref_name == 'beta' && 'beta' || 'main' }}
             SELF_TEST=${{ github.ref_name == 'beta' && '1' || '0' }}
           push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ steps.meta.outputs.tags }}

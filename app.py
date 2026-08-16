@@ -2377,12 +2377,16 @@ SELF_TEST_ENABLED = os.environ.get("SELF_TEST", "0").strip().lower() not in (
     "0", "false", "no", "off",
 )
 
-# Which build this is, for reports. Reads the environment for the same reason
-# SELF_TEST does, and that reason is worth stating: this line is IDENTICAL on
-# `main` and `beta`, and it has to be.
+# Which BRANCH this build came from, for reports: "main" or "beta". A branch
+# name rather than a product word like "stable" on purpose — the field exists
+# so that whoever reads a pasted report knows which source to read it against,
+# and a branch name answers that directly instead of needing a mental hop.
 #
-# The beta values used to be a source-level default that differed between the
-# branches, with a comment asking whoever merged to preserve it. Git cannot
+# Reads the environment for the same reason SELF_TEST does, and that reason is
+# worth stating: this line is IDENTICAL on `main` and `beta`, and it has to be.
+#
+# The branch values used to be a source-level default that differed between
+# the branches, with a comment asking whoever merged to preserve it. Git cannot
 # help with that: if beta changes the line and main never touches it, the next
 # beta -> main merge is clean and main silently inherits beta's value —
 # switching a TV-hijacking button on for every stable user with no conflict to
@@ -2392,7 +2396,7 @@ SELF_TEST_ENABLED = os.environ.get("SELF_TEST", "0").strip().lower() not in (
 #
 # Operator overrides still win: docker's `-e` and compose `environment:` both
 # beat the image's ENV.
-CHANNEL = os.environ.get("CHANNEL", "").strip() or "stable"
+CHANNEL = os.environ.get("CHANNEL", "").strip() or "main"
 
 # Two stable, long-lived public videos. The short one is 19 seconds
 # deliberately — a probe that hijacks someone's TV should hand it back fast.

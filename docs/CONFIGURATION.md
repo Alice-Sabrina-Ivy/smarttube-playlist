@@ -38,7 +38,7 @@ services:
 | `SELF_TEST` | `0` | `1` adds the **Run device self-test** button and enables `/api/diagnostics`. The self-test drives the TV for several minutes and anyone who can reach the page can press it; `/api/diagnostics` reports your LAN address, device model, firmware and event log to any caller. On by default only in the `:beta` image. See [SECURITY.md](../SECURITY.md) |
 | `SELF_TEST_VIDEO` | `jNQXAC9IVRw` | The 19-second clip the self-test plays. Override if it isn't available where you are |
 | `SELF_TEST_VIDEO_LONG` | `aqz-KE-bpKQ` | The longer clip it swaps to, so the pause/resume checks have something still playing |
-| `CHANNEL` | `stable` | The build name a diagnostics report carries. Set by the image; only worth changing if you build your own |
+| `CHANNEL` | `main` | Which branch this build came from — `main` or `beta` — recorded in diagnostics reports so we know which source to read yours against. Set by the image; only worth changing if you build your own |
 
 ## Volume and mute
 
