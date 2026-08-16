@@ -911,6 +911,17 @@ class QueueController:
             else:
                 self.state.current = None
                 self.state.current_started_at = None
+                # Nothing is playing and nothing is queued, so a leftover
+                # `paused` describes a player we no longer own — and it is
+                # not inert. add() gates should_start on `not paused`, and
+                # the replace-current branch can't rescue it because that
+                # needs `current is not None`. Leaving it set wedges the
+                # queue: every later add parks and never plays, silently.
+                # Found on hardware — a lone video ends Paused, not Stopped,
+                # so the mirror sets this on the way out of every video that
+                # plays to its end with nothing behind it.
+                self.state.paused = False
+                self.state.pause_source = None
                 # Cancel any leftover timer state for the now-cleared current.
                 self._timer_gen += 1
                 self._timer_task = None
@@ -933,6 +944,10 @@ class QueueController:
                 return
             self.state.current = None
             self.state.current_started_at = None
+            # Same reasoning as _advance's empty-queue branch: a `paused`
+            # that outlives the item it described wedges every later add.
+            self.state.paused = False
+            self.state.pause_source = None
             self._timer_gen += 1
             self._timer_task = None
             snapshot = self.state.snapshot()
