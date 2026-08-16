@@ -128,26 +128,50 @@ jobs:
           VERSION="${TAG#v}"
           IMAGE="ghcr.io/$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')"
 
+          # Notes are hand-written in CHANGELOG.md, NOT --generate-notes. The
+          # generated kind lists raw commit subjects, a compare link, and a
+          # "New Contributors" section that credits the maintainer on their
+          # own project — none of which tell a reader whether it is worth
+          # updating.
+          #
+          # Pull this tag's section: from its "## v1.01" heading to whichever
+          # comes first, the next "## " heading or the "---" rule between
+          # entries. Stopping at the rule too keeps a stray horizontal line
+          # off the end of the published notes.
+          CHANGES="$(awk -v tag="## ${TAG}" '
+            $0 == tag { grab = 1; next }
+            grab && (/^## / || /^---[[:space:]]*$/) { exit }
+            grab { print }
+          ' CHANGELOG.md)"
+
+          # Never publish a blank release. Say so plainly instead.
+          if [ -z "$(printf '%s' "$CHANGES" | tr -d '[:space:]')" ]; then
+            CHANGES="No changelog entry for ${TAG} yet."
+          fi
+
           # Past releases are never touched: GitHub keeps them all and lists
           # them newest-first, and every old image tag stays pullable.
           {
-            echo "## Install or update"
+            echo "## Update or install"
             echo
             echo '```bash'
-            echo "docker pull ${IMAGE}:${VERSION}"
+            echo "docker pull ${IMAGE}:latest"
             echo '```'
-            echo
-            echo "Or pin the major version with \`${IMAGE}:${VERSION%%.*}\`, or track"
-            echo "the newest with \`${IMAGE}:latest\`. Older versions stay available."
             echo
             echo "Already running it? \`docker compose pull && docker compose up -d\`,"
             echo "or if you installed with the one-line \`docker run\` command, see"
             echo "[Updating](https://github.com/Alice-Sabrina-Ivy/smarttube-playlist#changing-a-setting-updating-or-removing-it)."
             echo "Your pairing is kept either way."
+            echo
+            echo "Would rather stay on this exact version than follow new releases?"
+            echo "Use \`${IMAGE}:${VERSION}\` in place of \`:latest\`."
+            echo
+            echo "## What's new"
+            echo
+            printf '%s\n' "$CHANGES"
           } > notes.md
 
           gh release create "$TAG" \
             --title "$TAG" \
-            --notes-file notes.md \
-            --generate-notes
+            --notes-file notes.md
 
