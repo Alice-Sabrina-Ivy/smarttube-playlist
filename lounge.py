@@ -192,14 +192,46 @@ class LoungeMonitor:
         self._auth: Optional[dict] = None
         self._stopped = False
         # Set by request_reconnect_now() to interrupt the subscribe loop's
-        # backoff sleep — used by tv_play right after market://launch
-        # foregrounds SmartTube, so we don't have to wait out a 5-60s
-        # exponential backoff before our next reconnect attempt.
+        # backoff sleep — used by tv_play before it waits on Lounge, so we
+        # don't sit out a 5-60s exponential backoff. That backoff is easy to
+        # land in: the sender gives up while SmartTube is backgrounded behind
+        # a screensaver, which is exactly when the next play arrives.
         self._wake_subscribe = asyncio.Event()
 
     @property
     def observation(self) -> LoungeObservation:
         return self._observation
+
+    async def request_now_playing(self) -> bool:
+        """Force ONE get_now_playing(), bypassing the should_refresh gate.
+
+        `observation` is a passive cache: SmartTube pushes state on
+        TRANSITIONS ONLY, so position during steady playback never arrives
+        unless somebody asks. `_periodic_refresh_loop` normally does the
+        asking, but it is gated on the queue owning a current item — and the
+        self-test plays OUTSIDE the queue by design, so during a self-test
+        that gate is shut and the observation is frozen at whatever the last
+        transition left behind.
+
+        Callers must have established that SmartTube is foregrounded and
+        playing before calling this. That is the whole reason for the gate:
+        polling against a BACKGROUNDED SmartTube auto-foregrounds it (a
+        YouTube protocol behaviour), which on a Shield can even wake the
+        device. This method deliberately cannot check that for itself, so it
+        is not a general-purpose refresh — `_probe_end_of_video` is its only
+        caller, and it waits for `state == "Playing"` first.
+        """
+        api = self._api
+        if api is None or not self._observation.available:
+            return False
+        try:
+            await api.get_now_playing()
+            return True
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.debug("Explicit get_now_playing failed", exc_info=True)
+            return False
 
     @property
     def is_paired(self) -> bool:
@@ -219,7 +251,9 @@ class LoungeMonitor:
         if not digits:
             raise ValueError("empty pairing code")
 
-        async with YtLoungeApi(device_name) as api:
+        async with YtLoungeApi(
+            device_name, logger=log.getChild("pyytlounge"),
+        ) as api:
             ok = await api.pair(digits)
             if not ok or not api.linked():
                 raise RuntimeError("pair returned False or session not linked")
@@ -334,7 +368,19 @@ class LoungeMonitor:
             return
         # YtLoungeApi requires async-context-manager init. We manually enter
         # the context so the api lives across the lifetime of the session.
-        api = YtLoungeApi(self.device_name, event_listener=self._listener)
+        api = YtLoungeApi(
+            self.device_name,
+            event_listener=self._listener,
+            # Not optional. Left to itself pyytlounge builds
+            # logging.Logger(...) through the constructor, whose parent is
+            # None — so it never propagates to root, our redacting formatter
+            # never sees it, and its records fall through to
+            # logging.lastResort (stderr). It logs the Lounge token verbatim
+            # at INFO and its exception tracebacks carry request URLs with the
+            # token in the query string. A child of our logger propagates
+            # normally and gets redacted like everything else.
+            logger=log.getChild("pyytlounge"),
+        )
         await api.__aenter__()
         try:
             api.load_auth_state(self._auth)

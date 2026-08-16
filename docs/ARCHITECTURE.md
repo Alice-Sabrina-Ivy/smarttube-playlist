@@ -13,12 +13,13 @@ Without Lounge the service is flying blind: it knows what it asked the TV to do,
 
 ## Starting a video
 
-1. If the TV reports off, send `POWER` and wait for it to come up. Instant-on TVs claim to be awake within about a second while the OS is still booting, so a minimum delay is enforced rather than trusting the "on" signal.
+1. If the TV reports off, send the wake key and wait for it to come up. Instant-on TVs claim to be awake within about a second while the OS is still booting, so a minimum delay is enforced rather than trusting the "on" signal.
 2. If a screensaver is in the foreground, dismiss it first — screensavers silently swallow app-launch intents.
-3. If SmartTube isn't in the foreground, launch it via `market://launch`.
-4. Send **exactly one** play signal: `setPlaylist` over Lounge when it's connected, otherwise a `vnd.youtube.launch://` deep link through the remote.
+3. Then one of two things, depending on whether SmartTube is already in front:
+   - **Not in front** (cold boot, screensaver, launcher, another app) — send a single `vnd.youtube.launch://` deep link and stop there. Android hands the Intent to SmartTube, which comes to the foreground *and* starts playing in one step, so no separate launch command is needed. This is the common case.
+   - **Already in front** — use Lounge instead, for a smoother swap: skip entirely if it's already playing that video, resume in place if it's genuinely paused mid-video, otherwise `setPlaylist`. If Lounge isn't reachable, or SmartTube is in front but idle, fall back to the same single deep link.
 
-That last point is load-bearing. Sending both makes SmartTube load the video twice, which is audible.
+Either way: **exactly one** play signal. Sending both makes SmartTube load the video twice, which is audible, and it is the most-repeated regression in this project's history.
 
 ## Auto-advance
 
@@ -68,19 +69,23 @@ Python 3.12. The frontend is a single `index.html` — vanilla HTML/CSS/JS, no b
 
 ## Releasing
 
-Versions are **MAJOR.MINOR** (`v1.0`, `v1.1`, `v2.0`). `VERSION` at the repo root is the single source of truth: the app reads it and serves it at `/api/status`, the UI footer renders it, and the Dockerfile copies it into the image, so a running container can always say what it is.
+Versions are **MAJOR.MINOR** with a zero-padded two-digit minor — `v1.00`, `v1.01`, … `v1.99`, `v2.00`. `VERSION` at the repo root is the single source of truth: the app reads it and serves it at `/api/status`, the UI footer renders it, and the Dockerfile copies it into the image, so a running container can always say what it is.
 
 ```bash
-python scripts/release.py --minor      # 1.0 -> 1.1
-python scripts/release.py --major      # 1.3 -> 2.0
-python scripts/release.py --set 2.5    # explicit
+python scripts/release.py --minor      # 1.01 -> 1.02
+python scripts/release.py --major      # 1.13 -> 2.00
+python scripts/release.py --set 2.05   # explicit
 python scripts/release.py --check      # verify VERSION, footer and tag agree
 python scripts/release.py --dry-run --minor
 ```
 
-The script bumps `VERSION`, syncs the footer, commits, tags and pushes. Everything after that is CI: the image is built multi-arch and tagged `1.1`, `1` and `latest` in GHCR, then a GitHub Release is created with notes generated from the commits since the previous tag.
+The padding is why `scripts/release.py` orders tags itself rather than with `git --sort=v:refname`: git follows `strverscmp`, which reads a leading zero as a fraction and ranks `v1.01` *below* `v1.0`. It also refuses the unpadded spelling, since `1.1` and `1.01` are one version but two image tags.
 
-Old releases and old image tags are never touched — GitHub lists releases newest-first automatically and keeps them all, so anyone can pin `:1.0` indefinitely. There is no manifest to maintain.
+The script bumps `VERSION`, syncs the footer, commits, tags and pushes. Everything after that is CI: the image is built multi-arch and tagged `1.01`, `1` and `latest` in GHCR, then a GitHub Release is created with notes generated from the commits since the previous tag.
+
+Note `:latest` does **not** only track releases — `publish.yml` also emits it on every push to the default branch, so it follows the tip of `main`. Pin `:1.01` to move only when you choose to. The `beta` branch publishes `:beta`, built with `CHANNEL=beta SELF_TEST=1` as build args so the source stays identical on both branches.
+
+Old releases and old image tags are never touched — GitHub lists releases newest-first automatically and keeps them all, so anyone can pin `:1.01` indefinitely. There is no manifest to maintain.
 
 ## Contributing
 

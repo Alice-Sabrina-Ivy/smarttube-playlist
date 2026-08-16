@@ -16,7 +16,11 @@ It is **not** built to be exposed to the internet, and no amount of configuratio
 
 ### What an unauthenticated caller can do
 
-Anyone who can reach the page can queue, skip, pause, reorder and clear videos, seek, change volume if an AVR is configured, wake the TV, and read what's playing. They cannot read files, run commands, or reach anything on your network beyond this service.
+Anyone who can reach the page can queue, skip, pause, reorder and clear videos, seek, change the volume, wake the TV, and read what's playing. They can also point the service at a different TV address — deliberately reversible, since the same screen stays on display until a working address is entered, which is what makes it a recovery tool rather than a way to lock someone out. They cannot read files, run commands, or reach anything on your network beyond this service.
+
+With `SELF_TEST=1` they can additionally start the device self-test, which drives the TV for up to about eight minutes (nearer three if the device is already awake) — a short clip, pause/resume, volume — then hands the TV back to its screensaver, refusing everyone else's playback requests while it runs. It never powers the device off. The same setting exposes `/api/diagnostics`, which reports this host's LAN address, your device model and firmware, how old the SmartTube pairing is, and a recent event log.
+
+**Both are off by default.** The `:beta` image turns them on, because producing that report is what it exists for.
 
 ### Don't port-forward it
 

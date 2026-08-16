@@ -13,6 +13,9 @@ Assumes Docker Engine and the Compose plugin are already installed.
 ```bash
 mkdir -p /opt/smarttube-playlist && cd /opt/smarttube-playlist
 curl -O https://raw.githubusercontent.com/Alice-Sabrina-Ivy/smarttube-playlist/main/docker-compose.yml
+# This pins :latest. Helping test on new hardware? Swap `main` for `beta`
+# in that URL — that copy points at the :beta image and turns the device
+# diagnostics on. See docs/BETA-TESTING.md.
 docker compose up -d
 ```
 
@@ -28,7 +31,7 @@ A Raspberry Pi needs a **64-bit** OS. Check with `uname -m` — you want `aarch6
 
 ### Where state lives
 
-`./data`, next to the compose file: the pairing certificate, the TV's address, the Lounge token, and your AV receiver choice. Back that directory up and you never have to pair again — including when moving to a different host.
+`./data`, next to the compose file: the pairing certificate and its key, the TV's address, and the Lounge token. Back that directory up and you never have to pair again — including when moving to a different host.
 
 It's created on first run and chowned to UID 1000 by the entrypoint, which runs as root just long enough to do that before dropping privileges via `gosu`. If you add a `user:` directive to the compose file the chown can't happen, and you'll need to pre-create the directory with the right ownership yourself.
 
@@ -103,7 +106,7 @@ The compose file tracks `:latest`, which follows the newest build from `main` �
 If you'd rather only move when you choose to, pin a tag instead:
 
 ```yaml
-image: ghcr.io/alice-sabrina-ivy/smarttube-playlist:1.0   # exactly this release
+image: ghcr.io/alice-sabrina-ivy/smarttube-playlist:1.01  # exactly this release
 image: ghcr.io/alice-sabrina-ivy/smarttube-playlist:1     # newest 1.x
 ```
 

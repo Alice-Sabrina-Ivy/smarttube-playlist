@@ -11,10 +11,16 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import ipaddress
+from collections import deque
+from datetime import datetime, timezone
 import json
 import logging
 import os
+import platform
 import re
+import sys
+import time
+from importlib.metadata import version as metadata_version
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Optional
@@ -34,7 +40,7 @@ import httpx
 
 from events import Broadcaster
 from lounge import LoungeMonitor, LoungeObservation
-from metadata import Metadata, fetch_metadata
+from metadata import FETCH_TIMEOUT_S as METADATA_TIMEOUT_S, Metadata, fetch_metadata
 from playlist import QueueController, QueueItem, make_item
 from ratelimit import RateLimiter
 
@@ -124,7 +130,8 @@ SMARTTUBE_PACKAGE = os.environ.get("SMARTTUBE_PACKAGE", "org.smarttube.stable")
 SCREENSAVER_PACKAGES = frozenset(
     p.strip() for p in os.environ.get(
         "SCREENSAVER_PACKAGES",
-        "com.google.android.apps.tv.dreamx,com.google.android.backdrop",
+        "com.google.android.apps.tv.dreamx,com.google.android.backdrop,"
+        "com.android.dreams.basic,com.neilturner.aerialviews",
     ).split(",") if p.strip()
 )
 # Keycode used to dismiss a foreground screensaver. HOME is the most
@@ -134,16 +141,110 @@ SCREENSAVER_PACKAGES = frozenset(
 # through the Android TV Remote v2 protocol that androidtvremote2
 # (and therefore our app) uses — verified empirically with 0/3 dismiss
 # success rate for both, so they are NOT supported here.
-SCREENSAVER_DISMISS_KEY = os.environ.get("SCREENSAVER_DISMISS_KEY", "HOME").strip()
+_RAW_SCREENSAVER_DISMISS_KEY = os.environ.get("SCREENSAVER_DISMISS_KEY")
 WAKE_DELAY = float(os.environ.get("WAKE_DELAY", "15.0"))         # minimum total wake time after POWER
 WAKE_TIMEOUT = float(os.environ.get("WAKE_TIMEOUT", "30.0"))     # max time to wait for is_on=True
 WAKE_POLL = float(os.environ.get("WAKE_POLL", "0.5"))
+# Which keycode wakes a sleeping device. POWER is a TOGGLE, and that is the
+# crux: hardware that ignores a toggle while asleep can never be woken, and
+# raises no error to say so. NVIDIA Shield is the known case — its "Simplified
+# wake buttons" setting makes a network-delivered POWER a silent no-op, and a
+# Shield-specific Home Assistant integration works around it with a separate
+# non-toggle power-on command carried on NVIDIA's own protocol (see CLAUDE.md).
+#
+# We don't speak that protocol, so instead of guessing at a better default,
+# make it a variable a tester can turn: WAKEUP (224) and TV_POWER (177) are the
+# candidates worth trying on unfamiliar hardware. WAKEUP is measured to be
+# silently dropped on Google TV, which is exactly why this stays per-install
+# rather than becoming the new default.
+WAKE_KEYCODE_FALLBACK = "POWER"
+
+
+def _known_keycode_names() -> Optional[frozenset]:
+    """Every KEYCODE_* name androidtvremote2 will accept, or None.
+
+    Returns None rather than raising if the library's generated protobuf
+    module ever moves: validation is a nicety, and losing it must not stop
+    the service booting.
+    """
+    try:
+        from androidtvremote2.remotemessage_pb2 import RemoteKeyCode
+        return frozenset(RemoteKeyCode.keys())
+    except Exception:  # pragma: no cover - depends on library internals
+        return None
+
+
+def _resolve_keycode(raw: Optional[str], fallback: str, var: str,
+                     examples: str) -> str:
+    """Normalise a keycode env var, falling back on anything unknown.
+
+    Same shape and the same reason as _resolve_log_level: a config typo must
+    never be fatal. send_key_command resolves names through a protobuf enum
+    and raises ValueError on one it doesn't recognise, and every keycode we
+    send sits on a path that ends in playback — so a lowercase value takes
+    out far more than the key it names.
+
+    Case and an optional KEYCODE_ prefix are accepted because both are what a
+    human types; the library wants the bare uppercase name.
+    """
+    name = (raw or "").strip().upper()
+    if name.startswith("KEYCODE_"):
+        name = name[len("KEYCODE_"):]
+    if not name:
+        return fallback
+    known = _known_keycode_names()
+    if known is not None and f"KEYCODE_{name}" not in known:
+        log.warning(
+            "%s=%r is not a keycode this device protocol knows — falling "
+            "back to %s. Valid examples: %s.",
+            var, raw, fallback, examples,
+        )
+        return fallback
+    return name
+
+
+def _resolve_dismiss_keycode(raw: Optional[str]) -> str:
+    """Normalise SCREENSAVER_DISMISS_KEY. Default HOME.
+
+    docs/CONFIGURATION.md tells the reader "BACK also works", so `back` is a
+    spelling people will actually type. DPAD_CENTER and WAKEUP resolve fine
+    but are measured to be silently dropped by the remote protocol — that is
+    a device fact, not something validation can catch here.
+    """
+    return _resolve_keycode(raw, "HOME", "SCREENSAVER_DISMISS_KEY",
+                            "HOME, BACK")
+
+
+def _resolve_wake_keycode(raw: Optional[str]) -> str:
+    """Normalise WAKE_KEYCODE, falling back to POWER on anything unknown.
+
+    Same shape and the same reason as _resolve_log_level: a config typo must
+    never be fatal. send_key_command resolves names through a protobuf enum
+    and raises ValueError on one it doesn't recognise — and the wake send
+    sits on the only path that starts playback, so `wakeup` typed in
+    lowercase used to take out every add on the install rather than just the
+    wake.
+
+    That is not a hypothetical audience. Our own wake-failure log tells the
+    reader to "try WAKE_KEYCODE=WAKEUP or WAKE_KEYCODE=TV_POWER", so the
+    people most likely to set this var are the ones whose device already
+    won't wake — and the failure they'd get is strictly worse than the one
+    they were trying to fix.
+
+    Case and an optional KEYCODE_ prefix are accepted because both are what
+    a human types; the library wants the bare uppercase name.
+    """
+    return _resolve_keycode(raw, WAKE_KEYCODE_FALLBACK, "WAKE_KEYCODE",
+                            "POWER, WAKEUP, TV_POWER")
+
+
+WAKE_KEYCODE = _resolve_wake_keycode(os.environ.get("WAKE_KEYCODE"))
+# Resolved here rather than at its definition above, because the resolver 
+# it needs is defined between the two.
+SCREENSAVER_DISMISS_KEY = _resolve_dismiss_keycode(
+    _RAW_SCREENSAVER_DISMISS_KEY)
 # Timeouts inside tv_play's launch path. Module-level so tests can stub
 # them down to milliseconds for fast unit tests.
-SMARTTUBE_FG_TIMEOUT = 3.0       # market://launch -> SmartTube foregrounded
-                                 # (measured: ~166ms typical; this is a poll-
-                                 # with-early-exit, so it just caps worst-case)
-SMARTTUBE_FG_POLL = 0.3
 # Lounge sender can be in a 5-60s exponential backoff sleep after SmartTube
 # has been backgrounded (e.g. during the screensaver). 15s comfortably
 # covers a typical post-foreground reconnect; we ALSO poke the monitor to
@@ -156,12 +257,6 @@ SCREENSAVER_DISMISS_DELAY = 0.3  # after the dismiss key, time for the OS to
                                  # settle (measured: ~100ms typical for HOME
                                  # to take dreamx off screen; we poll with
                                  # early-exit so this caps worst-case wait)
-# Post-setPlaylist nudge window: max time to wait for Lounge to report
-# state=Playing after setPlaylist, before sending a play() nudge for a
-# Paused load. Only used on the cold-boot / re-foreground path; hot-path
-# setPlaylist auto-plays and skips the nudge entirely.
-POST_SETPLAYLIST_TIMEOUT = 2.0
-POST_SETPLAYLIST_POLL = 0.2
 # Sequence of keycodes sent when /api/skip empties the queue. Comma-separated
 # so multi-step "go idle" routines work. The default "HOME,BACK" mirrors
 # pressing the home button then back on the physical remote — that's what
@@ -200,6 +295,189 @@ VOLUME_KEYCODES = {
     "down": "VOLUME_DOWN",
     "mute": "VOLUME_MUTE",
 }
+
+# ── beta-only diagnostics ────────────────────────────────────────────────────
+# This project is verified on hardware the maintainer owns. Supporting anything
+# else means asking someone who owns it to tell us what their device does — and
+# a list of twenty questions over text message is a poor way to do that.
+#
+# So every device event we observe goes into a small ring buffer, and
+# /api/diagnostics renders it as one pasteable report. The single most valuable
+# field is the history of `current_app` values: it is how we learn what a given
+# device calls its screensaver and its launcher, which is exactly the thing that
+# breaks launching on unfamiliar hardware (screensavers silently swallow
+# app-launch intents, so a screensaver we don't recognise is never dismissed).
+#
+# Bounded on purpose: a long-running container must not grow a log forever.
+DEVICE_LOG_MAX = 200
+_device_log: deque = deque(maxlen=DEVICE_LOG_MAX)
+# Stamped at import so a report can say how long this container had been up.
+# A box that has just restarted behaves differently from one that has been
+# running a fortnight, and that difference has explained more than one
+# "it worked yesterday".
+_BOOT_MONO = time.monotonic()
+_BOOT_AT = datetime.now(timezone.utc).isoformat()
+# Counts remote reconnects. A device that drops off the LAN in standby is the
+# most likely Shield-in-sleep behaviour, and without this a wake failure looks
+# identical to a command that was never delivered.
+_remote_reconnects = 0
+
+# Foreground packages that are expected and therefore not screensaver suspects.
+# Launchers are included because "sitting on the home screen" is normal, not a
+# fault — listing them keeps the suspect list short enough to act on.
+# Read from SmartTube's own build.gradle (productFlavors) — every id it
+# actually ships under, plus the legacy one it shipped under before the
+# ~Nov 2025 signing-key compromise forced a rename. The in-app updater cannot
+# cross that rename, so long-standing installs sit on the old id forever.
+#
+# NOTE the legacy id is videoMANAGER, not videotv. That distinction matters:
+# a plausible-looking corruption of it circulates, and a wrong id here would
+# have us tell a tester to configure a package that does not exist.
+KNOWN_SMARTTUBE_PACKAGES = {
+    "org.smarttube.stable": "current stable",
+    "org.smarttube.beta": "current beta",
+    "app.smarttube.fdroid": "F-Droid build",
+    "app.smarttube": "default/self-built",
+    "com.teamsmart.videomanager.tv": "LEGACY, pre-rename",
+    "com.liskovsoft.smarttubetv.beta": "LEGACY beta, pre-rename",
+}
+
+
+KNOWN_BENIGN_PACKAGES = frozenset({
+    "com.google.android.tvlauncher",         # Android TV launcher
+    "com.google.android.apps.tv.launcherx",  # Google TV launcher
+    "com.google.android.leanbacklauncher",   # older Android TV launcher; ships
+    "com.google.android.leanbacklauncher.recommendations",  # on Shield too
+    "com.android.tv.settings",
+    "com.google.android.katniss",            # Assistant / search overlay
+    "android",                               # the system app-chooser dialog
+    "com.google.android.tvrecommendations",  # recommendations service; can
+                                             # flash foreground on older ATV
+    "com.android.systemui",                  # transient system surfaces
+    # Bell's Fibe TV app, and the HOME target on a Bell Streamer — so it is
+    # both a normal foreground app and the device's home screen. Listed
+    # because _looks_like_a_launcher can't catch it: nothing in the name says
+    # "launcher", so without this a Bell report would hand the tester a
+    # pasteable SCREENSAVER_PACKAGES line containing their own home screen.
+    "com.quickplay.android.bellmediaplayer",
+    # com.android.vending (Play Store) is deliberately NOT here: it appearing
+    # right after a launch attempt means the configured SMARTTUBE_PACKAGE is
+    # not installed under that id (the store listing opened instead) — its
+    # presence in the events log is a diagnostic signal, not noise.
+})
+
+
+# pyytlounge sends the Lounge token as a URL QUERY PARAMETER on every bind
+# call, and aiohttp's ClientResponseError stringifies as "... url=<the url>".
+# So any Lounge failure we log with exc_info, or embed in a self-test report as
+# repr(exc), can carry a live token — one that grants control of the user's
+# YouTube playback. Session ids are the same class of problem.
+_SECRET_QS_RE = re.compile(
+    r"(?i)\b(loungeIdToken|SID|gsessionid|access_token|token)=[^&\s'\")]+"
+)
+# Secrets also appear in PROSE, without an equals sign, and that form is the
+# one that actually leaked: pyytlounge logs `"Refreshed auth, lounge id token
+# %s"` at INFO on every token refresh. A query-string-only pattern misses it
+# entirely — caught 2026-08-15 by reading a real dev-server log rather than by
+# any test, because every test fed it URL-shaped input.
+#
+# Deliberately greedy about what follows the label: tokens, screen ids and
+# session ids are all long opaque strings, so anything 16+ chars of token
+# alphabet after one of these labels is redacted. Over-redacting a log line is
+# free; under-redacting one puts playback control in a paste.
+_SECRET_PROSE_RE = re.compile(
+    r"(?i)\b("
+    # "lounge id token X" AND "lounge id X" — pyytlounge logs both, and the
+    # value is the same secret either way.
+    r"lounge[ _]?id(?:[ _]?token)?|loungeIdToken|"
+    r"refresh[ _]?token|access[ _]?token|auth[ _]?token|"
+    r"screen[ _]?id|session[ _]?id"
+    r")(\s*[:=]?\s+)([A-Za-z0-9_\-]{16,})"
+)
+
+
+def _redact_secrets(text: str) -> str:
+    """Strip credentials out of arbitrary text.
+
+    Two shapes, because secrets reach us in two: as query parameters on a
+    request URL (aiohttp errors stringify the whole URL), and as bare values
+    in a log message following a human label.
+    """
+    text = _SECRET_QS_RE.sub(r"\1=<redacted>", text)
+    return _SECRET_PROSE_RE.sub(r"\1\2<redacted>", text)
+
+
+class _RedactingFormatter(logging.Formatter):
+    """Scrub secrets from the FULLY RENDERED log line, tracebacks included.
+
+    Redacting at format time rather than in a Filter is deliberate, and both
+    reasons are load-bearing:
+
+    1. A Filter runs before formatting, so it can never touch a rendered
+       traceback — which is exactly where a leaked URL shows up.
+    2. Inspecting `record.args` / `exc.args` for strings misses the case that
+       matters most: aiohttp's ClientResponseError keeps a RequestInfo OBJECT
+       in args[0], and the URL only becomes text when the formatter calls its
+       __str__. A string-typed check sails straight past it.
+
+    Wraps whatever formatter the handler already had, so log layout is
+    unchanged.
+    """
+
+    def __init__(self, inner: logging.Formatter):
+        super().__init__()
+        self._inner = inner
+
+    def format(self, record: logging.LogRecord) -> str:
+        try:
+            return _redact_secrets(self._inner.format(record))
+        except Exception:
+            return self._inner.format(record)  # logging must never raise
+
+
+def _install_log_redaction() -> None:
+    """Wrap every root handler's formatter. Called after basicConfig, which is
+    what installs the handler in the first place — attaching earlier would
+    silently wrap nothing."""
+    for handler in logging.getLogger().handlers:
+        current = handler.formatter or logging.Formatter()
+        if not isinstance(current, _RedactingFormatter):
+            handler.setFormatter(_RedactingFormatter(current))
+
+
+_install_log_redaction()
+
+
+def _record_device_event(kind: str, value) -> None:
+    """Append one observed device event. Never raises: diagnostics must not be
+    able to break playback."""
+    try:
+        _device_log.append({
+            "t": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "kind": kind,
+            "value": str(value),
+        })
+    except Exception:
+        # Non-fatal by design — diagnostics must never break playback — but
+        # logged, because a silent except here once hid a NameError and made
+        # the report claim the device had produced no events at all.
+        log.warning("diagnostics: could not record %s event", kind, exc_info=True)
+
+
+def _diagnostic_host() -> Optional[str]:
+    """The TV's address, unmasked.
+
+    Beta builds report the real address: it is genuinely useful when diagnosing
+    an unfamiliar device (wrong subnet, wrong device, stale pairing), and these
+    reports go to someone the operator chose to share them with. Credentials are
+    still never included — the certificate, its key and the Lounge token stay
+    out, and that part is not negotiable.
+
+    If a report is pasted somewhere public, note this is an RFC1918 address and
+    is meaningless outside the network it belongs to.
+    """
+    return state.host
+
 
 YT_REGEX = re.compile(r"(?:v=|youtu\.be/|/shorts/|/embed/|/live/)([A-Za-z0-9_-]{11})")
 ID_REGEX = re.compile(r"^[A-Za-z0-9_-]{11}$")
@@ -261,10 +539,13 @@ def _apply_reset_if_requested() -> None:
         return
 
     if RESET_MARKER.exists():
-        log.warning(
-            "RESET_PAIRING is still set but the reset has already run. "
-            "Remove RESET_PAIRING from the container's environment and "
-            "restart. Ignoring so your new pairing survives."
+        # Deliberately not nagging: leaving the flag set is a supported
+        # end state, and the marker is what makes it safe. Telling people to
+        # go and undo it invents work this code exists to avoid.
+        log.info(
+            "RESET_PAIRING is set but the reset has already run; ignoring so "
+            "your pairing survives. Nothing to do — clear the flag only if "
+            "you want to arm another reset later."
         )
         return
 
@@ -435,6 +716,7 @@ def _on_current_app_changed(new_app: str) -> None:
     suppress_lounge flag based on whether SmartTube is foreground."""
     prev = state.last_current_app
     state.last_current_app = new_app
+    _record_device_event("current_app", new_app)
     was_suppressed = state.suppress_lounge
     state.suppress_lounge = (new_app != SMARTTUBE_PACKAGE)
     queue_controller.on_current_app_changed(prev, new_app)
@@ -456,6 +738,13 @@ def _on_current_app_changed(new_app: str) -> None:
 def _on_is_available_changed(available: bool) -> None:
     """Connection up/down. Push as a snapshot event so clients can render a
     'TV unreachable' banner."""
+    global _remote_reconnects
+    if available:
+        _remote_reconnects += 1
+    # Logged because a device that drops off the LAN in standby is the most
+    # likely Shield-in-sleep behaviour, and without it a failed wake looks
+    # identical to a command that was never delivered.
+    _record_device_event("remote_available", available)
     event_type = "connection_restored" if available else "connection_lost"
     asyncio.create_task(broadcaster.publish(event_type, queue_controller.snapshot()))
 
@@ -470,8 +759,25 @@ def _on_is_on_changed(is_on: bool) -> None:
 
 
 async def _handle_is_on_change(is_on: bool) -> None:
-    await queue_controller.update_tv_on(is_on)
+    _record_device_event("is_on", is_on)
+    # Gate the destructive branch on a real transition. androidtvremote2
+    # re-emits the current power state whenever it reconnects, and
+    # tv_off_reset() clears the queue — so a connection blip while the TV was
+    # off used to throw away whatever the user had just queued.
+    changed = await queue_controller.update_tv_on(is_on)
     if not is_on:
+        if not changed:
+            # A reconnect re-emitting the power state we already knew about,
+            # not the device turning off again. Change NOTHING. This has to
+            # be its own branch rather than a conjunct on the line below:
+            # gating only the destructive half left the `else` — whose whole
+            # premise is "TV came back on" — reachable while the device is
+            # off, where it re-read the library's stale current_app and undid
+            # both effects of the real off-transition. suppress_lounge
+            # flipping back to False there is the dangerous one: it lets the
+            # dormant-player cache (invariant 4) render as "currently
+            # playing" on a TV that is off.
+            return
         # Invalidate the cached foreground app — once the TV's off, we
         # don't know what it'll boot into next. Without this, the post-wake
         # `current_app` callback (TV typically lands at the launcher, not
@@ -492,7 +798,16 @@ async def _handle_is_on_change(is_on: bool) -> None:
         # every real Lounge event so the UI shows no playing state
         # even though SmartTube is genuinely playing.
         current = _get_current_app()
-        if current is not None:
+        # `if current`, not `is not None`: androidtvremote2 initialises
+        # current_app to "" and only ever fills it from an IME key-inject
+        # message, so "" means "no reading", not "some app that isn't
+        # SmartTube". Treating it as the latter pinned suppress_lounge True —
+        # permanently on a device where IME is never negotiated, which blanks
+        # every Lounge event and takes auto-advance down with it, and
+        # transiently on ALL hardware, because each reconnect builds a fresh
+        # protocol object with current_app back to "" and re-emits is_on.
+        # Leaving the flag alone beats guessing.
+        if current:
             state.last_current_app = current
             state.suppress_lounge = (current != SMARTTUBE_PACKAGE)
 
@@ -539,18 +854,6 @@ async def _reconnect_remote() -> bool:
     return await _attempt_startup_connect(state.host)
 
 
-async def _wait_for_smarttube_foreground(timeout: float, poll: float) -> bool:
-    """Poll until SmartTube is the foreground app, or until timeout. Used
-    after a market://launch send so we know SmartTube is actually ready
-    to receive the YouTube deep link before we fire it."""
-    deadline = asyncio.get_running_loop().time() + timeout
-    while asyncio.get_running_loop().time() < deadline:
-        if _get_current_app() == SMARTTUBE_PACKAGE:
-            return True
-        await asyncio.sleep(poll)
-    return False
-
-
 async def _wait_for_lounge_connected(timeout: float, poll: float) -> bool:
     """Poll until our Lounge sender session is connected, or until timeout.
     Lounge typically (re)connects shortly after SmartTube foregrounds, so
@@ -575,10 +878,18 @@ async def _wait_for_lounge_connected(timeout: float, poll: float) -> bool:
 def _wire_callbacks(remote: AndroidTVRemote) -> None:
     """Register kill-switch + availability + power callbacks on a (re)connected remote."""
     state.last_current_app = _get_current_app()
-    state.suppress_lounge = (
-        state.last_current_app is not None
+    # Same "" trap as _handle_is_on_change: an unread current_app must not
+    # read as "not SmartTube".
+    state.suppress_lounge = bool(
+        state.last_current_app
         and state.last_current_app != SMARTTUBE_PACKAGE
     )
+    # Seed the diagnostics log with what the device looks like right now. The
+    # buffer otherwise only records *changes*, so a tester who opens the report
+    # before touching anything would see an empty list and reasonably conclude
+    # the feature was broken.
+    _record_device_event("connected", "is_on=%s current_app=%s" % (
+        getattr(remote, "is_on", None), state.last_current_app))
     remote.add_current_app_updated_callback(_on_current_app_changed)
     remote.add_is_available_updated_callback(_on_is_available_changed)
     remote.add_is_on_updated_callback(_on_is_on_changed)
@@ -617,8 +928,8 @@ async def _lounge_play() -> bool:
        paused then hit BACK on the remote) → fall through to tv_play()
        for the current item. tv_play's "foreground but idle" branch
        sends the deep link Intent and relaunches the player cleanly.
-    3. SmartTube NOT foreground → tv_play() runs the full launch
-       sequence (market://launch + deep link).
+    3. SmartTube NOT foreground → tv_play() sends the deep-link Intent,
+       which foregrounds SmartTube and starts playback in one step.
     4. Last resort → MEDIA_PLAY keycode.
 
     Note: we can't tell "player torn down" from Lounge observation
@@ -689,6 +1000,21 @@ async def _on_lounge_event(event_type: str, observation: LoungeObservation) -> N
     sticky (updated only by current_app callback transitions) so routine
     Lounge events while SmartTube is genuinely foreground are never
     suppressed by transient current_app reads."""
+    # Capture session-level transitions in the device log BEFORE the
+    # suppression gate — the report needs the raw truth. Connect/disconnect
+    # timestamps separate SmartTube's own behaviour (its Lounge connection
+    # self-launching the app, waking Shields at night — upstream #3170) from
+    # anything we sent; the FINISHED line carries position/duration so the
+    # known ~40-minute mid-video process-kill on Shield (upstream #5951) has a
+    # recognisable signature instead of looking like our timer misfiring.
+    if event_type in ("lounge.connected", "lounge.disconnected"):
+        _record_device_event(event_type, state.suppress_lounge and "(suppressed)" or "")
+    elif event_type == "lounge.finished":
+        _record_device_event(
+            "lounge_finished",
+            f"{observation.video_id}@{observation.current_time}/{observation.duration}",
+        )
+
     if state.suppress_lounge:
         await queue_controller.on_lounge_event(
             event_type, LoungeObservation().to_dict(),
@@ -788,6 +1114,20 @@ async def _start_lounge_monitor() -> None:
         #       session open). The stuck-ct detector forcing
         #       reconnects under this condition would yank the user
         #       out of whatever they're doing on the TV.
+        # SAFETY COUPLING, easy to break by accident: `suppress_lounge` is
+        # written ONLY from current_app callbacks, which require a remote. With
+        # no remote it is permanently False, so this gate's third clause is
+        # stuck open — and refreshing while SmartTube is backgrounded
+        # auto-foregrounds it (the comment above explains why that is
+        # actively harmful). What saves us today is the FIRST clause:
+        # `_require_paired()` 503s /api/queue when state.remote is None, so
+        # `current` can never be set without a remote and the gate stays shut.
+        #
+        # Anything that lets the queue run without a paired remote — a
+        # Lounge-only mode, say — must disable this refresh loop outright, or
+        # it will yank the user out of whatever app they are in every 3
+        # seconds, forever. Pinned by
+        # test_the_refresh_gate_depends_on_pairing_to_stay_shut.
         should_refresh=lambda: (
             queue_controller.state.current is not None
             and not queue_controller.state.paused
@@ -863,12 +1203,29 @@ async def tv_play(video_id: str, start_s: Optional[int] = None) -> None:
         was_off = False
 
     if was_off:
-        log.info("TV reports off — sending POWER and waiting for boot")
+        log.info("TV reports off — sending %s and waiting for boot",
+                 WAKE_KEYCODE)
         await queue_controller.set_waking(True)
         try:
             loop = asyncio.get_running_loop()
             wake_started_at = loop.time()
-            state.remote.send_key_command("POWER")
+            try:
+                state.remote.send_key_command(WAKE_KEYCODE)
+                _record_device_event("wake_sent", WAKE_KEYCODE)
+            except Exception:
+                # Never fatal, and note the retry below has always been
+                # wrapped this way — this is the same guard on the first
+                # send, which was the one that could take the whole add
+                # down with it. An exception here (unknown keycode name,
+                # ConnectionClosed on a dead socket) used to unwind past
+                # both send_launch_app_command sites, so the user got no
+                # wake AND no deep link while the UI showed a now-playing
+                # card for a video that never started. An unsendable wake
+                # key is just a wake that had no effect: log it, and let
+                # the launch below try anyway.
+                log.warning("Wake key %s could not be sent", WAKE_KEYCODE,
+                            exc_info=True)
+                _record_device_event("wake_send_error", WAKE_KEYCODE)
             came_on = await _wait_for_tv_on(WAKE_TIMEOUT, WAKE_POLL)
             if not came_on:
                 # First POWER didn't take effect. Probable cause: the
@@ -879,19 +1236,20 @@ async def tv_play(video_id: str, start_s: Optional[int] = None) -> None:
                 # against a new connection wakes the TV within 1
                 # second, while the long-running container's connection
                 # silently drops the same command. Reconnect and retry
-                # POWER once before giving up.
+                # the wake key once before giving up.
                 log.warning(
                     "TV did not report on within %.0fs — connection likely "
-                    "stale; reconnecting remote and retrying POWER",
+                    "stale; reconnecting remote and retrying %s",
                     WAKE_TIMEOUT,
+                    WAKE_KEYCODE,
                 )
                 if await _reconnect_remote():
                     if state.remote is not None and not bool(state.remote.is_on):
                         try:
-                            state.remote.send_key_command("POWER")
+                            state.remote.send_key_command(WAKE_KEYCODE)
                         except Exception:
-                            log.warning("Retry POWER after reconnect failed",
-                                        exc_info=True)
+                            log.warning("Retry %s after reconnect failed",
+                                        WAKE_KEYCODE, exc_info=True)
                         came_on = await _wait_for_tv_on(WAKE_TIMEOUT, WAKE_POLL)
                     else:
                         # Reconnect happened to land while TV was already
@@ -899,10 +1257,19 @@ async def tv_play(video_id: str, start_s: Optional[int] = None) -> None:
                         # not visibly via the dead connection).
                         came_on = bool(state.remote and state.remote.is_on)
                 if not came_on:
+                    # Two attempts on a fresh connection both went nowhere, so
+                    # this is very unlikely to be our side. The usual cause is
+                    # the device ignoring this keycode while asleep.
                     log.warning(
-                        "TV still not reporting on after reconnect + retry; "
-                        "trying launch anyway"
+                        "TV still not reporting on after reconnect + retry "
+                        "with %s; trying launch anyway. If this device never "
+                        "wakes, it may ignore that keycode while asleep — try "
+                        "WAKE_KEYCODE=WAKEUP or WAKE_KEYCODE=TV_POWER. On "
+                        "NVIDIA Shield also check Settings > Remotes & "
+                        "accessories > Simplified wake buttons.",
+                        WAKE_KEYCODE,
                     )
+                    _record_device_event("wake_failed", WAKE_KEYCODE)
             # Enforce a minimum total wake time — is_on may flip true (display
             # backlight on) before Android is ready for launch intents. On
             # Quick Resume TVs is_on flips ~instantly even while the OS is
@@ -922,15 +1289,27 @@ async def tv_play(video_id: str, start_s: Optional[int] = None) -> None:
     current_app = _get_current_app()
 
     # Dismiss the screensaver if it's foreground. Verified empirically:
-    # dreamx silently swallows send_launch_app_command intents — both
-    # market://launch and vnd.youtube.launch:// — leaving us stuck. Any
+    # dreamx silently swallows send_launch_app_command intents of every
+    # kind, including the vnd.youtube.launch:// one we rely on — leaving us
+    # stuck with no error to see. Any
     # navigation key dismisses the screensaver and returns the TV to
     # whatever app was foreground before it kicked in (typically SmartTube
     # or the launcher), and from there our normal launch flow works.
     if current_app in SCREENSAVER_PACKAGES:
         log.info("Dismissing screensaver (%s) via %s",
                  current_app, SCREENSAVER_DISMISS_KEY)
-        state.remote.send_key_command(SCREENSAVER_DISMISS_KEY)
+        try:
+            state.remote.send_key_command(SCREENSAVER_DISMISS_KEY)
+        except Exception:
+            # Same rule as the wake key: an undismissed screensaver is a
+            # launch that MIGHT fail, but an exception here is a launch that
+            # never happens at all — it would unwind past both deep-link
+            # sites and take out every add on the install. This is the
+            # production path for most adds, so it is the worst place to
+            # raise.
+            log.warning("Screensaver dismiss key %s could not be sent",
+                        SCREENSAVER_DISMISS_KEY, exc_info=True)
+            _record_device_event("dismiss_send_error", SCREENSAVER_DISMISS_KEY)
         # Poll for the dismiss to actually take effect, capped at
         # SCREENSAVER_DISMISS_DELAY. Polling lets us proceed early when
         # the dismiss completes (typically ~150ms via HOME) instead of
@@ -959,8 +1338,9 @@ async def tv_play(video_id: str, start_s: Optional[int] = None) -> None:
     # exactly this case). The deep link is the right primitive here:
     # Android resolves `vnd.youtube.launch://` to SmartTube's Intent
     # handler, which launches SmartTube AND kicks playback fresh in
-    # one step. No market://launch needed — the Intent itself
-    # foregrounds the app.
+    # one step. Do NOT add a separate app-launch command before this:
+    # the Intent already foregrounds SmartTube, and sending both is the
+    # double-play regression (invariant 1).
     #
     # When SmartTube IS already foreground (had_to_foreground=False),
     # use Lounge primitives for a smooth swap (no PlaybackActivity
@@ -1190,15 +1570,21 @@ async def lifespan(_app: FastAPI):
 
     cfg = load_config()
     host = cfg.get("host")
-    startup_retry_task: Optional[asyncio.Task] = None
     if host and CERT_FILE.exists() and KEY_FILE.exists():
+        # Remember the configured address even if we cannot reach it. Without
+        # this the UI can only say "can't reach your TV" without naming which
+        # address it is failing on — and that address IS the answer when a
+        # DHCP lease has moved the device. _attempt_startup_connect sets it
+        # too, but only on success.
+        state.host = host
         connected = await _attempt_startup_connect(host)
         if not connected:
             # If the TV was unreachable at startup (typical after a power
             # outage where the NAS recovers before the TV), schedule a
             # background retry. Without this we'd be stuck in a fake
             # "NOT CONFIGURED" state until someone restarts the container.
-            startup_retry_task = asyncio.create_task(
+            global _startup_retry_task
+            _startup_retry_task = asyncio.create_task(
                 _retry_startup_connect_until_success(host)
             )
     else:
@@ -1225,10 +1611,20 @@ async def lifespan(_app: FastAPI):
         watchdog_task.cancel()
         with contextlib.suppress(BaseException):
             await watchdog_task
-        if startup_retry_task is not None and not startup_retry_task.done():
-            startup_retry_task.cancel()
-            with contextlib.suppress(BaseException):
-                await startup_retry_task
+        # Cancel the GLOBALS, not the startup-time locals. /api/tv/address
+        # re-arms the retry loop into _startup_retry_task after a failed
+        # address change, so the local captured at boot can be a task that
+        # was already replaced — or None, if the TV was reachable at boot and
+        # the address was changed later. The residue is a retry still inside
+        # _attempt_startup_connect during teardown, assigning state.remote
+        # after disconnect() ran and leaking a live TLS socket to exit.
+        # _self_test_task was never cancelled by anything at all: a variable
+        # whose only purpose is to be cancellable.
+        for task in (_startup_retry_task, _self_test_task):
+            if task is not None and not task.done():
+                task.cancel()
+                with contextlib.suppress(BaseException):
+                    await task
         await _stop_lounge_monitor()
         await queue_controller.shutdown()
         if state.remote:
@@ -1295,6 +1691,11 @@ async def csrf_origin_check(request: Request, call_next):
     changes by themselves.
     """
     if request.method not in ("GET", "HEAD", "OPTIONS"):
+        # Tally guest activity so a self-test can say whether someone used the
+        # page mid-run. Its own start call doesn't count as interference.
+        if request.url.path != "/api/selftest":
+            global _client_write_count
+            _client_write_count += 1
         if not _host_header_is_trusted(request.url.hostname):
             log.warning(
                 "blocked %s %s with untrusted Host=%r — if you reach this "
@@ -1346,25 +1747,125 @@ async def status():
             current_app = state.remote.current_app
         except Exception:
             current_app = None
+    # `configured` answers "is there a live connection", which the UI was
+    # rendering as "have you set this up" — so a paired install with an
+    # unreachable TV showed NOT CONFIGURED, offered a pairing form that can
+    # only 409, and advised deleting a perfectly good certificate. Report the
+    # credentials separately so the two states can be told apart.
+    credentials_present = _is_tv_paired()
     lounge_paired = LOUNGE_AUTH_FILE.exists()
     lounge_connected = bool(state.lounge_monitor and state.lounge_monitor.is_connected)
     return {
         "version": VERSION,
         "configured": paired,
+        # True when cert/key/config are all on disk. `configured && not
+        # credentials_present` is impossible; the interesting case is the
+        # reverse — paired, but we cannot reach the device right now.
+        "credentials_present": credentials_present,
         "host": state.host,
         "pairing_in_progress": state.pairing_in_progress,
         "tv_on": is_on,
         "current_app": current_app,
         "lounge_paired": lounge_paired,
         "lounge_connected": lounge_connected,
-        # null when no volume backend is configured; the string name of
-        # the backend (currently only "denon") when one is active. The
-        # frontend uses this to decide whether to render volume buttons.
-        # Volume goes over HDMI-CEC through the paired remote, so it's
+        # True whenever a TV is paired; the frontend uses it to decide
+        # whether to render the volume buttons. The four per-brand AVR
+        # backends this once described were deleted when CEC was proven —
+        # volume goes over the paired remote, so it's
         # available whenever the TV is. Whether the device actually honours it
         # depends on its CEC volume setting, which we can't read without ADB.
         "volume_available": state.remote is not None,
     }
+
+
+class TvAddressReq(BaseModel):
+    host: str
+
+
+@app.post("/api/tv/address")
+async def tv_address(req: TvAddressReq):
+    """Point an existing pairing at a new address, without re-pairing.
+
+    A DHCP lease change used to take the service down with no way back from
+    the UI: the certificate is still valid — it is bound to the device, not
+    its address — but `/api/pair/start` refuses because the credential files
+    exist, so recovering meant editing config.json inside the container.
+
+    Deliberately NOT treated like the removed `/api/reset` and
+    `/api/lounge/unpair` endpoints, which were dropped as one-shot LAN-side
+    denials of service. The difference is reversibility: those destroyed
+    credentials permanently, whereas a wrong address here is fixed by
+    entering the right one — and the UI keeps this form on screen precisely
+    when the device is unreachable, so a mistake is always recoverable
+    through the same control that caused it.
+    """
+    if not _is_tv_paired():
+        raise HTTPException(
+            409, "Not paired yet — use the pairing flow instead.",
+        )
+    host = (req.host or "").strip()
+    if not host:
+        raise HTTPException(400, "Enter the TV's address.")
+    try:
+        ipaddress.ip_address(host)
+    except ValueError:
+        # Hostnames are accepted too; only obvious junk is refused. Anything
+        # that resolves is the user's business, and a wrong value here is
+        # recoverable by entering a right one.
+        if any(c in host for c in " \t/\\?#") or len(host) > 253:
+            raise HTTPException(400, "That doesn't look like an address.")
+
+    global _startup_retry_task
+    if _tv_address_lock.locked():
+        raise HTTPException(409, "Another address change is already running.")
+
+    async with _tv_address_lock:
+        previous = state.host
+        state.host = host
+        save_config({"host": host})
+        log.info("TV address changed from %s to %s; reconnecting", previous, host)
+        _record_device_event("tv_address_changed", f"{previous} -> {host}")
+
+        # Stop the old retry loop before tearing anything down — otherwise it
+        # races the reconnect below and can revive the previous address.
+        if _startup_retry_task is not None and not _startup_retry_task.done():
+            _startup_retry_task.cancel()
+            _startup_retry_task = None
+
+        # Drop the existing connection and rebuild against the new address.
+        # The certificate is reused untouched.
+        try:
+            connected = await asyncio.wait_for(
+                _reconnect_remote(), timeout=TV_ADDRESS_CONNECT_TIMEOUT,
+            )
+        except asyncio.TimeoutError:
+            # androidtvremote2 puts no overall timeout on its connect, so a
+            # hostname that resolves slowly would hang this request open.
+            log.warning("Connect to %s timed out after %.0fs",
+                        host, TV_ADDRESS_CONNECT_TIMEOUT)
+            connected = False
+
+        if connected:
+            return {"ok": True, "host": host, "connected": True}
+
+        # ALWAYS leave something retrying. _reconnect_remote has already
+        # nulled state.remote and cancelled the library's own reconnect task,
+        # so without this a wrong address means nothing is trying at all and
+        # the only recovery is restarting the container — which is exactly
+        # the one-shot denial of service this endpoint is supposed not to be.
+        _startup_retry_task = asyncio.create_task(
+            _retry_startup_connect_until_success(host)
+        )
+        return {
+            "ok": True,
+            "host": host,
+            "connected": False,
+            "detail": (
+                "Address saved, but the TV didn't answer there. It'll keep "
+                "retrying in the background, and you can enter a different "
+                "address any time — your pairing is untouched."
+            ),
+        }
 
 
 @app.post("/api/pair/start")
@@ -1501,7 +2002,8 @@ class LoungePairReq(BaseModel):
 @app.post("/api/lounge/pair")
 async def lounge_pair(req: LoungePairReq):
     """Pair with SmartTube via a 12-digit YouTube Lounge code (shown by
-    SmartTube's "Link with TV code" screen). Persists the resulting auth
+    SmartTube's Settings -> Remote control screen; older builds called it
+    "Link with TV code"). Persists the resulting auth
     token to /data/lounge.json and starts the Lounge monitor.
 
     Refuses once a token exists, mirroring the pair_start guard: otherwise any
@@ -1530,9 +2032,2485 @@ async def lounge_pair(req: LoungePairReq):
 
 
 # ── queue endpoints ──────────────────────────────────────────────────────────
+def _reject_during_self_test() -> None:
+    """Refuse play requests while a self-test is driving the TV.
+
+    Without this the two send play signals concurrently — the double-play
+    regression this project has fixed more times than any other (invariant 1).
+    QueueController._send_to_tv cancels only tasks it created, so it cannot
+    see the self-test; the guard has to live here.
+    """
+    if _self_test_active:
+        raise HTTPException(
+            409,
+            "A device self-test is running — it will finish in about "
+            f"{int(_self_test['eta_s'])}s. Try again then.",
+        )
+
+
 def _require_paired() -> None:
     if not state.remote or state.pairing_in_progress:
         raise HTTPException(503, "not paired — visit the web UI to pair")
+
+
+def _negotiated_features() -> Optional[list]:
+    """Which protocol features the device and library agreed on.
+
+    Reaches for a private attribute because the library exposes no public
+    accessor; guarded so a library change degrades to None rather than
+    breaking the report.
+    """
+    try:
+        proto = getattr(state.remote, "_remote_message_protocol", None)
+        active = getattr(proto, "_active_features", None)
+        if active is None:
+            return None
+        return {
+            "negotiated": sorted(
+                f.name for f in type(active) if f in active and f.name
+            ),
+            # The raw bitmask matters on its own: a missing KEY bit is the
+            # documented cause of "every keycode silently dead" (remedy is
+            # device-side: clear the Android TV Remote Service app's storage
+            # and re-pair), and a missing IME bit explains empty current_app.
+            "raw": int(active),
+        }
+    except Exception:
+        return None
+
+
+def _qc_safe(fn):
+    """Read from queue_controller if it exists yet.
+
+    It is assigned in the FastAPI lifespan, not at module level, so the NAME
+    is absent until startup runs — an `is not None` guard raises NameError
+    rather than helping. The diagnostics endpoint must never be the thing that
+    500s, since it is what someone reaches for when everything else is broken.
+    """
+    qc = globals().get("queue_controller")
+    if qc is None:
+        return None
+    try:
+        return fn(qc)
+    except Exception:
+        return None
+
+
+def _diagnostic_environment() -> dict:
+    """Build and config provenance.
+
+    Every question of the form "which version were you running / what are your
+    settings / how long had it been up" is a round trip, and all of it is
+    free to include. Env values are read from OUR OWN named constants, never
+    by walking os.environ — a NAS container's environment routinely holds
+    unrelated secrets.
+    """
+    libs = {}
+    for name in ("androidtvremote2", "pyytlounge", "httpx", "fastapi"):
+        try:
+            libs[name] = metadata_version(name)
+        except Exception:
+            libs[name] = "unknown"
+    return {
+        "version": VERSION,
+        "channel": CHANNEL,
+        # A separate fact from `channel`, and both matter: the channel says
+        # which source to read the report against, this says whether the
+        # operator turned the diagnostics on. They used to be conflated.
+        "self_test_enabled": SELF_TEST_ENABLED,
+        "booted_at": _BOOT_AT,
+        "uptime_s": round(time.monotonic() - _BOOT_MONO, 1),
+        "python": sys.version.split()[0],
+        "platform": f"{platform.system()}/{platform.machine()}",
+        "libs": libs,
+        # The constants actually in force, so observed timings can be judged
+        # without the reader looking any of them up.
+        "settings": {
+            "smarttube_package": SMARTTUBE_PACKAGE,
+            "screensaver_packages": sorted(SCREENSAVER_PACKAGES),
+            "screensaver_dismiss_key": SCREENSAVER_DISMISS_KEY,
+            "screensaver_dismiss_delay": SCREENSAVER_DISMISS_DELAY,
+            "idle_keycode": IDLE_KEYCODE,
+            "wake_keycode": WAKE_KEYCODE,
+            "wake_delay": WAKE_DELAY,
+            "wake_timeout": WAKE_TIMEOUT,
+            "lounge_connect_timeout": LOUNGE_CONNECT_TIMEOUT,
+            "lounge_observation_timeout": LOUNGE_OBSERVATION_TIMEOUT,
+            "resume_verify_timeout": RESUME_VERIFY_TIMEOUT,
+            "metadata_timeout": METADATA_TIMEOUT_S,
+        },
+    }
+
+
+def _diagnostic_lounge() -> dict:
+    """Everything about the Lounge session EXCEPT anything that could control it.
+
+    Never include: lounge_id_token, refresh_token, screen_id, _sid, _gsession,
+    the serialised auth blob, or any repr of the YtLoungeApi object — its
+    __repr__ prints the token and both session ids. A leaked token grants
+    control of the tester's YouTube playback, and this document gets pasted
+    into a chat window.
+
+    `paired` and `connected` are separate answers: paired-but-not-connected
+    means an expired token or SmartTube not running, and those need different
+    advice. Token AGE is included (file mtime only, never contents) because
+    Lounge tokens expire in roughly two weeks.
+    """
+    out = {"paired": _is_lounge_paired(), "connected": False}
+    mon = state.lounge_monitor
+    if mon is None:
+        out["monitor_running"] = False
+        return out
+    out["monitor_running"] = True
+    try:
+        out["connected"] = bool(mon.is_connected)
+    except Exception:
+        pass
+    try:
+        obs = mon.observation
+        out["observation"] = {
+            "available": obs.available,
+            "video_id": obs.video_id,
+            "current_time": obs.current_time,
+            # The field the near-end rule depends on. Its absence means
+            # auto-advance can only ever run off the scraped duration.
+            "duration": obs.duration,
+            "state": obs.state,
+        }
+    except Exception:
+        pass
+    try:
+        api = getattr(mon, "_api", None)
+        if api is not None:
+            # Private attrs on purpose: the public screen_name /
+            # screen_device_name properties raise when not linked.
+            out["screen_name"] = getattr(api, "_screen_name", None)
+            info = getattr(api, "_device_info", None)
+            if isinstance(info, dict):
+                out["receiver"] = {
+                    k: info.get(k)
+                    for k in ("brand", "model", "deviceType", "clientName")
+                    if info.get(k)
+                }
+    except Exception:
+        pass
+    try:
+        if LOUNGE_AUTH_FILE.exists():
+            age = time.time() - LOUNGE_AUTH_FILE.stat().st_mtime
+            out["token_age_days"] = round(age / 86400.0, 1)
+    except Exception:
+        pass
+    return out
+
+
+def _diagnostic_warnings() -> list:
+    """Conditions that make a report misleading if not called out."""
+    out = []
+    if state.remote is not None and not _get_current_app():
+        out.append(
+            "current_app is empty. This is derived from the remote protocol's "
+            "IME feature; if IME is disabled on the device, foreground-app "
+            "detection stops working and the screensaver-dismiss, kill-switch "
+            "and SmartTube-foreground checks all silently degrade."
+        )
+    if state.remote is not None and not _is_lounge_paired():
+        out.append(
+            "Lounge is not paired, so playback position and end-of-video "
+            "detection fall back to a scraped-duration timer."
+        )
+    return out
+
+
+def _build_diagnostics() -> dict:
+    """One pasteable report for someone beta testing on hardware we don't own.
+
+    Beta builds only. Never contains credentials: no certificate, no private
+    key, no Lounge token. It does include the TV's local address, which is
+    useful for diagnosis — see _diagnostic_host.
+
+    Split out from the route so the self-test can embed the same payload
+    directly; keep it that way, so the two can never drift.
+    """
+    seen = [e["value"] for e in _device_log if e["kind"] == "current_app"]
+    suspects = sorted({
+        pkg for pkg in seen
+        if pkg
+        and pkg != SMARTTUBE_PACKAGE
+        and pkg not in SCREENSAVER_PACKAGES
+        and pkg not in KNOWN_BENIGN_PACKAGES
+    })
+
+    remote = state.remote
+    return {
+        "version": VERSION,
+        "channel": CHANNEL,
+        "tv_paired": _is_tv_paired(),
+        "lounge_paired": _is_lounge_paired(),
+        "lounge_connected": bool(
+            state.lounge_monitor and state.lounge_monitor.is_connected
+        ),
+        "host": _diagnostic_host(),
+        "device": {
+            # Free from the protocol, and firmware version is load-bearing:
+            # SHIELD Experience before 9.2 is documented to ignore the remote
+            # for ~60s after waking, which is longer than our whole wake
+            # sweep and would read as "this device refuses network wake".
+            "info": (
+                dict(getattr(remote, "device_info", None) or {}) if remote else None
+            ),
+            "is_on": getattr(remote, "is_on", None) if remote else None,
+            "current_app": _get_current_app(),
+            # The field that distinguished our two known devices: the Streamer
+            # reports max=0 and drives volume over CEC, the Chromecast reports
+            # a real range and attenuates its own output.
+            "volume_info": (
+                dict(getattr(remote, "volume_info", None) or {}) if remote else None
+            ),
+            # current_app is derived from the IME feature. If IME isn't in the
+            # negotiated set, foreground detection cannot work on this device
+            # and half the app degrades silently — worth knowing directly
+            # rather than inferring it from empty readings.
+            "protocol_features": _negotiated_features(),
+        },
+        "config": {
+            "smarttube_package": SMARTTUBE_PACKAGE,
+            "screensaver_packages": sorted(SCREENSAVER_PACKAGES),
+            "screensaver_dismiss_key": SCREENSAVER_DISMISS_KEY,
+            "idle_keycode": IDLE_KEYCODE,
+            "wake_keycode": WAKE_KEYCODE,
+            "wake_delay": WAKE_DELAY,
+        },
+        # Packages seen in the foreground that we neither expect nor know how to
+        # dismiss. On new hardware this is usually the screensaver, and usually
+        # the reason a video won't start.
+        "unrecognised_foreground_packages": suspects,
+        # current_app is not a first-class protocol property: androidtvremote2
+        # derives it from the IME feature. With IME disabled it is permanently
+        # empty, which silently degrades the kill-switch, suppress_lounge,
+        # screensaver detection and the SmartTube-foreground check all at once,
+        # with no error raised anywhere. Say so rather than reporting a device
+        # that merely looks idle.
+        "warnings": _diagnostic_warnings(),
+        "environment": _diagnostic_environment(),
+        "lounge": _diagnostic_lounge(),
+        # Our own view of the world. Probes read the Lounge observation
+        # directly, bypassing suppress_lounge — so a probe can report success
+        # while the tester's page showed nothing playing. That contradiction
+        # is unresolvable without seeing this.
+        "app_state": {
+            "suppress_lounge": state.suppress_lounge,
+            "last_current_app": state.last_current_app,
+            "pairing_in_progress": getattr(state, "pairing_in_progress", None),
+            "remote_reconnects": _remote_reconnects,
+            "has_pending_sends": _qc_safe(lambda qc: qc.has_pending_sends()),
+        },
+        "queue": _qc_safe(lambda qc: qc.snapshot()),
+        "events": list(_device_log),
+    }
+
+
+@app.get("/api/diagnostics")
+async def diagnostics():
+    """The passive report: reads state, sends nothing to the TV.
+
+    Gated on SELF_TEST despite being read-only, because "sends nothing" is
+    only half the question. What it RETURNS is this machine's LAN address,
+    the device model and firmware, how old the Lounge token is and the
+    recent event log — to any unauthenticated caller that can reach the
+    service, which is everyone on the network by design. That is a fine
+    trade on a beta build whose entire purpose is producing a report to
+    paste to us. It is not something to leave on for every stable install.
+    """
+    if not SELF_TEST_ENABLED:
+        raise HTTPException(503, "Diagnostics are disabled (SELF_TEST=0)")
+    return _build_diagnostics()
+
+
+
+# ── Beta: device self-test ───────────────────────────────────────────────────
+#
+# One button in the UI runs every probe below against the tester's real device
+# and produces a single pasteable report.
+#
+# Why this exists rather than "run the test suite on their machine": the pytest
+# suite cannot observe a TV, by design. Every test substitutes a fake for the
+# device (invariant 6), so results are a pure function of (source, env vars) —
+# identical on every machine on the same commit. The only signals that WOULD
+# vary are env vars, and they are inverted: the wake-keycode assertions go red
+# exactly when a Shield owner has applied the documented WAKE_KEYCODE fix. Real
+# sends to a real device are the only thing that answers a firmware question.
+#
+# Three rules a probe must never break:
+#
+#  1. NEVER put the device to sleep. The wake sweep exists precisely because
+#     some hardware ignores wake commands — so a probe that sleeps first can
+#     strand the device with no recovery but the physical remote, in exactly
+#     the case it was written to detect. Wake probes run ONLY when the device
+#     is already off and skip themselves otherwise.
+#  2. NEVER let a probe race tv_play. QueueController._send_to_tv cancels only
+#     tasks it created, so a second sender outside that guard reintroduces the
+#     double-play regression (invariant 1). Adds are refused with 409 for the
+#     duration of a run.
+#  3. NEVER stomp on someone's viewing. Several guests share this page and only
+#     one pressed the button — the disruptive probes skip themselves when the
+#     queue has a current item.
+
+# Off switch for the device diagnostics: the self-test button, which moves
+# the TV, and /api/diagnostics, which hands this machine's LAN address,
+# device model, firmware and recent event log to any caller on the network.
+#
+# DEFAULT OFF, on every branch. The `:beta` image turns it on by baking
+# SELF_TEST=1 in as a build arg (Dockerfile / publish.yml), which preserves
+# the reason beta wants it on — beta's install instructions are a `docker run`
+# line in the README rather than a compose file, so a tester who followed them
+# must get the button without passing a flag — while removing the way that
+# used to be expressed.
+#
+# It used to be a source default of "1" on beta and "0" here, with a note
+# asking whoever merged to keep them apart. That is not something a human can
+# be asked to remember: if beta changes the line and main never touches it,
+# the next beta -> main merge is CLEAN and main silently inherits "1". No
+# conflict, no diff to review, and a guest-pressable button that hijacks the
+# TV is suddenly on for every stable user. Verified in a scratch repo, not
+# assumed. Keep this line identical on both branches.
+SELF_TEST_ENABLED = os.environ.get("SELF_TEST", "0").strip().lower() not in (
+    "0", "false", "no", "off",
+)
+
+# Which BRANCH this build came from, for reports: "main" or "beta". A branch
+# name rather than a product word like "stable" on purpose — the field exists
+# so that whoever reads a pasted report knows which source to read it against,
+# and a branch name answers that directly instead of needing a mental hop.
+#
+# Reads the environment for the same reason SELF_TEST does, and that reason is
+# worth stating: this line is IDENTICAL on `main` and `beta`, and it has to be.
+#
+# The branch values used to be a source-level default that differed between
+# the branches, with a comment asking whoever merged to preserve it. Git cannot
+# help with that: if beta changes the line and main never touches it, the next
+# beta -> main merge is clean and main silently inherits beta's value —
+# switching a TV-hijacking button on for every stable user with no conflict to
+# notice. The `:beta` image bakes CHANNEL=beta and SELF_TEST=1 in as build
+# args instead (see Dockerfile / publish.yml), so the difference lives in the
+# artefact rather than in a line a merge can carry across.
+#
+# Operator overrides still win: docker's `-e` and compose `environment:` both
+# beat the image's ENV.
+CHANNEL = os.environ.get("CHANNEL", "").strip() or "main"
+
+# Two stable, long-lived public videos. The short one is 19 seconds
+# deliberately — a probe that hijacks someone's TV should hand it back fast.
+# The long one gives the setPlaylist swap and the pause/resume probes
+# something still playing to act on.
+SELF_TEST_VIDEO_SHORT = os.environ.get("SELF_TEST_VIDEO", "jNQXAC9IVRw")
+SELF_TEST_VIDEO_LONG = os.environ.get("SELF_TEST_VIDEO_LONG", "aqz-KE-bpKQ")
+# Used to tell OUR playback apart from somebody else's. The idle guard re-reads
+# live state, which is right — an add can land mid-run — but the probes start
+# their clip outside the queue, so without this the run reads its own video as
+# a stranger's viewing and stands down from the measurements it exists to take.
+_SELF_TEST_VIDEO_IDS = frozenset((SELF_TEST_VIDEO_SHORT, SELF_TEST_VIDEO_LONG))
+
+# Wake candidates tried in order. WAKE_KEYCODE first so a tester who already
+# set it gets their answer confirmed rather than buried behind three others.
+SELF_TEST_WAKE_CANDIDATES = ("POWER", "WAKEUP", "TV_POWER")
+
+# How long each probe waits for the device to do something. Named rather than
+# inline so tests can patch them down — and so the ETA the UI shows and the
+# waits the probes actually take can be read side by side and kept honest.
+# Intent-only wake. Tied to production's WAKE_TIMEOUT for the same reason the
+# key sweep is: a shorter window turns "woke slowly" into "never woke".
+SELF_TEST_WAKE_INTENT_TIMEOUT = WAKE_TIMEOUT
+# Per keycode candidate. Tied to production's WAKE_TIMEOUT rather than set
+# independently: a shorter probe window mis-attributes the win. A device that
+# wakes at ~25s would have POWER time out, then WAKEUP time out, then wake
+# during TV_POWER's wait — crediting TV_POWER for POWER's work, and telling
+# the tester to configure a keycode that did nothing. The sweep is slow, but
+# it only ever runs on a device that is already asleep, where nothing else
+# can run anyway.
+SELF_TEST_WAKE_KEY_TIMEOUT = WAKE_TIMEOUT
+SELF_TEST_PLAY_TIMEOUT = 20.0          # deep link -> foreground + Lounge sees it
+SELF_TEST_SWAP_TIMEOUT = 15.0          # setPlaylist -> Playing on the new video
+SELF_TEST_TRANSPORT_TIMEOUT = 5.0      # pause/resume -> state confirmed
+SELF_TEST_IDLE_TIMEOUT = 8.0           # IDLE_KEYCODE -> whatever it lands on
+# The short probe clip is ~19s. Waiting it out is the only way to observe an
+# end-of-video, which is the entire auto-advance mechanism.
+SELF_TEST_FINISH_TIMEOUT = 40.0
+# How long after a successful wake we sample for the device becoming USABLE.
+# is_on flips within ~1s on instant-on hardware while the OS is still deaf;
+# SHIELD Experience before 9.2 documents "remote stops responding for 60
+# seconds after wake from sleep" (NVIDIA 9.2 release notes). 75s covers that
+# window with margin, and the sampling breaks out on the first sign of life —
+# a healthy device costs seconds, and only the sleep run pays at all.
+SELF_TEST_READINESS_TIMEOUT = 75.0
+# The screensaver suspect protocol: how long an unrecognised foreground
+# package gets to prove a launch Intent landed before we conclude it was
+# swallowed (the defining screensaver behaviour, per the dreamx finding).
+SELF_TEST_SUSPECT_TIMEOUT = 8.0
+SELF_TEST_FOREGROUND_SAMPLES = 10      # current_app liveness sampling
+SELF_TEST_FOREGROUND_INTERVAL = 0.5
+SELF_TEST_POLL = 0.5                   # how often a probe re-reads device state
+# How often the finish probe ASKS Lounge for the position, as opposed to
+# re-reading the cached observation (SELF_TEST_POLL, above). Matches the 3s
+# REFRESH_INTERVAL that `_periodic_refresh_loop` uses in production, so the
+# probe measures the same cadence the queue would actually run on. Polling
+# every SELF_TEST_POLL instead would be ~80 requests across one 40s probe.
+SELF_TEST_NOW_PLAYING_INTERVAL = 3.0
+# Bound on /api/tv/address's reconnect. androidtvremote2 wraps
+# loop.create_connection with no overall timeout of its own, so without this a
+# slow-resolving hostname holds the request open indefinitely.
+TV_ADDRESS_CONNECT_TIMEOUT = 12.0
+
+
+class _ProbeSkip(Exception):
+    """Probe doesn't apply to the state the device is in. Not a failure."""
+
+
+class _ProbeUnmeasurable(Exception):
+    """Probe ran but the instrument it depends on is broken on this device.
+
+    Distinct from failure on purpose: "current_app is always empty so we
+    cannot tell whether SmartTube came to the foreground" is a fact about our
+    visibility, not about the device's behaviour, and reporting it as a
+    failure would send someone chasing a bug that isn't there.
+    """
+
+
+# The background reconnect loop. Owned by the lifespan, but /api/tv/address
+# needs to re-arm it: _reconnect_remote tears down state.remote AND cancels
+# androidtvremote2's own keep_reconnecting task before it knows the new
+# address is good, so a failed change would otherwise leave nothing retrying
+# at all — turning a typo into "restart the container".
+_startup_retry_task: Optional[asyncio.Task] = None
+# One address change at a time. Two interleaved calls can each tear down the
+# other's fresh connection.
+_tv_address_lock = asyncio.Lock()
+
+_self_test_active = False
+_self_test_task: Optional[asyncio.Task] = None
+# Counts state-changing HTTP requests (incremented in the CSRF middleware,
+# which already sees every mutating call). A run compares start and end: if a
+# guest added a video mid-run, the measurements are suspect and the report has
+# to say so rather than let someone chase a phantom device fault.
+_client_write_count = 0
+
+# Answers posted back from the UI after a run. Kept beside the run rather
+# than inside it so a late answer can still be folded into an existing report.
+_self_test_answers: dict = {}
+
+_self_test: dict = {
+    "status": "idle",       # idle | running | done | error
+    "run_id": None,
+    "started_at": None,
+    "eta_s": 0.0,
+    "probes": [],
+    "report": None,
+}
+
+
+async def _probe_snapshot(ctx: dict) -> dict:
+    """Everything the passive report already knows. Free, and it anchors the
+    rest: whoever reads the report needs the config in effect to interpret
+    every probe below it."""
+    return _build_diagnostics()
+
+
+async def _probe_snapshot_after(ctx: dict) -> dict:
+    """The same report again, after the run has moved the device.
+
+    Probe 1's copy of `_device_log` is frozen at run start, so every
+    foreground transition the run itself caused — the screensaver it dismissed,
+    the launcher it passed through, where IDLE_KEYCODE landed — was invisible
+    in the report. That log is what BETA-TESTING.md calls the most useful
+    thing in the whole thing, and on unfamiliar hardware the packages a run
+    surfaces are exactly the ones we don't yet know about.
+
+    Also re-runs the foreground liveness check when a wake probe woke the
+    device, since the first attempt correctly skipped on a sleeping TV.
+    """
+    if ctx.get("woke_by_intent") or ctx.get("woke_by_key") or ctx.get("woke"):
+        try:
+            ctx["foreground_recheck"] = await _probe_foreground_readability(ctx)
+        except (_ProbeSkip, _ProbeUnmeasurable) as exc:
+            ctx["foreground_recheck"] = {"skipped": str(exc)}
+    out = _build_diagnostics()
+    if "foreground_recheck" in ctx:
+        out["foreground_recheck_after_wake"] = ctx["foreground_recheck"]
+    return out
+
+
+async def _probe_foreground_readability(ctx: dict) -> dict:
+    """Can we read the foreground app at all, and does it ever change?
+
+    This runs early because it is the instrument six later probes measure
+    with. `current_app` is not a first-class protocol property — the library
+    derives it from the IME feature — so on a device with IME disabled it is
+    permanently empty and every foreground-dependent conclusion below becomes
+    meaningless. Better to know that up front than to report six device
+    failures that are really one blind spot of ours.
+    """
+    remote = state.remote
+    if remote is not None and not bool(getattr(remote, "is_on", False)):
+        # A sleeping device reports no foreground app, which is not the same
+        # finding as "IME is disabled and foreground detection is broken".
+        # Without this the TV-off run — the one BETA-TESTING.md explicitly
+        # asks for — reports usable=false and marks everything downstream
+        # unmeasurable, sending a tester to check a setting that is fine.
+        raise _ProbeSkip(
+            "device is off, so it reports no foreground app. This check needs "
+            "an awake device — it re-runs automatically if a wake probe "
+            "succeeds."
+        )
+
+    samples = []
+    for i in range(SELF_TEST_FOREGROUND_SAMPLES):
+        samples.append(_get_current_app() or "")
+        if i < SELF_TEST_FOREGROUND_SAMPLES - 1:
+            await asyncio.sleep(SELF_TEST_FOREGROUND_INTERVAL)
+    non_empty = [s for s in samples if s]
+    ctx["current_app_usable"] = bool(non_empty)
+    return {
+        "samples": samples,
+        "non_empty": len(non_empty),
+        "of": len(samples),
+        "distinct": sorted(set(non_empty)),
+        "usable": bool(non_empty),
+        "note": (
+            "usable=false means foreground detection is dead on this device; "
+            "the screensaver-dismiss, kill-switch and SmartTube-foreground "
+            "checks all silently degrade, and the probes below that rely on it "
+            "are reported unmeasurable rather than failed."
+        ),
+    }
+
+
+async def _probe_metadata(ctx: dict) -> dict:
+    """Can the container reach YouTube's watch page, and how slow is it?
+
+    An environment check, not a device one — but it belongs here because a
+    failed scrape is not cosmetic: the fallback hands the duration timer 600
+    seconds, so a 10-hour video gets skipped after 10 minutes. Without this
+    probe that shows up in a report as a mysterious auto-advance bug.
+    """
+    loop = asyncio.get_running_loop()
+    t0 = loop.time()
+    meta = await fetch_metadata(SELF_TEST_VIDEO_SHORT, client=state.http_client)
+    elapsed = loop.time() - t0
+    looks_like_fallback = (
+        meta.title == SELF_TEST_VIDEO_SHORT
+        and meta.channel == "unknown"
+        and meta.duration_s == 600
+    )
+    return {
+        "seconds": round(elapsed, 2),
+        "timeout_s": METADATA_TIMEOUT_S,
+        "title": meta.title,
+        "channel": meta.channel,
+        "duration_s": meta.duration_s,
+        "is_live": meta.is_live,
+        "scrape_failed": looks_like_fallback,
+        "note": (
+            "scrape_failed=true means the title/channel/duration trio is the "
+            "fallback, not real data — auto-advance would fire at 10:00 on "
+            "every video."
+        ),
+    }
+
+
+async def _await_playback_observed(vid: str, timeout: float) -> Optional[float]:
+    """Seconds until Lounge reports `vid` with a real position, or None.
+
+    `current_time` as well as `video_id`, because the Lounge cloud cache
+    reports a video id for a player that is not running (invariant 4).
+    """
+    mon = state.lounge_monitor
+    if mon is None:
+        return None
+    loop = asyncio.get_running_loop()
+    t0 = loop.time()
+    deadline = t0 + timeout
+    while loop.time() < deadline:
+        obs = mon.observation
+        if obs.video_id == vid and obs.current_time is not None:
+            return round(loop.time() - t0, 2)
+        await asyncio.sleep(SELF_TEST_POLL)
+    return None
+
+
+async def _sample_post_wake_readiness(ctx: dict) -> dict:
+    """After a wake: how long until the device is actually usable?
+
+    `is_on` is a liar on instant-on hardware — it flips within ~1s while the
+    OS is still booting, and on pre-9.2 SHIELD Experience the device then
+    ignores the network for up to 60s ("remote stops responding for 60 seconds
+    after wake from sleep", NVIDIA's own release notes). Our WAKE_DELAY=15
+    expires inside that window, so a launch sent on schedule is silently
+    swallowed and would previously have been misread as a deep-link failure.
+
+    Strictly read-only: samples current_app, sends nothing. Breaks out on the
+    first non-empty read, so a healthy device costs seconds.
+    """
+    loop = asyncio.get_running_loop()
+    t0 = loop.time()
+    readable_after = None
+    deadline = t0 + SELF_TEST_READINESS_TIMEOUT
+    while loop.time() < deadline:
+        if _get_current_app():
+            readable_after = round(loop.time() - t0, 2)
+            break
+        await asyncio.sleep(SELF_TEST_POLL)
+    if readable_after is not None:
+        ctx["current_app_usable"] = True
+    ctx["post_wake_readiness_s"] = readable_after
+    return {
+        "current_app_readable_after_wake_s": readable_after,
+        "readiness_sample_limit_s": SELF_TEST_READINESS_TIMEOUT,
+        "configured_wake_delay_s": WAKE_DELAY,
+        "wake_delay_sufficient": (
+            readable_after is not None and readable_after <= WAKE_DELAY
+        ),
+        "readiness_note": (
+            "How long after waking the device became usable, measured from "
+            "the wake, not from the keypress. null means it never did within "
+            "the window: either foreground detection is off on this device "
+            "(see the foreground probe) or it ignores the network for a while "
+            "after waking — documented on SHIELD Experience before 9.2."
+        ),
+    }
+
+
+async def _probe_launch_intent_wakes(ctx: dict) -> dict:
+    """THE question: does an app-launch Intent by itself wake a sleeping device?
+
+    If yes, hardware that ignores the POWER toggle while asleep can still be
+    woken with machinery we already have — no second protocol, no extra
+    pairing, no power button in the UI. Production already sends this Intent
+    after a failed wake ("trying launch anyway") but records nothing, so a
+    device that woke this way is indistinguishable in our logs from someone
+    picking up the physical remote. This probe is the controlled version:
+    no wake key first, so anything that happens is attributable to the Intent.
+
+    Runs only when the device is ALREADY off. Never sleeps it to create the
+    condition — see rule 1 above.
+    """
+    remote = state.remote
+    if remote is None:
+        raise _ProbeSkip("no remote connection")
+    if bool(getattr(remote, "is_on", False)):
+        raise _ProbeSkip(
+            "device is already on. To test waking, put the STREAMING DEVICE "
+            "itself to sleep (not just the TV picture \u2014 on a Shield or "
+            "similar box, the box is what sleeps), then run the self-test "
+            "again."
+        )
+    # Record BEFORE anything that can raise. This flag is what tells the
+    # verdict that waking was genuinely tested; if a queued video or a dropped
+    # connection made us skip out below, the verdict would otherwise tell the
+    # tester to redo the one run they did correctly.
+    ctx["device_was_off"] = True
+    # This probe sends a real play signal, so it lives under the same rule as
+    # the playback probes even though the device is asleep: if our queue owns
+    # something, tv_play is the one that should be waking this device.
+    _require_idle(ctx)
+
+    deep_link = (
+        f"vnd.youtube.launch://www.youtube.com/watch?v={SELF_TEST_VIDEO_SHORT}"
+    )
+    loop = asyncio.get_running_loop()
+    t0 = loop.time()
+    try:
+        remote.send_launch_app_command(deep_link)
+    except Exception as exc:
+        # A device asleep on WiFi may have dropped off the LAN entirely. That
+        # is a finding, not a crash, and it is a completely different fix from
+        # "the device ignores wake commands".
+        ctx["intent_send_error"] = repr(exc)
+        return {
+            "device_was_off": True,
+            "wake_key_sent": None,
+            "woke": False,
+            "send_error": _redact_secrets(repr(exc)),
+            "note": (
+                "The command could not even be sent \u2014 the device was "
+                "unreachable on the network while asleep. That is a different "
+                "problem from ignoring wake commands: check whether it is on "
+                "WiFi and whether its network stays up in standby."
+            ),
+        }
+    _record_device_event("selftest_launch_sent", "wake-probe (no wake key)")
+    # Whoever sends a play signal owns undoing it. Without this the idle probe
+    # skips and a device woken by this probe is left playing our clip — the
+    # same bug the Playwright run caught in _probe_deep_link_play.
+    ctx["launched"] = True
+    woke = await _wait_for_tv_on(SELF_TEST_WAKE_INTENT_TIMEOUT, SELF_TEST_POLL)
+    elapsed = loop.time() - t0
+    ctx["woke_by_intent"] = woke
+
+    # If the Intent woke it, it also STARTED this video — so adopt that as the
+    # run's playback rather than leaving it unclaimed. Without this the best
+    # possible outcome produced the least data: the play probe skips (rightly,
+    # it would be a second signal for the same video), `played` stayed unset,
+    # and swap and transport then skipped too.
+    observed_s = None
+    readiness = {}
+    if woke:
+        # Readiness first: it usually resolves in seconds and the playback
+        # wait below then measures a device we know is listening.
+        readiness = await _sample_post_wake_readiness(ctx)
+        observed_s = await _await_playback_observed(
+            SELF_TEST_VIDEO_SHORT, SELF_TEST_PLAY_TIMEOUT,
+        )
+        ctx["played"] = observed_s is not None
+
+    return {
+        **readiness,
+        "device_was_off": True,
+        "wake_key_sent": None,
+        "woke": woke,
+        "seconds": round(elapsed, 2) if woke else None,
+        "lounge_saw_it_after_s": observed_s,
+        "note": (
+            "woke=true would mean a launch Intent alone wakes this device — a "
+            "wake path needing no power command at all. woke=false is also a "
+            "real answer and sends the sweep below."
+        ),
+    }
+
+
+async def _probe_wake_keycodes(ctx: dict) -> dict:
+    """Which keycode, if any, wakes this device?
+
+    POWER is a toggle; hardware that ignores toggles while asleep cannot be
+    woken and raises nothing to say so. This sweeps the candidates and names
+    the winner, which is exactly the value a tester should then put in
+    WAKE_KEYCODE. Only runs if the device is still off after the Intent probe.
+    """
+    remote = state.remote
+    if remote is None:
+        raise _ProbeSkip("no remote connection")
+    if bool(getattr(remote, "is_on", False)):
+        if ctx.get("woke_by_intent"):
+            raise _ProbeSkip(
+                "device already woke from the launch Intent — no wake key needed"
+            )
+        if ctx.get("device_was_off"):
+            # It was asleep when the Intent went out and it is awake now, but
+            # the Intent probe's wait expired before the state flip landed.
+            # The Intent still did it. Without this the verdict asserts "the
+            # device never woke" while snapshot_after shows is_on: true — the
+            # kind of self-contradiction that costs a round trip to resolve.
+            ctx["woke_by_intent"] = True
+            return {
+                "woke_with": None,
+                "woke_late_from_intent": True,
+                "attempts": [],
+                "configured_wake_keycode": WAKE_KEYCODE,
+                "note": (
+                    "No keycode was needed. The device was asleep, the launch "
+                    "Intent alone woke it, and it just took longer than the "
+                    "Intent probe waited — see wake_intent."
+                ),
+            }
+        raise _ProbeSkip(
+            "device is already on. To test waking, put the STREAMING DEVICE "
+            "itself to sleep (not just the TV picture \u2014 on a Shield or "
+            "similar box, the box is what sleeps), then run the self-test "
+            "again."
+        )
+
+    # Configured key first, then the rest, de-duplicated.
+    candidates = [WAKE_KEYCODE]
+    for k in SELF_TEST_WAKE_CANDIDATES:
+        if k not in candidates:
+            candidates.append(k)
+
+    attempts = []
+    winner = None
+    for key in candidates:
+        loop = asyncio.get_running_loop()
+        # Re-read power state before EVERY candidate, not just at the top.
+        # POWER and TV_POWER are toggles: if an earlier candidate actually
+        # worked but _wait_for_tv_on missed the transition (is_on lags on
+        # Quick Resume hardware), sending the next one would turn a
+        # just-woken device straight back off — the exact stranding this
+        # probe is supposed to protect against, arrived at from the other
+        # direction.
+        try:
+            if bool(getattr(remote, "is_on", False)):
+                # Credit only an attempt that actually LEFT the machine. The
+                # send-failure path below also appends an attempt (a device
+                # asleep on WiFi can drop off the LAN entirely), and crediting
+                # a raise would put its keycode in suggested_configuration —
+                # telling the tester to configure a key that never reached the
+                # device, and costing them the one that did. Same
+                # mis-attribution class SELF_TEST_WAKE_KEY_TIMEOUT exists to
+                # prevent, reached through the error path instead of timing.
+                sent_attempts = [a for a in attempts if "error" not in a]
+                last = sent_attempts[-1] if sent_attempts else None
+                if last is not None:
+                    last["woke"] = True
+                    last["late"] = True
+                    winner = winner or last["key"]
+                    # Must be set here too, not only on the fast path: it is
+                    # what tells snapshot_after to re-run the foreground check
+                    # now that the device is actually awake.
+                    ctx["woke_by_key"] = winner
+                # Woke either way — record that even when we cannot say which
+                # key did it, so the later probes still know the device is up.
+                ctx["woke"] = True
+                break
+        except Exception:
+            pass
+        t0 = loop.time()
+        try:
+            remote.send_key_command(key)
+        except Exception as exc:
+            attempts.append({"key": key, "woke": False, "error": repr(exc)})
+            continue
+        woke = await _wait_for_tv_on(SELF_TEST_WAKE_KEY_TIMEOUT, SELF_TEST_POLL)
+        attempts.append({
+            "key": key,
+            "woke": woke,
+            "seconds": round(loop.time() - t0, 2) if woke else None,
+        })
+        if woke:
+            winner = key
+            ctx["woke_by_key"] = key
+            break
+
+    readiness = await _sample_post_wake_readiness(ctx) if winner else {}
+    return {
+        **readiness,
+        "attempts": attempts,
+        "woke_with": winner,
+        "configured_wake_keycode": WAKE_KEYCODE,
+        "note": (
+            "late=true on an attempt means the device reported on only after "
+            "we had given up waiting for it — that key DID work, just slower "
+            "than the timeout. "
+            "woke_with names the keycode to put in WAKE_KEYCODE. If every "
+            "attempt failed, the device is refusing network wake entirely — "
+            "on an NVIDIA Shield check Settings > Remotes & accessories > "
+            "Simplified wake buttons, which makes a network POWER a no-op."
+        ),
+    }
+
+
+def _looks_like_a_launcher(pkg: str) -> bool:
+    """Cheap name heuristic for "this is a home screen, not a screensaver".
+
+    We cannot enumerate every carrier's launcher — a Bell, Rogers or Sky box
+    ships its own — but launchers are named like launchers, and the cost of
+    being wrong is asymmetric: calling a screensaver a launcher just means we
+    ask the tester, while calling a LAUNCHER a screensaver puts it in
+    SCREENSAVER_PACKAGES and fires a dismiss key every time anyone sits on
+    their own home screen.
+    """
+    p = (pkg or "").lower()
+    return any(t in p for t in ("launcher", ".home", "homescreen", "tvhome"))
+
+
+async def _probe_screensaver(ctx: dict) -> dict:
+    """What is this device's screensaver called, and does our dismiss key work?
+
+    The single most common reason playback fails on unfamiliar hardware:
+    screensavers silently swallow launch Intents, so an unrecognised one means
+    videos never start and nothing errors.
+    """
+    if not ctx.get("current_app_usable"):
+        raise _ProbeUnmeasurable("current_app is unreadable on this device")
+    current = _get_current_app()
+    if not current:
+        raise _ProbeSkip("no foreground app reported right now")
+    if current not in SCREENSAVER_PACKAGES:
+        if current in KNOWN_BENIGN_PACKAGES or current == SMARTTUBE_PACKAGE:
+            return {
+                "screensaver_active": False,
+                "foreground": current,
+                "note": (
+                    "No screensaver was up when the test ran. To capture "
+                    "yours, leave the device untouched until the screensaver "
+                    "appears and run the self-test again from a phone."
+                ),
+            }
+        # An UNRECOGNISED, non-launcher package in the foreground — and the
+        # guide explicitly asks for a run with the screensaver up, so in that
+        # flow this package IS the screensaver. Previously this returned
+        # "no screensaver was up… run again", an unresolvable loop on exactly
+        # the hardware the beta exists for. Measure it instead: send the
+        # launch Intent once; a screensaver swallows it (the defining failure
+        # mode, verified on dreamx), a real app plays it.
+        #
+        # "Once" is per RUN, not per probe. _probe_deep_link_play already
+        # stands down for us; this is the missing mirror. Without it, a
+        # device the wake Intent woke by itself — the best outcome the sweep
+        # can find — got a second identical Intent here, restarting the clip
+        # audibly (invariant 1). The attribution goes wrong too: the
+        # landed-check below reads a Lounge observation the FIRST Intent
+        # populated and credits it to this one, so an ordinary app would be
+        # confidently reported as "not a screensaver" on someone else's
+        # evidence.
+        if ctx.get("launched"):
+            return {
+                "screensaver_active": None,
+                "foreground": current,
+                "note": (
+                    f"{current} was in the foreground and we don't recognise "
+                    "it, but a launch Intent had already gone out earlier in "
+                    "this run, so testing whether it swallows one would have "
+                    "meant sending a second play signal for the same video. "
+                    "To measure it, run this again with the device already "
+                    "awake."
+                ),
+            }
+        _require_idle(ctx)
+        deep_link = (
+            f"vnd.youtube.launch://www.youtube.com/watch?v={SELF_TEST_VIDEO_SHORT}"
+        )
+        state.remote.send_launch_app_command(deep_link)
+        _record_device_event(
+            "selftest_launch_sent", f"screensaver-suspect probe ({current})"
+        )
+        # Ours to clean up either way: if the Intent lands late (slow device)
+        # the idle probe still hands the TV back.
+        ctx["launched"] = True
+        ctx["screensaver_suspect_tested"] = True
+
+        loop = asyncio.get_running_loop()
+        landed = None
+        deadline = loop.time() + SELF_TEST_SUSPECT_TIMEOUT
+        while loop.time() < deadline:
+            if _get_current_app() == SMARTTUBE_PACKAGE:
+                landed = "foreground"
+                break
+            mon = state.lounge_monitor
+            if mon is not None:
+                obs = mon.observation
+                if (obs.video_id == SELF_TEST_VIDEO_SHORT
+                        and obs.current_time is not None):
+                    landed = "lounge"
+                    break
+            await asyncio.sleep(SELF_TEST_POLL)
+
+        looks_launcher = _looks_like_a_launcher(current)
+        if landed:
+            ctx["played"] = True
+            return {
+                "screensaver_active": False,
+                "suspect_package": current,
+                "intent_swallowed": False,
+                "intent_landed_via": landed,
+                "note": (
+                    f"{current} was in the foreground but did NOT swallow the "
+                    "launch Intent — a video started, so it behaves like a "
+                    "real app. Do NOT add it to SCREENSAVER_PACKAGES."
+                ),
+            }
+
+        # Swallowed. A LAUNCHER that swallows an Intent is a different and
+        # more likely story than a screensaver: it usually means SmartTube
+        # isn't installed under the configured package id, so Android had
+        # nothing to hand the Intent to and the home screen simply stayed put.
+        # Branding it a screensaver would be a confident wrong answer with a
+        # harmful fix attached.
+        #
+        # Only now is the dismiss key justified — sending it on the landed
+        # branch would HOME someone out of a live app.
+        state.remote.send_key_command(SCREENSAVER_DISMISS_KEY)
+        _record_device_event(
+            "selftest_dismiss_sent", f"{SCREENSAVER_DISMISS_KEY} at {current}"
+        )
+        deadline = loop.time() + max(SCREENSAVER_DISMISS_DELAY, 3.0)
+        after = current
+        while loop.time() < deadline:
+            after = _get_current_app() or ""
+            if after and after != current:
+                break
+            await asyncio.sleep(0.2)
+        if looks_launcher:
+            return {
+                "screensaver_active": False,
+                "suspect_package": current,
+                "likely_role": "launcher",
+                "intent_swallowed": True,
+                "dismiss_key": SCREENSAVER_DISMISS_KEY,
+                "dismissed": bool(after) and after != current,
+                "foreground_after": after,
+                "note": (
+                    f"{current} looks like this device's HOME SCREEN, and it "
+                    "swallowed a launch Intent. That usually means SmartTube "
+                    "is not installed under the package id this app is "
+                    "configured for — Android had nothing to hand the Intent "
+                    "to, so the home screen stayed put. Check "
+                    "smarttube_package_candidate and the tester's SmartTube "
+                    "build. Deliberately NOT suggested for "
+                    "SCREENSAVER_PACKAGES: a launcher listed there makes "
+                    "every play send a pointless dismiss key at the home "
+                    "screen. If this really is the screensaver, say so and "
+                    "we'll add it by hand."
+                ),
+            }
+        return {
+            "screensaver_active": True,
+            "screensaver_package": current,
+            "recognised": False,
+            "intent_swallowed": True,
+            "dismiss_key": SCREENSAVER_DISMISS_KEY,
+            "dismissed": bool(after) and after != current,
+            "foreground_after": after,
+            "note": (
+                f"MEASURED, not guessed: {current} swallowed a launch Intent "
+                "— the defining screensaver behaviour — and `dismissed` says "
+                "whether our key clears it. Adding this package to "
+                "SCREENSAVER_PACKAGES is the change that makes videos start "
+                "on this device."
+            ),
+        }
+
+    state.remote.send_key_command(SCREENSAVER_DISMISS_KEY)
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + max(SCREENSAVER_DISMISS_DELAY, 3.0)
+    after = current
+    while loop.time() < deadline:
+        after = _get_current_app() or ""
+        if after not in SCREENSAVER_PACKAGES:
+            break
+        await asyncio.sleep(0.2)
+    return {
+        "screensaver_active": True,
+        "screensaver_package": current,
+        "recognised": True,
+        "dismiss_key": SCREENSAVER_DISMISS_KEY,
+        "dismissed": after not in SCREENSAVER_PACKAGES,
+        "foreground_after": after,
+    }
+
+
+async def _probe_deep_link_play(ctx: dict) -> dict:
+    """Does the production play path actually start a video on this device?
+
+    This is the exact primitive tv_play uses when SmartTube isn't foreground,
+    which is most adds. Measures two things separately, because they fail
+    separately: did SmartTube come to the foreground, and did Lounge ever
+    report it actually playing our video.
+    """
+    remote = state.remote
+    if remote is None:
+        raise _ProbeSkip("no remote connection")
+    if ctx.get("screensaver_suspect_tested"):
+        raise _ProbeSkip(
+            "the screensaver probe already exercised the deep link this run — "
+            "see its intent_swallowed result. Firing it again would be two "
+            "play signals for one video."
+        )
+    remote_now = state.remote
+    if ctx.get("device_was_off") and remote_now is not None and not bool(
+            getattr(remote_now, "is_on", False)):
+        raise _ProbeSkip(
+            "the device never woke, so there is nothing to play into. See "
+            "wake_intent and wake_keys."
+        )
+    if "woke_by_intent" in ctx:
+        # Set at all means the wake probe already sent this exact deep link —
+        # True or False. Checking truthiness let a FAILED wake fall through
+        # and fire a second identical Intent, which is two play signals for
+        # one video and destroys the attribution of any late wake.
+        # Sending it again is two play signals for one video — the shape
+        # invariant 1 exists to prevent — and the timing would read as a
+        # cold-start measurement when it is really a re-fire.
+        raise _ProbeSkip(
+            "the wake probe already started this video with the same deep "
+            "link; see wake_intent for the launch timing"
+        )
+    _require_idle(ctx)
+
+    vid = SELF_TEST_VIDEO_SHORT
+    deep_link = f"vnd.youtube.launch://www.youtube.com/watch?v={vid}"
+    loop = asyncio.get_running_loop()
+    t0 = loop.time()
+    remote.send_launch_app_command(deep_link)
+    _record_device_event("selftest_launch_sent", vid)
+    # Set BEFORE any waiting: this is what tells the idle probe there is
+    # something to hand back. Gating that on Lounge confirming playback would
+    # strand a tester who never paired Lounge with our test video playing on
+    # their TV — the probe sent it, so the probe owns cleaning it up.
+    ctx["launched"] = True
+
+    fg_seconds = None
+    lounge_seconds = None
+    deadline = loop.time() + SELF_TEST_PLAY_TIMEOUT
+    while loop.time() < deadline:
+        if fg_seconds is None and _get_current_app() == SMARTTUBE_PACKAGE:
+            fg_seconds = round(loop.time() - t0, 2)
+        mon = state.lounge_monitor
+        if lounge_seconds is None and mon is not None:
+            obs = mon.observation
+            if obs.video_id == vid and obs.current_time is not None:
+                lounge_seconds = round(loop.time() - t0, 2)
+        if fg_seconds is not None and lounge_seconds is not None:
+            break
+        await asyncio.sleep(0.5)
+
+    mon = state.lounge_monitor
+    obs = mon.observation if mon is not None else None
+    ctx["played"] = bool(ctx.get("played")) or lounge_seconds is not None
+
+    # If SmartTube never came to the foreground, name what did. The Intent
+    # resolves to whatever handles vnd.youtube.launch:// regardless of our
+    # configured package, so an older SmartTube build (or the official YouTube
+    # app) shows up here — and that is a one-line fix the tester can apply,
+    # not something to diagnose over email.
+    candidate = None
+    if fg_seconds is None:
+        for pkg in reversed([e["value"] for e in _device_log
+                             if e["kind"] == "current_app" and e["value"]]):
+            if pkg != SMARTTUBE_PACKAGE and pkg not in SCREENSAVER_PACKAGES \
+                    and pkg not in KNOWN_BENIGN_PACKAGES:
+                candidate = pkg
+                break
+
+    return {
+        "video_id": vid,
+        "smarttube_package_candidate": candidate,
+        "smarttube_foreground_after_s": fg_seconds,
+        "smarttube_foreground_measurable": bool(ctx.get("current_app_usable")),
+        "lounge_saw_it_after_s": lounge_seconds,
+        "lounge_state": getattr(obs, "state", None),
+        "lounge_video_id": getattr(obs, "video_id", None),
+        "lounge_current_time": getattr(obs, "current_time", None),
+        "note": (
+            "lounge_saw_it_after_s=null with a populated lounge_state for a "
+            "different video usually means the Lounge cloud cache is reporting "
+            "a stale session rather than this device."
+        ),
+    }
+
+
+async def _probe_lounge_swap(ctx: dict) -> dict:
+    """Does Lounge setPlaylist swap videos on this device without a relaunch?
+
+    The smooth-swap path. Only meaningful if the deep-link probe actually got
+    something playing — setPlaylist against an idle SmartTube loads a video
+    without starting it, which is a different (documented) behaviour and not
+    what this measures.
+    """
+    _require_idle(ctx)
+    mon = state.lounge_monitor
+    if mon is None or not mon.is_connected:
+        raise _ProbeSkip("Lounge not connected")
+    if not ctx.get("played"):
+        raise _ProbeSkip("nothing was playing to swap from")
+
+    vid = SELF_TEST_VIDEO_LONG
+    loop = asyncio.get_running_loop()
+    t0 = loop.time()
+    await mon.play_video(vid, None)
+    swapped_s = None
+    deadline = loop.time() + SELF_TEST_SWAP_TIMEOUT
+    while loop.time() < deadline:
+        obs = mon.observation
+        if obs.video_id == vid and obs.state == "Playing":
+            swapped_s = round(loop.time() - t0, 2)
+            break
+        await asyncio.sleep(SELF_TEST_POLL)
+    ctx["swapped"] = swapped_s is not None
+    obs = mon.observation
+    return {
+        "video_id": vid,
+        "swapped_after_s": swapped_s,
+        "lounge_state": obs.state,
+        "lounge_video_id": obs.video_id,
+    }
+
+
+async def _probe_transport(ctx: dict) -> dict:
+    """Do pause and resume take effect, and does the device report them back?
+
+    Verified by observation rather than by the call returning — Lounge.play()
+    against a torn-down player succeeds over HTTPS and does nothing, which is
+    the whole reason production verifies this transition.
+    """
+    _require_idle(ctx)
+    mon = state.lounge_monitor
+    if mon is None or not mon.is_connected:
+        raise _ProbeSkip("Lounge not connected")
+    if not (ctx.get("played") or ctx.get("swapped")):
+        raise _ProbeSkip("nothing was playing to pause")
+
+    async def _await_state(target: str, timeout: float) -> Optional[float]:
+        loop = asyncio.get_running_loop()
+        t0 = loop.time()
+        deadline = t0 + timeout
+        while loop.time() < deadline:
+            if mon.observation.state == target:
+                return round(loop.time() - t0, 2)
+            await asyncio.sleep(0.3)
+        return None
+
+    await mon.pause()
+    paused_s = await _await_state("Paused", SELF_TEST_TRANSPORT_TIMEOUT)
+    await asyncio.sleep(1.0)
+    await mon.play()
+    resumed_s = await _await_state("Playing", SELF_TEST_TRANSPORT_TIMEOUT)
+    return {
+        "paused_confirmed_after_s": paused_s,
+        "resumed_confirmed_after_s": resumed_s,
+        "final_state": mon.observation.state,
+        "note": (
+            "null means Lounge never reported the transition. SmartTube only "
+            "pushes state on transitions and sometimes not even then, so a null "
+            "here is weaker evidence than a number — say whether the TV "
+            "actually paused."
+        ),
+    }
+
+
+async def _probe_end_of_video(ctx: dict) -> dict:
+    """Let a video actually END, and watch what the device reports.
+
+    The single biggest hole in this test until now. Auto-advance is a core
+    feature and nothing exercised it: the play probe returns a few seconds
+    into the clip, the swap probe replaces it, and no video ever reached its
+    own end — so `lounge.finished`, the near-end rule and the persistent-
+    Stopped detector were all completely unobserved on the tester's hardware.
+
+    Cheap only because the probe clip is ~19 seconds. It restarts that clip
+    and waits for the end, recording what Lounge reports and when.
+
+    Deliberately does NOT go through QueueController: the self-test owns no
+    queue item, so nothing here can advance a real queue. (That is also why
+    `_on_lounge_finished` had to be tightened first — with `state.current`
+    None its cross-video guard was skipped entirely, and this probe would
+    have triggered a spurious advance the moment the clip ended.)
+    """
+    _require_idle(ctx)
+    mon = state.lounge_monitor
+    if mon is None or not mon.is_connected:
+        raise _ProbeSkip(
+            "Lounge not connected, so we cannot see a video end. Pair with "
+            "SmartTube and run again — this is the only check that covers "
+            "whether the next video starts by itself."
+        )
+
+    vid = SELF_TEST_VIDEO_SHORT
+    loop = asyncio.get_running_loop()
+    await mon.play_video(vid, None)
+    ctx["launched"] = True
+
+    # Wait for OUR clip to actually be playing before watching for an ending.
+    # The probe runs straight after swap/transport left the LONG clip going,
+    # and SmartTube fires Paused -> Stopped -> Playing for the OLD video
+    # during a swap (recorded in playlist.py). Without this phase the very
+    # next Stopped — belonging to the previous video — reads as "our 19s clip
+    # ended after 1.5s", which is a confident wrong answer about the only
+    # auto-advance coverage in the whole test.
+    #
+    # And it has to ASK. `observation` is a passive cache that only moves when
+    # SmartTube pushes — which it does on transitions "and sometimes not even
+    # then" — while `_periodic_refresh_loop` is gated on the queue owning a
+    # current item, and this probe plays outside the queue by design. Reading
+    # the cache in a loop here is the identical bug the first hardware run
+    # caught in the sampling loop below; only that one got fixed.
+    #
+    # Gated, though: request_now_playing's precondition is that SmartTube is
+    # foregrounded and playing, because polling a BACKGROUNDED SmartTube
+    # auto-foregrounds it and on a Shield can wake the device. We only poll
+    # once an earlier probe has confirmed playback.
+    start_deadline = loop.time() + SELF_TEST_SWAP_TIMEOUT
+    may_poll = bool(
+        (ctx.get("played") or ctx.get("swapped"))
+        and getattr(state.remote, "is_on", False)
+    )
+    next_start_poll = 0.0
+    while loop.time() < start_deadline:
+        if may_poll and loop.time() >= next_start_poll:
+            next_start_poll = loop.time() + SELF_TEST_NOW_PLAYING_INTERVAL
+            with contextlib.suppress(Exception):
+                await mon.request_now_playing()
+        obs = mon.observation
+        if obs.video_id == vid and obs.state == "Playing":
+            break
+        await asyncio.sleep(SELF_TEST_POLL)
+    else:
+        raise _ProbeUnmeasurable(
+            "the test clip never started playing, so there was no ending to "
+            "watch for. That is itself worth reporting."
+        )
+    t0 = loop.time()
+
+    # Sample the whole way through: a frozen current_time is itself the
+    # finding (it means the duration timer is the only thing that could ever
+    # advance the queue on this device).
+    samples = []
+    states = []
+    duration = None
+    last_ct = None
+    ended_at = None
+    deadline = loop.time() + SELF_TEST_FINISH_TIMEOUT
+    # Ask for the position rather than waiting to be told it.
+    #
+    # Measured on the reference Google TV Streamer 2026-08-15: this probe
+    # reported position_advanced=false and ended_after_s=null on a device
+    # where auto-advance demonstrably works. `observation` only moves when
+    # SmartTube pushes (transitions only) or when `_periodic_refresh_loop`
+    # polls — and that loop is gated on the queue having a current item,
+    # which this probe deliberately never creates. So the gate was shut for
+    # the entire run and the position sat frozen at its start value.
+    #
+    # Safe to poll here specifically because the phase above already
+    # confirmed our clip is foreground and Playing; see the warning on
+    # request_now_playing().
+    next_poll = 0.0        # ask on the first pass, then on the interval
+    while loop.time() < deadline:
+        if loop.time() >= next_poll:
+            next_poll = loop.time() + SELF_TEST_NOW_PLAYING_INTERVAL
+            try:
+                await mon.request_now_playing()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                pass       # a dead session is the subscribe loop's problem
+        obs = mon.observation
+        if obs.video_id == vid:
+            if obs.duration:
+                duration = obs.duration
+            if obs.current_time is not None and obs.current_time != last_ct:
+                last_ct = obs.current_time
+                samples.append(round(obs.current_time, 1))
+            if obs.state and (not states or states[-1] != obs.state):
+                states.append(obs.state)
+            # Inside the video_id guard on purpose: a Stopped belonging to
+            # a different video is not our clip ending.
+            if obs.state in ("Stopped", "Ended"):
+                ended_at = round(loop.time() - t0, 2)
+                break
+        await asyncio.sleep(SELF_TEST_POLL)
+
+    obs = mon.observation
+    near_end = (
+        duration is not None and last_ct is not None
+        and (duration - last_ct) <= 5.0
+    )
+    # Monotonic: an earlier probe may already have confirmed playback, and a
+    # failure here must not erase that. Same shape as the play probe.
+    ctx["played"] = bool(ctx.get("played")) or bool(samples)
+    return {
+        "video_id": vid,
+        "duration_reported": duration,
+        "position_samples": samples[:40],
+        "position_advanced": len(samples) > 1,
+        "state_sequence": states,
+        "final_state": obs.state,
+        "ended_after_s": ended_at,
+        "last_position": last_ct,
+        "stopped_within_5s_of_end": near_end,
+        "waited_s": SELF_TEST_FINISH_TIMEOUT,
+        "note": (
+            "This is what auto-advance runs on. position_advanced=false means "
+            "the device never reports progress, so the queue can only advance "
+            "on a scraped-duration timer and any pause or seek desyncs it. "
+            "ended_after_s=null with a full duration means the end-of-video "
+            "signal never arrived, so the next video would not start by "
+            "itself. stopped_within_5s_of_end is the exact rule the queue "
+            "uses to tell a real ending from a mid-video blip."
+        ),
+    }
+
+
+async def _probe_volume(ctx: dict) -> dict:
+    """Does anything observable happen when we send volume keys?
+
+    Read this one carefully: a no-change result is genuinely ambiguous. Volume
+    reaches the speakers by two routes — the device relays to an amp over
+    HDMI-CEC (nothing local moves, so we see nothing even when it works), or it
+    attenuates its own output (volume_info moves). No-change is therefore
+    consistent with "CEC working perfectly", "CEC ignored downstream", and
+    "IR mode, which can never work over the network". Only the tester's ears
+    separate them, which is why the report asks.
+    """
+    remote = state.remote
+    if remote is None:
+        raise _ProbeSkip("no remote connection")
+    if not bool(getattr(remote, "is_on", False)):
+        # Firing volume keys at a sleeping device returns "no change", which
+        # is indistinguishable from the normal CEC reading — a false negative
+        # that reads like a real result.
+        raise _ProbeSkip("device is off; volume can't be measured while asleep")
+    # Rule 3, and this probe was the one that skipped it. Volume is not a
+    # read: over CEC these keys reach whatever is doing the audio, so a
+    # dropped VOLUME_DOWN or an odd number of MUTEs leaves someone else's
+    # room offset or silent, with nothing on screen to explain why.
+    _require_idle(ctx)
+
+    def _vol():
+        try:
+            return dict(getattr(remote, "volume_info", None) or {})
+        except Exception:
+            return None
+
+    before = _vol()
+    for _ in range(2):
+        remote.send_key_command(VOLUME_KEYCODES["up"])
+        await asyncio.sleep(0.4)
+    await asyncio.sleep(0.6)
+    after_up = _vol()
+    for _ in range(2):
+        remote.send_key_command(VOLUME_KEYCODES["down"])
+        await asyncio.sleep(0.4)
+    await asyncio.sleep(0.6)
+    after_restore = _vol()
+
+    # Mute is a shipped button and was never exercised, while the report
+    # listed its keycode — implying coverage it didn't have. Toggled twice so
+    # the device is left as we found it. VOLUME_MUTE (164), never MUTE (91),
+    # which mutes the microphone.
+    remote.send_key_command(VOLUME_KEYCODES["mute"])
+    await asyncio.sleep(1.0)
+    after_mute = _vol()
+    remote.send_key_command(VOLUME_KEYCODES["mute"])
+    await asyncio.sleep(1.0)
+    after_unmute = _vol()
+
+    moved = bool(before and after_up and before != after_up)
+    return {
+        "mute_info_after_mute": after_mute,
+        "mute_info_after_unmute": after_unmute,
+        "mute_observable": bool(
+            after_mute and after_unmute and after_mute != after_unmute
+        ),
+        "volume_info_before": before,
+        "volume_info_after_up": after_up,
+        "volume_info_after_restore": after_restore,
+        "volume_info_moved": moved,
+        "restored": after_restore == before,
+        "keycodes": dict(VOLUME_KEYCODES),
+        "note": (
+            "volume_info_moved=true means this device attenuates its own "
+            "output. false is NOT a failure — it is the normal reading for a "
+            "device relaying over HDMI-CEC, and the app cannot tell that apart "
+            "from CEC being ignored. Answer the volume question at the bottom "
+            "of this report; that is the only thing that resolves it."
+        ),
+    }
+
+
+async def _probe_idle_return(ctx: dict) -> dict:
+    """What does this device land on when we hand the TV back?
+
+    Doubles as the cleanup step for the playback probes and as the best chance
+    of learning the device's screensaver/launcher package names, which is the
+    single most useful unknown on unfamiliar hardware.
+    """
+    remote = state.remote
+    if remote is None:
+        raise _ProbeSkip("no remote connection")
+    if not (ctx.get("launched") or ctx.get("played") or ctx.get("swapped")):
+        raise _ProbeSkip("nothing was started, nothing to hand back")
+
+    keys = [k.strip() for k in IDLE_KEYCODE.split(",") if k.strip()]
+    for i, key in enumerate(keys):
+        remote.send_key_command(key)
+        if i < len(keys) - 1:
+            await asyncio.sleep(IDLE_KEYCODE_DELAY)
+
+    seen = []
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + SELF_TEST_IDLE_TIMEOUT
+    while loop.time() < deadline:
+        app = _get_current_app() or ""
+        if app and (not seen or seen[-1] != app):
+            seen.append(app)
+        await asyncio.sleep(SELF_TEST_POLL)
+
+    final = seen[-1] if seen else None
+    return {
+        "idle_keycode": IDLE_KEYCODE,
+        "foreground_sequence": seen,
+        "final_foreground": final,
+        "final_is_known_screensaver": final in SCREENSAVER_PACKAGES if final else None,
+        "note": (
+            "This is where the device lands when we hand the TV back. Usually "
+            "that is the LAUNCHER, not the screensaver — the screensaver only "
+            "appears minutes later, long after this probe stops watching. Do "
+            "NOT add final_foreground to SCREENSAVER_PACKAGES on the strength "
+            "of this alone: adding a launcher there makes every play send a "
+            "pointless dismiss key. To capture the real screensaver, run the "
+            "self-test again once it is actually on screen."
+        ),
+    }
+
+
+def _tv_is_busy(ignore_video_ids: frozenset = frozenset()) -> bool:
+    """Is anything playing right now that isn't ours?
+
+    Two clauses, and the second is the one a queue-only check misses: a video
+    started from the TV's own remote, or one our queue ceded via the
+    external-switch logic, leaves `state.current` None while the TV plays on.
+    `/api/skip` already learned this; the self-test has to inherit it or a
+    guest can wipe out someone's viewing by pressing a diagnostics button.
+
+    The Lounge clause is gated on the device actually being ON. The Lounge
+    "current playlist" lives on YouTube's cloud and reports dormant players as
+    Playing indefinitely (invariant 4), so without that gate a stale ghost
+    would make a sleeping TV look busy — and permanently skip the wake probes,
+    which are the only ones that need a sleeping TV.
+    """
+    qstate = queue_controller.state
+    if qstate.current is not None or qstate.queue:
+        return True
+    remote = state.remote
+    if remote is None:
+        return False
+    # `is_on` is a property that can RAISE on a stale connection, not merely
+    # be absent — tv_play has wrapped this same read in try/except since it
+    # was written. `getattr(..., False)` only swallows AttributeError, so the
+    # bare version let a connection error escape a function every probe and
+    # the runner call. Unreadable power is treated as "not on" for the same
+    # reason the clause below is gated on power at all: the Lounge cache
+    # reports dormant players as Playing forever (invariant 4), so it may
+    # only be trusted when we positively know the device is awake.
+    try:
+        powered = bool(remote.is_on)
+    except Exception:
+        return False
+    if not powered:
+        return False
+    lng = qstate.lounge or {}
+    video_id = lng.get("video_id")
+    # Matching by video id rather than by "has the run launched anything yet"
+    # keeps the guard live: a guest's video landing mid-run still stops the
+    # probes, because it is a different id.
+    if video_id and video_id in ignore_video_ids:
+        return False
+    return bool(
+        lng.get("available")
+        and video_id
+        and lng.get("current_time") is not None
+        and lng.get("state") == "Playing"
+    )
+
+
+def _require_idle(ctx: dict) -> None:
+    """Refuse to move the TV when someone is watching something.
+
+    Re-reads live state rather than trusting the start-of-run snapshot. The
+    409 guard on /api/queue only refuses NEW adds; one that passed the guard
+    microseconds before the run began is still inside its metadata scrape (up
+    to METADATA_TIMEOUT_S) and lands mid-run, taking ownership of the queue
+    while a stale snapshot still says idle.
+    """
+    if ctx.get("was_busy") or _tv_is_busy(ignore_video_ids=_SELF_TEST_VIDEO_IDS):
+        raise _ProbeSkip(
+            "something is playing or queued; skipped so the test doesn't "
+            "interrupt it"
+        )
+
+
+# id, label, seconds budgeted (drives the ETA), probe
+_SELF_TEST_PROBES = (
+    ("snapshot", "Reading device + config", 1.0, _probe_snapshot),
+    ("foreground", "Checking foreground-app detection", 6.0, _probe_foreground_readability),
+    ("metadata", "Checking YouTube reachability", 16.0, _probe_metadata),
+    ("wake_intent", "Testing wake by launch Intent", 130.0, _probe_launch_intent_wakes),
+    ("wake_keys", "Sweeping wake keycodes", 170.0, _probe_wake_keycodes),
+    ("screensaver", "Identifying the screensaver", 17.0, _probe_screensaver),
+    ("play", "Starting a test video", 21.0, _probe_deep_link_play),
+    ("swap", "Swapping video via Lounge", 16.0, _probe_lounge_swap),
+    ("transport", "Testing pause and resume", 13.0, _probe_transport),
+    # Volume BEFORE finish, deliberately: the finish probe waits for the clip
+    # to end, so running volume after it fires the keys at a silent device.
+    # "Audio must be PLAYING" is one of the three confounds _keytest's CEC
+    # probe documents, and "what got louder?" is the one question only the
+    # tester can answer.
+    ("volume", "Testing volume keys", 11.0, _probe_volume),
+    ("finish", "Watching a video reach its end", 60.0, _probe_end_of_video),
+    ("idle", "Handing the TV back", 10.0, _probe_idle_return),
+    ("snapshot_after", "Re-reading device state", 7.0, _probe_snapshot_after),
+)
+
+# Questions the app genuinely cannot answer by itself, each with the prompt
+# the UI shows. Phrasing is deliberate: a bare "did the volume change?" gets a
+# yes/no, when what actually resolves the ambiguity is WHICH volume moved —
+# the TV's own speakers or a receiver — because that distinguishes the device
+# attenuating its own output from it relaying a CEC command downstream, and
+# those need different advice.
+def _hints_shield(detail) -> list:
+    """NVIDIA Shield interpretation. Sourced; see CLAUDE.md."""
+    hints = []
+    intent_woke = detail("wake_intent").get("woke")
+    attempts = detail("wake_keys").get("attempts") or []
+    swept_and_failed = bool(attempts) and not detail("wake_keys").get("woke_with")
+    if swept_and_failed and not intent_woke:
+        hints.append(
+            "Shield + no wake: this is almost always Settings > Remotes & "
+            "accessories > Simplified wake buttons — BOTH toggles must be "
+            "OFF. Every reported Shield wake failure with this protocol "
+            "was fixed there; none needed a different keycode. Keep "
+            "WAKE_KEYCODE=POWER."
+        )
+    readiness = (
+        detail("wake_intent").get("current_app_readable_after_wake_s")
+        or detail("wake_keys").get("current_app_readable_after_wake_s")
+    )
+    if readiness is not None and readiness > WAKE_DELAY:
+        hints.append(
+            f"Shield woke but took {readiness}s to become usable — "
+            f"longer than WAKE_DELAY={WAKE_DELAY:g}. SHIELD Experience "
+            "before 9.2 documents 'remote stops responding for 60 seconds "
+            "after wake from sleep'; updating the firmware to 9.2+ is the "
+            "real fix, WAKE_DELAY is the workaround. Note: sw_version in "
+            "this report is the Android TV Remote Service app version, "
+            "NOT the firmware — read Settings > Device Preferences > "
+            "About for the Experience version."
+        )
+    if detail("volume").get("volume_info_moved") is False:
+        hints.append(
+            "Shield volume is governed by Settings > Display & Sound > "
+            "Volume control. 2019 models default to HDMI-CEC (works with "
+            "no local change visible — same as our verified devices); "
+            "2015/2017 default to Digital (a change WOULD have been "
+            "visible in volume_info, so no-change there is a real "
+            "failure). IR mode relays network volume out the remote's IR "
+            "blaster — it works only when the blaster faces the "
+            "amplifier, so treat it as unreliable rather than impossible."
+        )
+    return hints
+
+
+def _hints_bell_streamer(detail) -> list:
+    """Bell Streamer (Askey STI6130) — researched, nothing hardware-verified.
+
+    Same silicon as Google's own ADT-3 developer kit with a Bell ROM and an
+    Android TV Operator Tier launcher on top. Everything here is sourced from
+    documentation and forum reports; the first real report replaces it.
+    """
+    hints = [
+        "Bell Streamer is Android TV Operator Tier on Askey STI6130 hardware "
+        "— the same board as Google's ADT-3 dev kit, with a Bell launcher on "
+        "top. Nothing about it is hardware-verified by us yet, so treat every "
+        "line in this report as new information rather than a check against "
+        "known-good behaviour."
+    ]
+    attempts = detail("wake_keys").get("attempts") or []
+    if (bool(attempts) and not detail("wake_keys").get("woke_with")
+            and not detail("wake_intent").get("woke")):
+        hints.append(
+            "Bell documents this box powering itself OFF after 30 minutes "
+            "idle — that is a deeper state than the sleep our wake path is "
+            "built for, and it may drop off Wi-Fi entirely (it is a Wi-Fi "
+            "only device, no Ethernet). Before changing any keycode, check "
+            "whether the box was merely asleep or fully off, and whether it "
+            "was still reachable at all — see remote_available in the events "
+            "log and remote_reconnects."
+        )
+    ss = detail("screensaver")
+    if ss.get("likely_role") == "launcher" or ss.get("intent_swallowed"):
+        hints.append(
+            "On this box HOME lands on Bell's own Fibe TV launcher rather "
+            "than an Android TV home screen, so our screensaver-dismiss and "
+            "idle-return keys may behave differently from every device we "
+            "have verified. Whatever package this report names as the "
+            "foreground here is genuinely new data."
+        )
+    return hints
+
+
+# Keyed by profile id. `match` is a tuple of (manufacturer_substring,
+# model_substring) AND-pairs, OR'd together; None means "don't care".
+#
+# Matching the two fields SEPARATELY is load-bearing, not fussiness: a
+# flattened "manufacturer model" string makes the token "streamer" match both
+# Google's TV Streamer and a Bell box whose model is literally "Streamer",
+# and the first profile in iteration order would silently win.
+_DEVICE_PROFILES = {
+    "google_tv_streamer": {
+        "label": "Google TV Streamer (4K)",
+        "match": (("google", "streamer"),),
+        "hints": None,
+        "verified": True,
+    },
+    "chromecast_gtv": {
+        "label": "Chromecast with Google TV",
+        "match": (("google", "chromecast"),),
+        "hints": None,
+        "verified": True,
+    },
+    "shield": {
+        "label": "NVIDIA Shield",
+        "match": (("nvidia", None), (None, "shield")),
+        "hints": _hints_shield,
+        "verified": False,
+    },
+    "bell_streamer": {
+        "label": "Bell Streamer / Bell Fibe TV box",
+        # Deliberately empty: selectable in the dropdown, never auto-detected.
+        # We have never seen what this box reports over the protocol, and a
+        # guessed match pair that fired on the wrong device would be worse
+        # than no detection at all. The pair goes in when the first report
+        # tells us what it actually says.
+        "match": (),
+        "hints": _hints_bell_streamer,
+        "verified": False,
+    },
+}
+
+
+def _detect_profile() -> Optional[str]:
+    """Best guess at the device family from what the protocol reports."""
+    try:
+        info = dict(getattr(state.remote, "device_info", None) or {})
+    except Exception:
+        return None
+    manufacturer = (info.get("manufacturer") or "").lower()
+    model = (info.get("model") or "").lower()
+    if not (manufacturer or model):
+        return None
+    for pid, prof in _DEVICE_PROFILES.items():
+        for want_mfr, want_model in prof["match"]:
+            if want_mfr and want_mfr not in manufacturer:
+                continue
+            if want_model and want_model not in model:
+                continue
+            return pid
+    return None
+
+
+# (id, prompt, profiles, choices)
+#   profiles: () = ask everyone. Otherwise only for those device profiles.
+#   choices:  () = free text. Otherwise a dropdown of (value, label).
+#
+# Scoping matters more than it looks. A tester shown two questions that
+# obviously don't apply to their hardware learns that this form isn't for
+# them, and leaves the whole thing blank — and these answers are the half the
+# app cannot measure for itself.
+_SELF_TEST_QUESTIONS = (
+    ("device_profile",
+     "Which device is this running on? We use this to ask the right "
+     "follow-up questions — pick the closest match.",
+     (),
+     ((("", "\u2014 choose your device \u2014"),)
+      + tuple((pid, prof["label"]) for pid, prof in _DEVICE_PROFILES.items())
+      + (("other", "Something else / not sure"),))),
+
+    ("device_software_version",
+     "Its software version — Settings \u2192 Device Preferences \u2192 About",
+     (), ()),
+
+    ("did_the_device_wake",
+     "If it was asleep: did it wake up by itself, and roughly how long did it "
+     "take?",
+     (), ()),
+
+    ("did_the_video_play_on_screen",
+     "Did a video actually appear and play, or did the screen stay put?",
+     (), ()),
+
+    ("did_pause_and_resume_work",
+     "When the test paused, did the picture actually stop and then start "
+     "again \u2014 or did it play straight through?",
+     (), ()),
+
+    ("what_got_louder",
+     "\u2b50 During the volume check, what changed \u2014 the TV\u2019s own speakers, "
+     "a soundbar/receiver, or nothing at all? Everything else here is "
+     "optional; this is the one the app genuinely cannot work out for "
+     "itself.",
+     (), ()),
+
+    ("volume_mode_setting",
+     "On a Shield: Settings \u2192 Display & Sound \u2192 Volume control \u2014 is it set "
+     "to HDMI-CEC, Digital, or IR?",
+     ("shield",), ()),
+
+    ("simplified_wake_buttons",
+     "NVIDIA Shield only — Settings → Remotes & accessories → Simplified "
+     "wake buttons: were BOTH switches OFF before this run? With them on, "
+     "waking over the network is impossible and every wake result below is "
+     "meaningless.",
+     ("shield",), ()),
+
+    ("what_did_you_put_to_sleep",
+     "If you ran the asleep test: did you sleep the streaming box itself, or "
+     "just switch off the TV picture?",
+     (), ()),
+
+    ("smarttube_build",
+     "SmartTube → Settings → About: which build and version?",
+     (), ()),
+
+
+
+    ("anything_odd_on_screen",
+     "Anything you saw that the app couldn\u2019t \u2014 error messages, a chooser "
+     "dialog, the wrong app opening, odd flicker?",
+     (), ()),
+)
+
+
+def _suggested_configuration(probes: list) -> dict:
+    """Turn measurements into the settings to actually change.
+
+    The difference between a report that ends the conversation and one that
+    starts it. "wake_keys.woke_with = WAKEUP" requires the reader to know that
+    WAKE_KEYCODE exists and defaults to POWER; `WAKE_KEYCODE=WAKEUP` can be
+    pasted into a compose file. Every entry carries the probe it came from, so
+    a wrong suggestion can be traced rather than trusted.
+    """
+    by_id = {p["id"]: p for p in probes}
+
+    def detail(pid):
+        d = by_id.get(pid, {}).get("detail")
+        return d if isinstance(d, dict) else {}
+
+    env, notes = [], []
+
+    woke_with = detail("wake_keys").get("woke_with")
+    if woke_with and woke_with != WAKE_KEYCODE:
+        env.append({
+            "var": "WAKE_KEYCODE", "value": woke_with,
+            "because": f"this device woke on {woke_with}, not {WAKE_KEYCODE}",
+            "from_probe": "wake_keys",
+        })
+
+    # A foreground package we neither recognise nor know how to dismiss, seen
+    # while the device was idle, is the classic unknown screensaver.
+    after = detail("snapshot_after")
+    suspects = [
+        pkg for pkg in (after.get("unrecognised_foreground_packages") or [])
+        if pkg not in KNOWN_BENIGN_PACKAGES
+    ]
+    ss = detail("screensaver")
+    if ss.get("screensaver_active") and ss.get("dismissed") is False:
+        notes.append(
+            f"{SCREENSAVER_DISMISS_KEY} did not dismiss this device's "
+            f"screensaver ({ss.get('screensaver_package')}). Try "
+            "SCREENSAVER_DISMISS_KEY=BACK."
+        )
+    # A suspect the screensaver probe MEASURED (it swallowed a launch
+    # Intent) outranks one merely seen in the foreground log — and must not
+    # be suggested twice at two confidence levels.
+    if ss.get("intent_swallowed") and ss.get("screensaver_package"):
+        measured_pkg = ss["screensaver_package"]
+        env.append({
+            "var": "SCREENSAVER_PACKAGES",
+            "value": ",".join(sorted(SCREENSAVER_PACKAGES | {measured_pkg})),
+            "because": (
+                f"{measured_pkg} swallowed a launch Intent — measured, the "
+                "defining screensaver behaviour — so until it is listed, "
+                "videos silently fail to start whenever it is on screen"
+            ),
+            "from_probe": "screensaver",
+            "confidence": "measured",
+        })
+        suspects = [pkg for pkg in suspects if pkg != measured_pkg]
+    # A carrier device's launcher is unrecognised by definition (we only know
+    # Google's), so it lands in `suspects` every time. Suggesting it would put
+    # a home screen in SCREENSAVER_PACKAGES.
+    launchers = [pkg for pkg in suspects if _looks_like_a_launcher(pkg)]
+    suspects = [pkg for pkg in suspects if not _looks_like_a_launcher(pkg)]
+    for pkg in launchers:
+        notes.append(
+            f"{pkg} was in the foreground and we don't recognise it, but it "
+            "looks like this device's home screen rather than a screensaver — "
+            "so it is NOT suggested for SCREENSAVER_PACKAGES. Confirm what it "
+            "is and we'll add it to the known-benign list, which only affects "
+            "reporting."
+        )
+    for pkg in suspects:
+        env.append({
+            "var": "SCREENSAVER_PACKAGES",
+            "value": ",".join(sorted(SCREENSAVER_PACKAGES | {pkg})),
+            "because": (
+                f"{pkg} was in the foreground and we neither recognise nor "
+                "dismiss it. ONLY apply this if it is actually the "
+                "screensaver — a launcher here would make every play send a "
+                "pointless dismiss key."
+            ),
+            "from_probe": "snapshot_after",
+            "confidence": "needs confirming",
+        })
+
+    cand = detail("play").get("smarttube_package_candidate")
+    if cand and cand != SMARTTUBE_PACKAGE:
+        if cand in KNOWN_SMARTTUBE_PACKAGES:
+            env.append({
+                "var": "SMARTTUBE_PACKAGE", "value": cand,
+                "because": (
+                    f"the deep link opened {cand} \u2014 a real SmartTube id "
+                    f"\u2014 not the configured {SMARTTUBE_PACKAGE}, so every "
+                    "foreground check is comparing against a package that "
+                    "isn't there"
+                ),
+                "from_probe": "play",
+                "confidence": "measured",
+            })
+        else:
+            # Emphatically NOT a pasteable env var: this is just the last
+            # foreground package that wasn't ours. com.android.vending shows
+            # up here when the configured package isn't installed, and
+            # setting SMARTTUBE_PACKAGE to the Play Store would break every
+            # foreground check for good.
+            notes.append(
+                f"The launch opened {cand}, which is not a SmartTube id we "
+                "recognise. Do NOT set SMARTTUBE_PACKAGE to it without "
+                "checking: if it is com.android.vending that is the Play "
+                "Store opening because the configured package isn't "
+                "installed, and if it is the stock YouTube app then Android "
+                "has the wrong default handler. Tell us what it is."
+            )
+
+    # Timings that beat our own constants.
+    slow = []
+    for pid, field, const_name, const in (
+        ("wake_intent", "seconds", "WAKE_DELAY", WAKE_DELAY),
+        ("wake_keys", "seconds", "WAKE_DELAY", WAKE_DELAY),
+        ("play", "lounge_saw_it_after_s",
+         "LOUNGE_OBSERVATION_TIMEOUT", LOUNGE_OBSERVATION_TIMEOUT),
+    ):
+        observed = detail(pid).get(field)
+        if isinstance(observed, (int, float)) and observed > const:
+            slow.append({
+                "constant": const_name, "current_s": const,
+                "observed_s": observed, "from_probe": pid,
+            })
+    # Prefer the READINESS measurement (time until the device was usable)
+    # over the is_on flip: instant-on hardware reports on within ~1s while
+    # still deaf, so the flip understates and readiness is the number
+    # WAKE_DELAY actually has to cover.
+    readiness = (
+        detail("wake_intent").get("current_app_readable_after_wake_s")
+        or detail("wake_keys").get("current_app_readable_after_wake_s")
+    )
+    wake_secs = detail("wake_intent").get("seconds")
+    basis, from_probe = None, None
+    if readiness is not None and readiness > WAKE_DELAY:
+        basis, from_probe = readiness, "wake readiness sampling"
+    elif isinstance(wake_secs, (int, float)) and wake_secs > WAKE_DELAY:
+        basis, from_probe = wake_secs, "wake_intent"
+    if basis is not None:
+        env.append({
+            "var": "WAKE_DELAY",
+            "value": str(round(basis + 5)),
+            "because": (
+                "this device took longer to become usable after waking than "
+                "WAKE_DELAY allows, so play commands were arriving before it "
+                "could hear them"
+            ),
+            "from_probe": from_probe,
+            "confidence": "measured",
+        })
+
+    return {
+        "env_vars_to_set": env,
+        "constants_that_look_too_short": slow,
+        "notes": notes,
+        "how_to_apply": (
+            "Add any env_vars_to_set to the `environment:` block of your "
+            "docker-compose.yml, then `docker compose up -d`. Anything under "
+            "constants_that_look_too_short is a code change, not a setting."
+        ) if (env or slow) else (
+            "No settings to change, but see `notes` — something was seen that "
+            "needs a human to identify."
+            if notes else "Nothing to change — the defaults fit this device."
+        ),
+    }
+
+
+def _device_hints(probes: list, profile: Optional[str] = None) -> list:
+    """Device-specific interpretation, written into the report itself.
+
+    Everything here is sourced research, keyed on what the device reports —
+    so a Shield report arrives pre-interpreted instead of needing us to
+    remember the folklore. Nothing in here sends anything.
+    """
+    by_id = {p["id"]: p for p in probes}
+
+    def detail(pid):
+        d = by_id.get(pid, {}).get("detail")
+        return d if isinstance(d, dict) else {}
+
+    hints = []
+    # The tester's declared profile wins over detection when present — they
+    # can see the box; we are reading two strings off a protocol.
+    pid = profile or _detect_profile()
+    prof = _DEVICE_PROFILES.get(pid or "")
+    if prof and prof.get("hints"):
+        hints.extend(prof["hints"](detail))
+
+    # Universal tail — NOT device-keyed. Must stay outside the profile
+    # dispatch: a non-standard SmartTube package id is most likely on exactly
+    # the devices we have no profile for.
+    cand = detail("play").get("smarttube_package_candidate") or ""
+    if cand in KNOWN_SMARTTUBE_PACKAGES and cand != SMARTTUBE_PACKAGE:
+        which = KNOWN_SMARTTUBE_PACKAGES[cand]
+        if "LEGACY" in which:
+            hints.append(
+                f"This install runs a LEGACY SmartTube id ({cand}). "
+                "SmartTube's signing key was compromised around Nov 2025 and "
+                "the app was re-released under new ids; the in-app updater "
+                "cannot cross the rename, so long-time installs stay on the "
+                "old id forever. Recommend a fresh install of current stable "
+                "(32.10s or later) rather than pointing SMARTTUBE_PACKAGE at "
+                "the legacy id — intent-launched videos also played "
+                "unauthenticated before 31.94s, which breaks age-restricted "
+                "playback and watch history."
+            )
+        else:
+            hints.append(
+                f"SmartTube IS installed here, as the {which} "
+                f"({cand}) — but this app is configured for "
+                f"{SMARTTUBE_PACKAGE}, so every foreground check compares "
+                "against a package that isn't there. One-line fix: set "
+                f"SMARTTUBE_PACKAGE={cand}. Nothing is wrong with the "
+                "install itself."
+            )
+    elif cand:
+        hints.append(
+            f"The launch Intent opened {cand}, which is not any SmartTube id "
+            "we know of. If that IS SmartTube, tell us the id and we'll add "
+            "it; if it's the stock YouTube app, Android picked the wrong "
+            "default handler — open SmartTube once by hand and choose "
+            "'always' when the chooser appears."
+        )
+    return hints
+
+
+def _self_test_verdict(probes: list, ctx: dict) -> dict:
+    """Did this run actually learn anything?
+
+    The failure mode this exists for: `status: "ok"` only means the probe
+    didn't raise, the UI colours nothing for a skip, and the docs tell the
+    tester that plenty of skips are normal. So a run that established almost
+    nothing looks exactly like a healthy one — progress bar full, "Finished",
+    send it over — and the round trip is discovered wasted days later, after
+    someone doing you a favour has already spent their evening.
+
+    So state it plainly at the top of the report, in the tester's language.
+    """
+    by_id = {p["id"]: p for p in probes}
+
+    def ok(pid):
+        return by_id.get(pid, {}).get("status") == "ok"
+
+    def detail(pid):
+        d = by_id.get(pid, {}).get("detail")
+        return d if isinstance(d, dict) else {}
+
+    learned, missing = [], []
+
+    woke_intent = detail("wake_intent").get("woke")
+    woke_key = detail("wake_keys").get("woke_with")
+    if ctx.get("device_was_off"):
+        if woke_intent:
+            learned.append("the launch Intent alone wakes this device")
+        elif woke_key:
+            learned.append(f"this device wakes on {woke_key}")
+        elif ctx.get("woke_by_intent") or ctx.get("woke"):
+            # It woke, but nothing is creditable: the Intent landed after its
+            # window expired, or every keycode send errored. Saying "never
+            # woke" here contradicts snapshot_after in the same report, which
+            # costs a round trip with someone doing us a favour.
+            learned.append(
+                "this device woke, but we cannot say what woke it — either "
+                "the launch Intent landed late or every keycode send failed "
+                "to reach the device"
+            )
+        else:
+            missing.append(
+                "The device never woke, from the Intent or any keycode. That "
+                "is itself a finding, but check the wake settings first — on "
+                "an NVIDIA Shield, Settings > Remotes & accessories > "
+                "Simplified wake buttons makes network wake impossible."
+            )
+    else:
+        missing.append(
+            "Waking was not tested: the device was already awake. This is the "
+            "single most useful thing this test can measure. Put the DEVICE "
+            "itself to sleep — the streaming box, not just the TV picture — "
+            "and run it again."
+        )
+
+    if detail("foreground").get("usable") is False:
+        missing.append(
+            "Foreground-app detection is not working on this device, so "
+            "several results below are marked unmeasurable rather than "
+            "failed. Worth reporting on its own."
+        )
+
+    if detail("play").get("lounge_saw_it_after_s") is not None or ctx.get("played"):
+        learned.append("a video can be started and was confirmed playing")
+    elif ok("play"):
+        missing.append(
+            "A video was started but never confirmed playing. If you have not "
+            "paired with SmartTube (the 12-digit code), do that and run again "
+            "— without it we are guessing at what the TV actually did."
+        )
+
+    # Auto-advance is the whole reason the finish probe exists, and the
+    # verdict used to ignore it completely — so a run whose data said the end
+    # of a video was never reported still summarised as a clean bill of
+    # health. Green probe, cheerful verdict, alarming data, three different
+    # stories. Exactly the failure this verdict was written to prevent.
+    fin = detail("finish")
+    if fin.get("ended_after_s") is not None:
+        learned.append(
+            "a video reaching its end is reported, so the queue can move to "
+            "the next one by itself"
+        )
+    elif ok("finish") and fin.get("position_advanced") and fin.get(
+            "stopped_within_5s_of_end"):
+        # Measured on the reference Google TV Streamer, 2026-08-15: with
+        # NOTHING queued behind it, SmartTube pauses on the last frame rather
+        # than reporting Stopped. `lounge.finished` needs Stopped, so it
+        # never fires for a lone clip — and this probe always plays a lone
+        # clip, outside the queue, by design. A two-video queue on that same
+        # device advanced cleanly minutes later, on the duration timer.
+        #
+        # So this reading is NORMAL, and the loud version below would tell
+        # every healthy tester their report proved a bug on our side. False
+        # alarms are the exact cost this whole verdict exists to avoid.
+        learned.append(
+            "playback position is reported accurately all the way to the end "
+            "of a video (this device pauses on the last frame instead of "
+            "reporting a stop, which is normal — the queue advances on its "
+            "own timer)"
+        )
+    elif ok("finish") and fin:
+        missing.append(
+            "Auto-advance could not be confirmed: the test clip played, but "
+            "its ending was never reported"
+            + ("" if fin.get("position_advanced")
+               else ", and the playback position never moved at all")
+            + ". If this report also shows SmartTube paired and connected, "
+            "send it over exactly as it is — that combination is something "
+            "to look at on our side, not anything you can fix."
+        )
+
+    if not _is_lounge_paired():
+        missing.append(
+            "Not paired with SmartTube, so playback position, pause/resume "
+            "and the video-swap checks could not run at all. Pairing takes a "
+            "minute and roughly doubles what this report can tell us."
+        )
+
+    if ok("screensaver") and detail("screensaver").get("screensaver_active") is False:
+        missing.append(
+            "No screensaver was on screen, so we did not learn what this "
+            "device's screensaver is called — the most common reason videos "
+            "fail to start on unfamiliar hardware. Leave it untouched until "
+            "the screensaver appears, then run this again from your phone."
+        )
+    elif ok("screensaver") and detail("screensaver").get("screensaver_active") is None:
+        # Distinct from the above, and the remedy differs: something we don't
+        # recognise WAS on screen, we just couldn't spend a second play signal
+        # finding out what it does. Saying "no screensaver was on screen"
+        # here would be false, and the fix is the awake run, not a longer wait.
+        missing.append(
+            f"{detail('screensaver').get('foreground')} was in the foreground "
+            "and we don't recognise it, but the launch Intent had already "
+            "been spent waking the device, so we could not test whether it "
+            "swallows one. Run this again with the device already awake."
+        )
+
+    return {
+        "useful": bool(learned),
+        "learned": learned,
+        "did_not_learn": missing,
+        "summary": (
+            ("Learned: " + "; ".join(learned) + ". ") if learned
+            else "This run did not establish much. "
+        ) + (
+            f"{len(missing)} thing(s) still unanswered — see did_not_learn."
+            if missing else "Nothing important was missed."
+        ),
+    }
+
+
+async def _run_self_test(run_id: str) -> None:
+    global _self_test_active
+    loop = asyncio.get_running_loop()
+    started = loop.time()
+    writes_at_start = _client_write_count
+    ctx: dict = {}
+
+    try:
+        # INSIDE the guard, deliberately. This runs as a background task and
+        # `_self_test_active` is already True by the time it starts, so
+        # anything that raises out here — rather than inside the try whose
+        # finally clears the flag — leaves the run "running" forever and
+        # every /api/queue and /api/play call answering 409 until the
+        # service is restarted. Nothing before the try may be fallible.
+        #
+        # No ignore-list at the START of a run: if a probe video is already
+        # playing then someone really is watching it, and it is not ours yet.
+        ctx["was_busy"] = _tv_is_busy()
+        for entry in _self_test["probes"]:
+            probe = entry.pop("_fn")
+            entry["status"] = "running"
+            _self_test["eta_s"] = max(
+                0.0, sum(e["budget_s"] for e in _self_test["probes"]
+                         if e["status"] in ("pending", "running"))
+            )
+            t0 = loop.time()
+            try:
+                entry["detail"] = await probe(ctx)
+                entry["status"] = "ok"
+            except _ProbeSkip as exc:
+                entry["status"] = "skipped"
+                entry["detail"] = {"reason": str(exc)}
+            except _ProbeUnmeasurable as exc:
+                entry["status"] = "unmeasurable"
+                entry["detail"] = {"reason": str(exc)}
+            except asyncio.CancelledError:
+                entry["status"] = "cancelled"
+                raise
+            except Exception as exc:
+                log.warning("Self-test probe %s failed", entry["id"], exc_info=True)
+                entry["status"] = "failed"
+                # Redacted: a Lounge failure's repr can carry the token from
+                # the request URL, and this string is pasted into a chat.
+                entry["detail"] = {"error": _redact_secrets(repr(exc))}
+            entry["seconds"] = round(loop.time() - t0, 2)
+
+        interference = _client_write_count - writes_at_start
+        _self_test["report"] = {
+            "run_id": run_id,
+            # First key in the report on purpose: whoever reads it should see
+            # what the run did and didn't establish before any probe detail.
+            "verdict": _self_test_verdict(_self_test["probes"], ctx),
+            # Second key on purpose: what to change, right after what we found.
+            "suggested_configuration": _suggested_configuration(
+                _self_test["probes"]
+            ),
+            # Sourced, device-keyed interpretation — a Shield report explains
+            # itself instead of needing the folklore remembered.
+            "device_hints": _device_hints(
+                _self_test["probes"], _effective_profile()
+            ),
+            "kind": "smarttube-playlist self-test",
+            "version": VERSION,
+            "channel": CHANNEL,
+            "started_at": _self_test["started_at"],
+            "duration_s": round(loop.time() - started, 1),
+            "device_was_busy_at_start": ctx["was_busy"],
+            "interference": {
+                "other_client_actions_during_run": interference,
+                "note": (
+                    "non-zero means someone used the page while the test ran; "
+                    "timings and playback results may be unreliable."
+                ) if interference else "none",
+            },
+            "probes": [
+                {k: v for k, v in e.items() if k != "budget_s"}
+                for e in _self_test["probes"]
+            ],
+            "questions_for_the_tester": _questions_payload(),
+            "device_profile": {
+                "declared": _declared_profile(),
+                "detected": _detect_profile(),
+                "effective": _effective_profile(),
+                "note": (
+                    "declared is what the tester picked; detected is what the "
+                    "protocol reported. A disagreement is itself worth "
+                    "reading — it means this device identifies as something "
+                    "we did not expect."
+                ),
+            },
+        }
+        _self_test["status"] = "done"
+    except asyncio.CancelledError:
+        _self_test["status"] = "error"
+        _self_test["report"] = {"run_id": run_id, "error": "cancelled"}
+        raise
+    except Exception as exc:
+        log.exception("Self-test run failed")
+        _self_test["status"] = "error"
+        _self_test["report"] = {
+            "run_id": run_id, "error": _redact_secrets(repr(exc)),
+        }
+    finally:
+        _self_test["eta_s"] = 0.0
+        _self_test_active = False
+
+
+@app.post("/api/selftest")
+async def selftest_start():
+    """Kick off a self-test. Returns immediately; poll GET for progress.
+
+    POST rather than GET on purpose: the CSRF middleware no-ops on GET, so a
+    GET version would be triggerable cross-origin by any page a guest happens
+    to load — and this endpoint moves the TV.
+    """
+    global _self_test_active, _self_test_task
+    if not SELF_TEST_ENABLED:
+        raise HTTPException(503, "Self-test is disabled (SELF_TEST=0)")
+    # Single-flight before the pairing check: "one is already running" is the
+    # more specific, more useful answer, and it stays correct even if the
+    # remote drops mid-run.
+    if _self_test_active:
+        raise HTTPException(409, "A self-test is already running")
+    # Refuse to start on top of an in-flight tv_play. The 409 on /api/queue
+    # only refuses NEW adds; an add that got in a moment earlier is still
+    # inside its metadata scrape or its wake sequence, and starting a run
+    # alongside it puts two senders on the TV at once.
+    if queue_controller.state.waking or queue_controller.has_pending_sends():
+        raise HTTPException(
+            409,
+            "The TV is mid-launch from a video someone just added. Wait for it "
+            "to start, then run the self-test.",
+        )
+    _require_paired()
+
+    probes = [
+        {
+            "id": pid, "label": label, "budget_s": budget,
+            "status": "pending", "detail": None, "seconds": None,
+            "_fn": fn,
+        }
+        for pid, label, budget, fn in _SELF_TEST_PROBES
+    ]
+    run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    _self_test.update({
+        "status": "running",
+        "run_id": run_id,
+        "started_at": datetime.now(timezone.utc).isoformat(),
+        "eta_s": sum(p["budget_s"] for p in probes),
+        "probes": probes,
+        "report": None,
+    })
+    _self_test_answers.clear()
+    _self_test_active = True
+    _self_test_task = asyncio.create_task(_run_self_test(run_id))
+    return {
+        "run_id": run_id,
+        "eta_s": _self_test["eta_s"],
+        "probes": [{"id": p["id"], "label": p["label"]} for p in probes],
+    }
+
+
+class SelfTestAnswers(BaseModel):
+    answers: dict
+
+
+def _declared_profile() -> Optional[str]:
+    """What the tester picked, if anything. 'other' is a real answer."""
+    v = (_self_test_answers.get("device_profile") or "").strip()
+    return v or None
+
+
+def _effective_profile() -> Optional[str]:
+    """Declared wins over detected — they can see the box, we are reading two
+    strings off a protocol. But a declared 'other' must NOT clobber a
+    confident detection: it means "I don't recognise the list", not "the
+    detection is wrong"."""
+    declared = _declared_profile()
+    if declared and declared != "other":
+        return declared
+    return _detect_profile()
+
+
+def _questions_for(profile: Optional[str]) -> tuple:
+    """The questions worth showing this tester."""
+    return tuple(
+        q for q in _SELF_TEST_QUESTIONS
+        if not q[2] or (profile and profile in q[2])
+    )
+
+
+def _questions_payload() -> list:
+    """Questions for the UI, filtered by profile, with answers folded in.
+
+    Anything already ANSWERED is included even when the current profile
+    filters it out — a tester who answers the Shield questions and then
+    switches the dropdown must not have their typing vanish from the report.
+    """
+    answers = _question_answers()
+    shown = {q[0] for q in _questions_for(_effective_profile())}
+    return [
+        {"id": qid, "question": prompt,
+         "choices": [{"value": v, "label": l} for v, l in choices],
+         "answer": (answers.get(qid) or "").strip()}
+        for qid, prompt, _profiles, choices in _SELF_TEST_QUESTIONS
+        if qid in shown or (answers.get(qid) or "").strip()
+    ]
+
+
+def _question_answers() -> dict:
+    """Tester answers, with device_profile prefilled from protocol detection.
+
+    Their own typed answer always wins. `device_model` used to be prefilled
+    here too, but that question was cut when the form went from fourteen
+    entries to nine — it duplicated the device picker directly above it — so
+    the key was injected and then discarded by every consumer.
+    """
+    answers = dict(_self_test_answers)
+    if not (answers.get("device_profile") or "").strip():
+        detected = _detect_profile()
+        if detected:
+            answers["device_profile"] = detected
+    return answers
+
+
+@app.post("/api/selftest/answers")
+async def selftest_answers(req: SelfTestAnswers):
+    """Fold the tester's answers into the finished report.
+
+    Separate from the run because the answers arrive after it: the questions
+    only make sense once they have watched what happened. Values are capped
+    and stored as data only — this is untrusted text from any LAN guest that
+    ends up pasted into someone else's chat window.
+    """
+    if not SELF_TEST_ENABLED:
+        raise HTTPException(503, "Self-test is disabled (SELF_TEST=0)")
+    # From the FULL list, never the profile-filtered one: a tester who
+    # answers the Shield questions and then switches the dropdown would
+    # otherwise have that POST silently rejected and their typing lost.
+    known = {q[0] for q in _SELF_TEST_QUESTIONS}
+    valid_profiles = set(_DEVICE_PROFILES) | {"other", ""}
+    for key, value in (req.answers or {}).items():
+        if key not in known or not isinstance(value, str):
+            continue
+        if key == "device_profile" and value not in valid_profiles:
+            # An unknown profile id would win over detection and then match no
+            # profile at all, silently disabling every device hint.
+            raise HTTPException(400, f"Unknown device profile: {value!r}")
+        _self_test_answers[key] = value[:500]
+    report = _self_test.get("report")
+    if isinstance(report, dict) and "questions_for_the_tester" in report:
+        report["questions_for_the_tester"] = _questions_payload()
+        # Hints are built at report time, before the tester picks anything —
+        # so recompute them once a profile arrives, or a declared Bell box
+        # would keep whatever the detection guessed at.
+        report["device_profile"] = {
+            "declared": _declared_profile(),
+            "detected": _detect_profile(),
+            "effective": _effective_profile(),
+        }
+        report["device_hints"] = _device_hints(
+            _self_test.get("probes") or [], _effective_profile(),
+        )
+    return {"saved": len(_self_test_answers)}
+
+
+@app.get("/api/selftest")
+async def selftest_status():
+    """Progress while running; the full report once done."""
+    return {
+        "enabled": SELF_TEST_ENABLED,
+        # Worst-case run length, so the UI's "takes about N minutes" comes from
+        # the same numbers the probes actually use instead of a hardcoded
+        # string that drifts the first time a probe is added.
+        "total_budget_s": sum(p[2] for p in _SELF_TEST_PROBES),
+        "status": _self_test["status"],
+        "run_id": _self_test["run_id"],
+        "eta_s": round(_self_test["eta_s"], 1),
+        "questions": _questions_payload(),
+        "probes": [
+            {"id": p["id"], "label": p["label"], "status": p["status"],
+             "seconds": p["seconds"]}
+            for p in _self_test["probes"]
+        ],
+        "report": _self_test["report"],
+    }
 
 
 @app.get("/api/queue")
@@ -1542,6 +4520,7 @@ async def get_queue():
 
 @app.post("/api/queue")
 async def add_to_queue(req: AddReq, request: Request):
+    _reject_during_self_test()
     _require_paired()
     _check_rate_limit(request)
     raw = req.url or req.video_id or ""
@@ -1585,6 +4564,7 @@ async def skip():
     AND something was playing before, send SLEEP to the TV — a manual
     skip past the last item is a clear signal the user is done, so put
     the TV into the ambient screensaver."""
+    _reject_during_self_test()
     _require_paired()
     # Something is playing if our queue owns it OR Lounge actively reports it.
     # The second clause matters: a video started from the TV remote, or one our
@@ -1640,6 +4620,7 @@ async def skip():
 async def pause_playback():
     """Pause the current video on the TV (via Cast) and freeze auto-advance.
     Idempotent — repeated calls have no extra effect."""
+    _reject_during_self_test()
     await queue_controller.pause()
     return {"ok": True, "paused": queue_controller.state.paused}
 
@@ -1649,6 +4630,7 @@ async def resume_playback():
     """Resume the current video on the TV (via Lounge or MEDIA_PLAY) and
     re-enable auto-advance. If the queue stalled with no current item but
     with items queued, starts the next one. Idempotent."""
+    _reject_during_self_test()
     await queue_controller.resume()
     return {"ok": True, "paused": queue_controller.state.paused}
 
@@ -1678,6 +4660,7 @@ async def seek(req: SeekReq):
     to be connected — without a live Lounge session we have no seek
     primitive on this hardware (the remote-protocol KEYCODE_MEDIA_*_FF
     keys aren't a thing across TV firmwares)."""
+    _reject_during_self_test()
     if state.lounge_monitor is None or not state.lounge_monitor.is_connected:
         raise HTTPException(503, "Lounge not connected; can't seek")
 
@@ -1706,16 +4689,19 @@ async def seek(req: SeekReq):
 
 @app.post("/api/volume/{action}")
 async def volume(action: str):
-    """Adjust volume by relaying a keycode over HDMI-CEC.
+    """Adjust volume by sending a keycode over the paired remote.
 
-    The streamer translates these into CEC volume commands aimed at whatever
-    is producing the sound — TV speakers, a soundbar, or an AV receiver — so
-    there is nothing to configure and no brand to pick.
+    The device decides how to deliver it, and there are two verified routes:
+    it relays a CEC command to whatever is producing the sound (TV speakers,
+    soundbar, AV receiver), or it attenuates its own HDMI output. Do NOT call
+    this "HDMI-CEC volume" — that names one mechanism of two and tells owners
+    of CEC-less TVs it cannot work for them, which is measurably false.
 
     Requires CEC volume control to be enabled on the device (Android's
     default, but not universal). When it's off the keypress is accepted and
     silently not translated, and these buttons do nothing; see the README.
     """
+    _reject_during_self_test()
     keycode = VOLUME_KEYCODES.get(action)
     if keycode is None:
         raise HTTPException(404, "unknown volume action — use up, down, or mute")
@@ -1758,6 +4744,7 @@ async def play(req: AddReq, request: Request):
     Same rate-limit bucket as /api/queue. Backward compatible with v0 callers.
     Prefer /api/queue for new clients.
     """
+    _reject_during_self_test()
     _require_paired()
     _check_rate_limit(request)
     raw = req.url or req.video_id or ""

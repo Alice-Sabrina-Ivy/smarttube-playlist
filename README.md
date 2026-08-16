@@ -8,28 +8,7 @@ No accounts to create and no third-party service to sign up for.
 
 ![The web UI: a "Now playing" card with thumbnail, progress bar and playback controls, a box for pasting a YouTube link, the upcoming queue, and a TV status panel](docs/screenshot.png)
 
-*Volume and mute work on both tested devices — see [Volume and mute](#volume-and-mute).*
-
----
-
-## Project status — work in progress
-
-Used daily on the setup it was built for, but not finished, and only proven on the two devices below.
-
-**Verified on real hardware:**
-
-| Device | Pairing | Playback | Wake from off | Volume / mute |
-|---|---|---|---|---|
-| Google TV Streamer (4K) | ✓ | ✓ | ✓ | ✓ (via HDMI-CEC) |
-| Chromecast with Google TV (4K) | ✓ | ✓ | ✓ | ✓ (device's own output — that TV has no CEC) |
-
-Each exercised end to end: pairing, Lounge, pause/resume, auto-advance, wake-from-sleep, screensaver return.
-
-**Other Android TV hardware** — Nvidia Shield, onn., Xiaomi — uses the same protocol and will most likely work, but nobody has confirmed it. Fire TV runs Fire OS and may not expose the Remote service at all. Tried one? [Open an issue](https://github.com/Alice-Sabrina-Ivy/smarttube-playlist/issues) either way.
-
-Where this is heading: see [Roadmap](#roadmap).
-
-Expect rough edges, occasional breaking changes, and slow replies to issues.
+*Work in progress: used daily on the setup it was built for, verified end to end on the two devices below, and still changing — expect rough edges and occasional breaking changes.*
 
 ---
 
@@ -41,16 +20,37 @@ This is the easier alternative: one page on your LAN, anyone pastes a link, the 
 
 ---
 
+## Will it work with my device?
+
+**One test answers it, in about thirty seconds, before you install anything.** Open Google's own **Google TV** app on your phone, tap the remote icon, and try to control your device with it. That app speaks the exact protocol this service uses. If it can drive your device, so can this. If it can't, nothing here will help.
+
+The reason is a single component: **Android TV Remote Service**, which Google pre-installs on Android TV and Google TV devices. It's the whole requirement.
+
+**Verified end to end here:**
+
+| Device | Pairing | Playback | Wake from off | Volume / mute |
+|---|---|---|---|---|
+| Google TV Streamer (4K) | ✓ | ✓ | ✓ | ✓ (via HDMI-CEC) |
+| Chromecast with Google TV (4K) | ✓ | ✓ | ✓ | ✓ (device's own output — that TV has no CEC) |
+
+Each exercised end to end: pairing, Lounge, pause/resume, auto-advance, wake-from-sleep, screensaver return.
+
+> **Careful:** SmartTube advertises that it works *without* Google services. This app needs more than SmartTube does — it needs Google's Remote Service specifically. So "SmartTube runs on my box" does **not** mean this will. The phone-app test above is the one that settles it.
+
+Every other device — the definite noes, the maybes, and why — is in [docs/INSTALL-SMARTTUBE.md](docs/INSTALL-SMARTTUBE.md#which-devices-can-run-it). Tried one that isn't listed? [Open an issue](https://github.com/Alice-Sabrina-Ivy/smarttube-playlist/issues) either way — a No is as useful as a Yes.
+
+---
+
 ## What you'll need
 
-- A **Google TV** device — verified on the Google TV Streamer and Chromecast with Google TV. Other Android TV hardware most likely works but is unconfirmed; see [Project status](#project-status--work-in-progress).
+- A **Google TV** device — verified on the Google TV Streamer and Chromecast with Google TV. Other Android TV hardware most likely works but is unconfirmed; see [Will it work with my device?](#will-it-work-with-my-device).
 - **[SmartTube](https://smarttubeapp.github.io/)** installed on it. It's a separate project from this one, it isn't on the Play Store, and you install it yourself — **[docs/INSTALL-SMARTTUBE.md](docs/INSTALL-SMARTTUBE.md)** walks you through it.
 - A computer that can run Docker and stays on while you're watching — a PC, a Mac, a NAS, a Raspberry Pi (64-bit OS), whatever you have.
 - Both on the **same network** as the TV.
 - **An internet connection** on that computer — video titles and lengths come from YouTube, and playback commands relay through YouTube's servers. Only the web page itself is LAN-only.
 - The TV's IP address (Settings → Network, or your router's device list).
 
-**Give the TV a permanent address** if you can — most routers call this a *DHCP reservation* or *static lease*, usually in the router's device list. Optional, but if the TV's address changes this app stops finding it, and re-pairing means setting `RESET_PAIRING: "1"` in `docker-compose.yml` and restarting (the pairing screen is hidden once a TV is paired).
+**Give the TV a permanent address** if you can — most routers call this a *DHCP reservation* or *static lease*, usually in the router's device list. Optional — if the TV's address changes, the page shows a **PAIRED · CAN'T REACH** screen with a box for typing the new one in. Nothing is re-paired, so it's a ten-second fix; a reservation just saves you doing it.
 
 ## Setup
 
@@ -62,7 +62,7 @@ Pick the path that matches you. Both end at the same place.
 | **Runs on** | Your everyday computer | An always-on box |
 | **Catch** | Only works while that computer is awake and Docker Desktop is running | You're expected to know your way around a shell |
 
-If you just want to try it, start with **Option A**. You can move it to a NAS later — copy the `data` folder across and you won't even need to re-pair.
+If you just want to try it, start with **Option A**. You can move it to a NAS later; you'll re-pair with the TV once, which takes about a minute.
 
 ---
 
@@ -75,47 +75,75 @@ If you just want to try it, start with **Option A**. You can move it to a NAS la
 
 Run the installer and launch it. Wait until the bottom-left says **Engine running**. On Windows it may ask to install WSL 2 and reboot — let it.
 
-**2. Make a folder for it.**
+> **Stuck on "Docker Engine starting…"?** Give it five minutes on a first launch, then restart the PC — that fixes it more often than everything else combined. Still stuck: [Something not working?](#something-not-working)
 
-Anywhere, e.g. `Documents\smarttube-playlist`. Everything lives here, including your TV pairing.
+**2. What you're actually looking at.**
 
-**3. Save the configuration file into that folder.**
+Docker Desktop runs apps in their own sealed box — a *container* — so nothing gets installed into Windows or macOS proper. Its window is mostly a viewer for what's running; there's no "install an app" button in it, which is the bit that trips most people up. You create the container once, by pasting a single line, and from then on it just sits in the **Containers** tab.
 
-Download [`docker-compose.yml`](docker-compose.yml) (click **Raw**, then save) into that folder. No need to edit it — the defaults work.
+**3. Open Docker Desktop's built-in terminal.**
 
-> **Windows:** first turn on File Explorer → **View → Show → File name extensions**, so you can see the real filename. It must be exactly `docker-compose.yml` — a hidden `.txt` on the end is the most common thing that goes wrong here. From Notepad, set *Save as type* to **All Files**.
+Look in the **bottom-right** of the Docker Desktop window for this button:
 
-**4. Open a terminal in that folder.**
+<img src="docs/docker-terminal-button.png" alt="A small dark button showing a greater-than sign followed by an underscore" height="26">
 
-- **Windows:** right-click a blank area in the folder → **Open in Terminal**. (Windows 10: **Shift**+right-click → **Open PowerShell window here**.)
-- **Mac:** right-click the folder → **Services → New Terminal at Folder**. (Missing? Enable it in System Settings → Keyboard → Keyboard Shortcuts → Services.)
+Click it. The first time, it asks whether to turn the terminal on — say yes. Then a panel slides up from the bottom.
 
-**5. Start it.**
+You don't need to go looking for any folder in it. The next step works from wherever it opens.
 
-```bash
-docker compose up -d
+**4. Paste this one line and press Enter.**
+
+```
+docker run -d --name smarttube-playlist --restart unless-stopped -p 38420:8000 -v smarttube-data:/data ghcr.io/alice-sabrina-ivy/smarttube-playlist:latest
 ```
 
-First run downloads the image — a minute or two. You'll see `Container smarttube-playlist  Started`, and it shows green in Docker Desktop's **Containers** tab. It restarts with Docker Desktop from then on.
+It downloads for a minute or two, then prints a long line of letters and numbers. That's the container's ID, and it means it worked. Check the **Containers** tab — `smarttube-playlist` should be there, green, marked *Running*.
 
-**6. Open the page.**
+That's the whole install.
+
+<details>
+<summary>What that line actually says (optional)</summary>
+
+- `-d` — run in the background
+- `--name smarttube-playlist` — what it's called in the Containers tab
+- `--restart unless-stopped` — bring it back after a reboot
+- `-p 38420:8000` — reach it at port 38420 on this computer
+- `-v smarttube-data:/data` — keep the TV pairing in storage Docker manages, so it survives updates. Deliberately not a folder on your PC: Windows paths are the single most common thing to get wrong here.
+- the last part is the app itself, the `:latest` build
+
+</details>
+
+**5. Open the page.**
 
 <http://localhost:38420>
 
-It should load. Two short things before you pair.
+It should load.
+
+**6. One tick box so it survives a restart.**
+
+Gear icon (**Settings**, top right) → **General** → tick **Start Docker Desktop when you sign in to your computer**.
+
+The app is already set to restart itself, but it can't if Docker Desktop isn't running — and Docker Desktop doesn't start on its own until you tick this. Skip it and everything works perfectly until your next reboot, then quietly doesn't.
+
+Two short things before you pair.
 
 #### Letting phones and tablets reach it
 
-`localhost` only works on the computer running it. Everyone else needs that computer's LAN address:
+`localhost` only works on the computer running it. Everyone else needs that computer's address on your network:
 
-- **Windows:** `ipconfig` → *IPv4 Address* under your active adapter
-- **Mac:** System Settings → Network → your connection → *Details*
+- **Windows 11:** Settings → **Network & internet** → click **Wi-Fi** (or **Ethernet**) → click your network's name → scroll to **IPv4 address**
+- **Windows 10:** Settings → **Network & Internet** → **Status** → **Properties** under your connection → **IPv4 address**
+- **Mac:** System Settings → **Network** → your connection → **Details** → **TCP/IP**
 
 Then browse to `http://<that-address>:38420` from any device on the network.
 
+> **Why not `ipconfig`?** Because Docker Desktop itself adds virtual network adapters, and their addresses look completely legitimate in that output — `172.x.x.x`, or `192.168.56.1` if you've ever had VirtualBox. Picking one gives you an address that works on that PC and nowhere else, with nothing to explain why. The Settings path above only ever shows the connection you're actually using.
+>
+> **Sanity check:** the first three numbers should match your phone's. Check on the phone under Wi-Fi settings — tap your network's name. If yours reads `192.168.1.x`, the computer's should too.
+
 **Windows only:** on first run, Windows Defender Firewall asks whether to allow Docker Desktop — tick **Private networks** and allow it. Missed the prompt and nothing else can connect? *Windows Security → Firewall & network protection → Allow an app through firewall*, find Docker Desktop, tick **Private**.
 
-#### The honest catch with Docker Desktop
+#### One catch with Docker Desktop
 
 It's only alive while that computer is on, awake, and running Docker Desktop. If the machine sleeps mid-video, the TV keeps playing but the queue stops advancing and the page goes dead until it wakes.
 
@@ -143,15 +171,17 @@ Same for both options. Open the page and work through the cards.
 
 This is the same protocol the official Google TV mobile app uses. The TV will remember this client under *Settings → Apps → See all apps → Show system apps → Android TV Remote Service* if you ever want to revoke it.
 
-**2. Pair YouTube Lounge** *(optional, strongly recommended)*
+**2. Pair with SmartTube** *(optional, strongly recommended)*
 
-On the TV: **SmartTube → Settings → Remote control**. A **12-digit code** appears — paste it into the web UI's *Pair YouTube Lounge* card. (Older guides call this "Link with TV code"; it moved. Verified on SmartTube 32.10.)
+On the TV: **SmartTube → Settings → Remote control**. A **12-digit code** appears — paste it into the web UI's *Pair with SmartTube* card. (Older guides call this "Link with TV code"; it moved. Verified on SmartTube 32.10.)
 
-This is the same mechanism as "play on TV" in the YouTube mobile app; SmartTube implements the receiver side. Skipping it still works, but you lose real playback position and precise end-of-video detection — see [Honest limitations](#honest-limitations).
+This uses the same YouTube Lounge protocol the phone app's "play on TV" button uses. You'll see the name in logs and the API; the UI just calls it SmartTube, since that's the app you're actually linking to.
+
+Skipping it still works, but you lose real playback position and precise end-of-video detection — see [Things it won't do](#things-it-wont-do).
 
 **3. Done.** Paste a YouTube URL, hit **Add to queue**.
 
-Your answers persist to the `data` folder, so this is a one-time job.
+Your pairing persists to the container's storage, so this is a one-time job — it survives restarts, updates and re-creating the container.
 
 ---
 
@@ -171,11 +201,11 @@ If your TV is asleep, adding a video wakes it, waits for it to boot, foregrounds
 
 ---
 
-## Honest limitations
+## Things it won't do
 
 Worth knowing before you commit:
 
-- **Pair Lounge if you can.** Without it, auto-advance runs on a duration estimate that any pause or seek on the TV puts out of sync.
+- **Pair with SmartTube if you can.** Without it, auto-advance runs on a duration estimate that any pause or seek on the TV puts out of sync.
 - **Livestreams never auto-advance.** No fixed duration, so the queue sits on one until you skip. Marked with a `● LIVE` badge.
 - **Leaving SmartTube stops the queue.** Open Netflix or press Home and it stops sending videos. Nothing is lost — go back to SmartTube and press Skip.
 - **The queue is in-memory.** Restart the container and it's empty. Your pairing is saved; the queue deliberately isn't.
@@ -202,23 +232,34 @@ Cross-site requests and DNS rebinding are both blocked, pairing can't be hijacke
 
 ---
 
-## Configuration
+## Changing a setting, updating, or removing it
 
-Everything is optional and the defaults work — most people change nothing. Set anything you do want as an environment variable in `docker-compose.yml`.
+All three are the same move: delete the container and run the command again.
+Your pairing is never in the container — it lives in the `smarttube-data`
+storage — so it survives all of this.
 
-Every setting, with what it's for: **[docs/CONFIGURATION.md](docs/CONFIGURATION.md)**.
+**Option A** — in the Docker Desktop terminal:
 
----
-
-## Updating
-
-In the folder with `docker-compose.yml`:
-
-```bash
-docker compose pull && docker compose up -d
+```
+docker pull ghcr.io/alice-sabrina-ivy/smarttube-playlist:latest
+docker rm -f smarttube-playlist
+docker run -d --name smarttube-playlist --restart unless-stopped -p 38420:8000 -v smarttube-data:/data ghcr.io/alice-sabrina-ivy/smarttube-playlist:latest
 ```
 
-Your pairing is kept. Stopping and removing it: [docs/ADVANCED-SETUP.md](docs/ADVANCED-SETUP.md#updating-stopping-removing).
+- **Updating?** That's all three lines. The `docker pull` is the part that
+  matters — without it the last line quietly reuses the copy you already have.
+- **Changing a setting?** Skip the first line, and add `-e NAME=VALUE` to the
+  last one, anywhere before the `ghcr.io/...` part. For example
+  `-e WAKE_DELAY=30` to wait longer for a slow TV.
+- **Removing it for good?** Just the middle line, then
+  `docker volume rm smarttube-data` to delete the pairing too. Nothing was ever
+  installed on the TV.
+
+**Option B** — in the folder with `docker-compose.yml`: `docker compose pull &&
+docker compose up -d` to update, edit `environment:` to change a setting, or
+`docker compose down -v` to remove it.
+
+Every setting, with what it's for: **[docs/CONFIGURATION.md](docs/CONFIGURATION.md)**.
 
 ---
 
@@ -235,6 +276,7 @@ The README covers getting it running. Everything else lives here:
 | | |
 |---|---|
 | **[docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md)** | Symptoms and fixes, from install errors to playback oddities |
+| **[docs/BETA-TESTING.md](docs/BETA-TESTING.md)** | Helping test on hardware nobody here owns: switching to the beta build, and what to send back |
 | **[docs/INSTALL-SMARTTUBE.md](docs/INSTALL-SMARTTUBE.md)** | Installing SmartTube on the TV, and which devices can run it |
 | **[docs/QR-CODE.md](docs/QR-CODE.md)** | Make a QR code so guests scan straight to the page |
 | **[docs/ADVANCED-SETUP.md](docs/ADVANCED-SETUP.md)** | Linux, NAS and homelab installs: Docker Engine, Portainer, where data lives, port binding, reverse proxies, building from source |
@@ -250,8 +292,7 @@ The README covers getting it running. Everything else lives here:
 
 No dates — spare-time project.
 
-- **Verified support for other sticks and boxes** — Nvidia Shield, onn./Xiaomi, possibly Fire TV.
-- **Volume where HDMI-CEC isn't available** — those users currently get none.
+- **Verified support for other sticks and boxes** — Nvidia Shield, onn./Xiaomi, carrier boxes. (Not Fire TV: Fire OS has no Android TV Remote Service, so it is out of reach regardless of SmartTube supporting it.)
 
 Got one of the untested devices? [Open an issue](https://github.com/Alice-Sabrina-Ivy/smarttube-playlist/issues) either way.
 

@@ -120,6 +120,9 @@
     margin: 0 0 0.25rem;
     color: var(--phos-bright);
   }
+  /* Aside inside a .card-sub — a note that shouldn't compete with the
+     instruction it follows. */
+  .hint { opacity: 0.7; }
   .card-sub {
     font-size: 0.78rem;
     color: var(--phos-dim);
@@ -256,6 +259,51 @@
     text-transform: uppercase;
   }
 
+  .beta-diag {
+    margin-top: 1rem;
+    padding-top: 0.85rem;
+    border-top: 1px dashed var(--phos-dim);
+  }
+  .beta-diag button { width: 100%; margin-top: 0.5rem; }
+  .st-bar {
+    height: 6px; margin-top: 0.85rem;
+    background: var(--ink); border: 1px solid var(--phos-dim);
+  }
+  .st-bar > div {
+    height: 100%; width: 0;
+    background: var(--phos); box-shadow: 0 0 8px var(--phos);
+    transition: width 500ms linear;
+  }
+  .st-list { list-style: none; margin: 0.6rem 0 0; padding: 0; font-size: 0.78rem; }
+  .st-list li {
+    display: flex; gap: 0.5rem; align-items: baseline;
+    padding: 0.2rem 0; color: var(--phos-dim);
+  }
+  .st-list li .st-ico { width: 1.2rem; flex: 0 0 1.2rem; text-align: center; }
+  .st-list li .st-secs { margin-left: auto; opacity: 0.75; font-size: 0.72rem; }
+  /* Running is the brightest row: on a 2-minute run the one thing a tester
+     wants at a glance is "is it still moving". */
+  .st-list li.st-running { color: var(--phos-bright); }
+  .st-list li.st-ok      { color: var(--phos); }
+  .st-list li.st-bad     { color: var(--warn); }
+  .st-q { margin-top: 0.9rem; }
+  /* Override the global label style here: it uppercases with wide tracking,
+     which is fine for "12-DIGIT CODE" but unreadable for eight full-sentence
+     questions someone has to parse and answer. */
+  .st-q label {
+    display: block; font-size: 0.78rem; line-height: 1.45;
+    letter-spacing: normal; text-transform: none;
+    color: var(--phos-dim); margin: 0 0 0.3rem;
+  }
+  .st-q input, .st-q select {
+    width: 100%; margin-bottom: 0.6rem; font-size: 0.85rem; padding: 0.5rem;
+  }
+  #st-json {
+    width: 100%; height: 14rem; margin-top: 0.5rem;
+    background: var(--ink); color: var(--phos-bright);
+    border: 1px solid var(--phos-dim);
+    font-family: "IBM Plex Mono", monospace; font-size: 12px;
+  }
   .meta {
     display: grid; grid-template-columns: 1fr 1fr; gap: 0.4rem 1rem;
     font-size: 0.78rem; margin-top: 0.5rem;
@@ -598,6 +646,30 @@
   </header>
 
   <!-- ── Pair: enter host ─────────────────────────────────────────────── -->
+  <!-- Shown when the credentials are on disk but we cannot reach the device.
+       Previously this state rendered the pairing card, which can only 409 and
+       which advised deleting a certificate that was never the problem. -->
+  <section id="card-unreachable" class="card" hidden>
+    <h2 class="card-title">▌ Can&#39;t reach your TV</h2>
+    <p class="card-sub">
+      Your pairing is fine — the TV just isn&#39;t answering at
+      <strong id="unreachable-host">its saved address</strong>. It keeps
+      retrying in the background, so if the TV is simply off or asleep, turn
+      it on and this will clear by itself.
+    </p>
+    <p class="card-sub">
+      Still stuck? The usual cause is that the TV&#39;s address changed —
+      routers hand out a different one after a reboot. Check it on the TV
+      under <strong>Settings → Network &amp; Internet</strong>, then enter it
+      here. <span class="hint">This doesn&#39;t re-pair anything; your
+      certificate stays as it is.</span>
+    </p>
+    <label for="new-host">TV address</label>
+    <input id="new-host" type="text" inputmode="decimal" placeholder="192.168.1.69" autocomplete="off">
+    <button id="btn-update-host">Update address</button>
+    <div id="toast-unreachable" class="toast"></div>
+  </section>
+
   <section id="card-pair-host" class="card" hidden>
     <h2 class="card-title">▌ Pair a TV</h2>
     <p class="card-sub">First-time setup. Enter the IP address of your Google TV / Android TV device.</p>
@@ -665,13 +737,17 @@
     <ul id="queue-list" class="qlist" hidden></ul>
   </section>
 
-  <!-- ── Lounge pair: only shown after TV-pair if Lounge isn't paired ──── -->
+  <!-- ── SmartTube pair: only shown after TV-pair if it isn't linked ───── -->
+  <!-- Labelled "SmartTube" throughout, not "YouTube Lounge": Lounge is the
+       protocol's name and means nothing to someone setting this up. What they
+       are doing is linking this page to the SmartTube app. -->
   <section id="card-lounge" class="card" hidden>
-    <h2 class="card-title">▌ Pair YouTube Lounge</h2>
-    <p class="card-sub">For accurate playback sync (real position, real pause/play). On the TV, open SmartTube → Settings → "Link with TV code". Paste the 12-digit code below.</p>
+    <h2 class="card-title">▌ Pair with SmartTube</h2>
+    <p class="card-sub">Optional, but worth it — it gives the real playback position, so the progress bar is accurate and videos advance exactly when they end. Without it the app works off an estimated length.</p>
+    <p class="card-sub">On the TV: <strong>SmartTube → Settings → Remote control</strong>. A 12-digit code appears — type it below. <span class="hint">(Older SmartTube builds called this "Link with TV code".)</span></p>
     <label for="lounge-code">12-digit code</label>
     <input id="lounge-code" class="code-input" type="text" maxlength="14" autocomplete="off" placeholder="123 456 789 012">
-    <button id="btn-lounge-pair">Pair Lounge</button>
+    <button id="btn-lounge-pair">Pair with SmartTube</button>
     <div id="toast-lounge" class="toast"></div>
   </section>
 
@@ -681,11 +757,75 @@
     <dl class="meta">
       <dt>Connected to</dt><dd id="meta-host">—</dd>
       <dt>TV power</dt><dd id="meta-power">—</dd>
-      <dt>Playback sync</dt><dd id="meta-lounge">—</dd>
+      <dt>SmartTube link</dt><dd id="meta-lounge">—</dd>
     </dl>
+    <div class="beta-diag" id="beta-diag" hidden>
+      <p class="card-sub">
+        <strong>Device report.</strong> If something doesn&#39;t work on your
+        device, copy the report and send it over — it says what your TV
+        reported, and includes your TV&#39;s local address but never any
+        credentials.
+      </p>
+      <button id="btn-diag" class="muted">📋 Copy diagnostics</button>
+
+      <p class="card-sub" id="st-intro" style="margin-top:0.9rem">
+        <strong>Device self-test.</strong> Everything above, plus live checks
+        against your TV: it starts a 19-second test video, tries pause, resume
+        and volume, then hands the TV back. The countdown shows the worst
+        case and usually finishes well ahead of it — the sleep run is the slow
+        one, because it waits out every wake attempt properly. Takes about
+        <span id="st-eta-intro">3–8 minutes</span> — please don&#39;t use the page
+        while it runs.
+        <br><br>
+        <strong>To test waking:</strong> put your streaming device to sleep
+        first, then run this from your phone. <span class="hint">If you use a
+        separate box (NVIDIA Shield, Chromecast, Apple TV…), send the BOX to
+        sleep — switching off the TV picture isn&#39;t enough, the box stays
+        awake and the wake checks will skip themselves.</span> Nothing here
+        ever puts your device to sleep for you — a device that ignores wake
+        commands is exactly what we&#39;re looking for, and we&#39;d have no way to
+        bring it back.
+      </p>
+      <button id="btn-selftest" class="muted">🔬 Run device self-test</button>
+
+      <div id="st-panel" hidden>
+        <div class="st-bar"><div id="st-fill"></div></div>
+        <p id="st-eta" class="card-sub" style="margin-top:0.4rem"></p>
+        <ol id="st-list" class="st-list"></ol>
+        <div id="st-questions" class="st-q" hidden>
+          <p class="card-sub">
+            <strong>A few things the app can&#39;t see.</strong> Answer what you
+            can — it goes into the report automatically. Blank is fine, but the
+            volume one is worth a moment: &quot;the app saw no change&quot; means
+            the same thing whether it worked perfectly or can never work.
+          </p>
+          <div id="st-qlist"></div>
+          <button id="btn-st-save" class="muted">Save answers</button>
+        </div>
+        <button id="btn-st-show" class="muted" hidden>📄 Show the report</button>
+        <div id="st-out" hidden>
+          <button id="btn-st-copy" class="muted">📋 Copy report</button>
+          <textarea id="st-json" readonly></textarea>
+          <p class="card-sub" style="margin-top:0.9rem">
+            <strong>Got another five minutes?</strong> Two things this test
+            can&#39;t do by itself. Neither is required — send the report
+            either way, and just mention what happened if you try them.
+            <br><br>
+            <strong>1.</strong> Add <em>two</em> short videos from this page
+            and let the first play all the way to its end. Did the second
+            start on its own?
+            <br>
+            <strong>2.</strong> With the device asleep, add one video the
+            ordinary way. Did it play, and roughly how many seconds passed
+            between pressing Add and the picture appearing?
+          </p>
+        </div>
+      </div>
+      <div id="toast-diag" class="toast"></div>
+    </div>
   </section>
 
-  <footer>SmartTube Playlist · <span id="app-version">v1.0</span> · <a href="https://opensource.org/licenses/MIT" target="_blank" rel="noopener noreferrer">MIT</a> · <a href="https://github.com/Alice-Sabrina-Ivy" target="_blank" rel="noopener noreferrer">Alice Sabrina Ivy</a></footer>
+  <footer>SmartTube Playlist · <span id="app-version">v1.01</span> · <a href="https://opensource.org/licenses/MIT" target="_blank" rel="noopener noreferrer">MIT</a> · <a href="https://github.com/Alice-Sabrina-Ivy" target="_blank" rel="noopener noreferrer">Alice Sabrina Ivy</a></footer>
 </div>
 
 <!-- ── Seek modal (opens via the "Seek" button on the now-playing card) ── -->
@@ -717,6 +857,7 @@
   const $ = id => document.getElementById(id);
   const cards = {
     host:   $("card-pair-host"),
+    unreachable: $("card-unreachable"),
     code:   $("card-pair-code"),
     now:    $("card-now"),
     add:    $("card-add"),
@@ -726,9 +867,14 @@
   };
 
   // queue cards (now/add/queue/meta) all show together when paired.
-  // The lounge-pair card is shown only when configured but not lounge-paired.
+  // The SmartTube-pair card is shown only when configured but not yet linked.
   function showPaired(loungePaired) {
+    // unreachable included deliberately: showCard() is what reveals it, and
+    // this is the only way back out. Leaving it off left the "Can't reach
+    // your TV" card pinned above a working queue — including immediately
+    // after the address form succeeded, which is the one flow it exists for.
     cards.host.hidden = true; cards.code.hidden = true;
+    cards.unreachable.hidden = true;
     cards.now.hidden = false; cards.add.hidden = false;
     cards.queue.hidden = false; cards.meta.hidden = false;
     cards.lounge.hidden = !!loungePaired;
@@ -780,15 +926,20 @@
       line.textContent = "PAIRING…";
     } else if (s.configured) {
       pulse.className = "pulse";
-      // Lounge state suffix — only show when something looks off (paired
-      // but disconnected). When everything's fine, header stays clean.
+      // SmartTube-link suffix — only shown when something looks off. When
+      // everything's fine the header stays clean.
       let suffix = "";
       if (s.lounge_paired === false) {
-        suffix = " · LOUNGE NOT PAIRED";
+        suffix = " · SMARTTUBE NOT PAIRED";
       } else if (s.lounge_paired && !s.lounge_connected) {
-        suffix = " · LOUNGE OFFLINE";
+        suffix = " · SMARTTUBE OFFLINE";
       }
       line.textContent = `LINKED · ${s.host}${suffix}`;
+    } else if (s.credentials_present) {
+      // Paired, but no live connection. Distinct from never having set it up,
+      // and the difference matters: nothing here needs re-pairing.
+      pulse.className = "pulse warn";
+      line.textContent = `PAIRED · CAN'T REACH ${s.host || "TV"} · RETRYING`;
     } else {
       pulse.className = "pulse off";
       line.textContent = "NOT CONFIGURED";
@@ -822,6 +973,14 @@
       setStatus(s);
       if (s.pairing_in_progress)      showCard("code");
       else if (s.configured)          { showPaired(s.lounge_paired); ensureSSE(); }
+      else if (s.credentials_present) {
+        // Prefill with the address we're failing on, so correcting a changed
+        // last octet is a two-character edit rather than a retype.
+        const el = $("new-host");
+        if (document.activeElement !== el && !el.value) el.value = s.host || "";
+        $("unreachable-host").textContent = s.host || "its saved address";
+        showCard("unreachable");
+      }
       else                            showCard("host");
     } catch (e) {
       $("status-line").textContent = "API UNREACHABLE";
@@ -1524,13 +1683,330 @@
     if (e.key === "Enter") submitSeekAbsolute();
   });
 
+  $("btn-diag").addEventListener("click", async () => {
+    const btn = $("btn-diag"); btn.disabled = true;
+    try {
+      const report = await api("/api/diagnostics");
+      const text = JSON.stringify(report, null, 2);
+      let copied = false;
+      // navigator.clipboard requires a secure context. This page is plain http
+      // on a LAN, so that is usually unavailable — hence the fallback below.
+      if (navigator.clipboard && window.isSecureContext) {
+        try { await navigator.clipboard.writeText(text); copied = true; } catch (e) {}
+      }
+      if (copied) {
+        toast($("toast-diag"), "Copied. Paste it to whoever asked.", "ok");
+      } else {
+        const ta = document.createElement("textarea");
+        ta.value = text;
+        ta.setAttribute("readonly", "");
+        ta.style.cssText = "width:100%;height:12rem;margin-top:.5rem;background:var(--ink);color:var(--phos-bright);border:1px solid var(--phos-dim);font-family:'IBM Plex Mono',monospace;font-size:12px;";
+        btn.insertAdjacentElement("afterend", ta);
+        ta.focus(); ta.select();
+        toast($("toast-diag"), "Select all and copy the text below.", "ok");
+      }
+    } catch (e) {
+      toast($("toast-diag"), e.message, "err");
+    } finally { btn.disabled = false; }
+  });
+
+  // ── device self-test ─────────────────────────────────────────────────────
+  // One button; the backend runs every probe and this polls for progress.
+  // Polling rather than SSE on purpose: the SSE stream carries queue snapshots
+  // and adding a second message shape to it would touch the hot path for a
+  // beta-only diagnostic.
+  const ST_ICONS = {
+    pending: "·", running: "▸", ok: "✓",
+    skipped: "–", unmeasurable: "?", failed: "✕", cancelled: "✕",
+  };
+  let stTimer = null;
+  let stFailures = 0;
+
+  function stStop() {
+    if (stTimer) clearInterval(stTimer);
+    stTimer = null;
+    $("btn-selftest").disabled = false;
+  }
+
+  function stRender(s) {
+    const list = $("st-list");
+    list.innerHTML = "";
+    for (const p of s.probes) {
+      const li = document.createElement("li");
+      // Skipped is not a failure — several probes only apply when the TV is
+      // off, or when nothing is playing. Only real breakage gets the warn
+      // colour, so a tester isn't alarmed by a normal run.
+      const cls = p.status === "running" ? "st-running"
+                : p.status === "ok" ? "st-ok"
+                : (p.status === "failed" || p.status === "cancelled") ? "st-bad"
+                : "";
+      if (cls) li.className = cls;
+      const ico = document.createElement("span");
+      ico.className = "st-ico";
+      ico.textContent = ST_ICONS[p.status] || "·";
+      const label = document.createElement("span");
+      label.textContent = p.label;
+      li.append(ico, label);
+      if (p.seconds != null) {
+        const secs = document.createElement("span");
+        secs.className = "st-secs";
+        secs.textContent = p.seconds + "s";
+        li.append(secs);
+      }
+      list.append(li);
+    }
+    const done = s.probes.filter(p => !["pending", "running"].includes(p.status)).length;
+    const pct = s.probes.length ? Math.round((done / s.probes.length) * 100) : 0;
+    $("st-fill").style.width = pct + "%";
+
+    if (s.status === "running") {
+      const m = Math.floor(s.eta_s / 60), sec = Math.round(s.eta_s % 60);
+      $("st-eta").textContent =
+        `Running — ${done} of ${s.probes.length} done, about ` +
+        (m ? `${m}m ${sec}s` : `${sec}s`) + " left. Leave this page open.";
+    } else if (s.status === "done") {
+      // Lead with what the run did or didn't establish. A run that learned
+      // almost nothing otherwise looks identical to a good one — full bar,
+      // "Finished" — and nobody notices until the round trip is spent.
+      const v = s.report && s.report.verdict;
+      $("st-eta").textContent = v
+        ? v.summary + " Answer the questions below, then send the report."
+        : "Finished. Send the report over when you can.";
+      renderQuestions(s.questions);
+      $("btn-st-show").hidden = false;
+    } else if (s.status === "error") {
+      $("st-eta").textContent = "The run stopped early — the report says why.";
+      $("btn-st-show").hidden = false;
+    }
+  }
+
+  function renderQuestions(questions, force) {
+    if (!questions || !questions.length) return;
+    const box = $("st-qlist");
+    // Don't clobber typing on each poll — but DO re-render when the device
+    // profile changes, since that changes which questions apply.
+    if (box.childElementCount && !force) return;
+    box.innerHTML = "";
+    for (const q of questions) {
+      const label = document.createElement("label");
+      label.textContent = q.question;
+      label.setAttribute("for", "stq-" + q.id);
+
+      let field;
+      if (q.choices && q.choices.length) {
+        field = document.createElement("select");
+        for (const c of q.choices) {
+          const opt = document.createElement("option");
+          opt.value = c.value;
+          opt.textContent = c.label;
+          if (c.value === q.answer) opt.selected = true;
+          field.append(opt);
+        }
+        // Picking a device re-asks: some questions only apply to some
+        // hardware, and showing a Shield question to someone holding a
+        // different box is how you teach them to skip the whole form.
+        field.addEventListener("change", async () => {
+          await saveAnswers({ quiet: true });
+          const s = await api("/api/selftest");
+          renderQuestions(s.questions, true);
+          if (s.report) $("st-json").value = JSON.stringify(s.report, null, 2);
+        });
+      } else {
+        field = document.createElement("input");
+        field.type = "text";
+        field.value = q.answer || "";
+        field.autocomplete = "off";
+      }
+      field.id = "stq-" + q.id;
+      field.dataset.qid = q.id;
+      box.append(label, field);
+    }
+    $("st-questions").hidden = false;
+  }
+
+  async function saveAnswers(opts) {
+    const answers = {};
+    // [data-qid], not input[data-qid] — the device picker is a <select>, and
+    // the narrower selector silently dropped it.
+    for (const el of $("st-qlist").querySelectorAll("[data-qid]")) {
+      if (el.value.trim()) answers[el.dataset.qid] = el.value.trim();
+    }
+    // The picker always has a value, so it must not by itself count as
+    // "they filled something in" — otherwise the honest "nothing filled in
+    // yet" nudge never fires.
+    const typed = Object.keys(answers).filter(k => k !== "device_profile");
+    if (!typed.length && !(opts && opts.quiet)) return false;
+    if (!Object.keys(answers).length) return false;
+    try {
+      await api("/api/selftest/answers", { method: "POST", body: { answers } });
+      const s = await api("/api/selftest");
+      if (s.report) $("st-json").value = JSON.stringify(s.report, null, 2);
+      return true;
+    } catch (e) {
+      toast($("toast-diag"), e.message, "err");
+      return false;
+    }
+  }
+
+  $("btn-st-save").addEventListener("click", async () => {
+    const btn = $("btn-st-save"); btn.disabled = true;
+    try {
+      const ok = await saveAnswers();
+      toast($("toast-diag"),
+        ok ? "Saved into the report." : "Nothing filled in yet.",
+        ok ? "ok" : "err");
+    } finally { btn.disabled = false; }
+  });
+
+  async function stPoll() {
+    try {
+      const s = await api("/api/selftest");
+      stFailures = 0;
+      // Populate the report BEFORE revealing the button that shows it, so
+      // there's no window where Show yields an empty box.
+      if (s.report) $("st-json").value = JSON.stringify(s.report, null, 2);
+      stRender(s);
+      if (s.status === "running") return;
+      stStop();
+    } catch (e) {
+      // The run lives on the server, so one dropped poll — phone sleeping,
+      // wifi roaming, a reload mid-flight — is not a reason to abandon a
+      // three-minute test. Only give up after several in a row, and say so
+      // rather than leaving the panel frozen at its last painted state.
+      if (++stFailures < 5) return;
+      stStop();
+      $("st-eta").textContent =
+        "Lost contact with the server. The test may still be running — " +
+        "reload this page to pick it back up.";
+      toast($("toast-diag"), e.message, "err");
+    }
+  }
+
+  $("btn-selftest").addEventListener("click", async () => {
+    // Starting a run clears the previous report AND every answer typed into
+    // it. If one is still on screen unsent, say so rather than eating it.
+    if ($("st-json").value && !confirm(
+          "Start a new test? This discards the finished report above, "
+          + "including any answers you typed. Copy it first if you haven't "
+          + "sent it.")) {
+      return;
+    }
+    const btn = $("btn-selftest"); btn.disabled = true;
+    $("st-out").hidden = true; $("btn-st-show").hidden = true;
+    try {
+      const started = await api("/api/selftest", { method: "POST" });
+      stFailures = 0;
+      $("st-json").value = "";
+      $("st-qlist").innerHTML = "";
+      $("st-questions").hidden = true;
+      $("st-panel").hidden = false;
+      $("st-eta").textContent = "Starting…";
+      $("st-list").innerHTML = "";
+      $("st-fill").style.width = "0%";
+      stRender({
+        status: "running", eta_s: started.eta_s,
+        probes: started.probes.map(p => ({ ...p, status: "pending", seconds: null })),
+      });
+      if (stTimer) clearInterval(stTimer);
+      stTimer = setInterval(stPoll, 1000);
+    } catch (e) {
+      btn.disabled = false;
+      toast($("toast-diag"), e.message, "err");
+    }
+  });
+
+  $("btn-st-show").addEventListener("click", async () => {
+    await saveAnswers();
+    $("st-out").hidden = false;
+    $("btn-st-show").hidden = true;
+    $("st-json").focus(); $("st-json").select();
+  });
+
+  $("btn-st-copy").addEventListener("click", async () => {
+    // Save first: the tester who types answers and hits Copy without pressing
+    // Save is the normal case, not the exception.
+    await saveAnswers();
+    const text = $("st-json").value;
+    // Same secure-context problem as Copy diagnostics: this page is plain http
+    // on a LAN, so navigator.clipboard is usually unavailable and selecting
+    // the textarea is the fallback that actually works.
+    if (navigator.clipboard && window.isSecureContext) {
+      try {
+        await navigator.clipboard.writeText(text);
+        return toast($("toast-diag"), "Copied. Paste it to whoever asked.", "ok");
+      } catch (e) {}
+    }
+    $("st-json").focus(); $("st-json").select();
+    toast($("toast-diag"), "Select all and copy the text above.", "ok");
+  });
+
+  // Another guest may have started a run before this page loaded — show it
+  // rather than offering a button that would only 409.
+  (async () => {
+    try {
+      const s = await api("/api/selftest");
+      if (s.enabled === false) {
+        // Hide the whole block, not just the self-test controls. "Copy
+        // diagnostics" lives in here too and calls /api/diagnostics, which
+        // answers 503 under the same flag — so hiding only the self-test
+        // left a dead button and a paragraph offering a report the server
+        // will refuse to produce. The block starts hidden in the markup and
+        // is revealed below, so a failed fetch shows nothing rather than
+        // showing something broken.
+        return;
+      }
+      $("beta-diag").hidden = false;
+      if (s.total_budget_s) {
+        // Budgets are worst case; a healthy device finishes well ahead.
+        const m = Math.ceil(s.total_budget_s / 60);
+        $("st-eta-intro").textContent = `${m} minutes at most`;
+      }
+      if (s.status === "running") {
+        $("st-panel").hidden = false;
+        $("btn-selftest").disabled = true;
+        stRender(s);
+        stTimer = setInterval(stPoll, 1000);
+      } else if (s.report) {
+        // A finished run survives a reload. The server still holds the whole
+        // report; only this page had forgotten it. Without this the tester's
+        // phone locking its screen loses the run — and the one visible
+        // control ("Run device self-test") would silently destroy it.
+        $("st-panel").hidden = false;
+        $("st-json").value = JSON.stringify(s.report, null, 2);
+        stRender(s);
+      }
+    } catch (e) { /* self-test is beta-only; a 404 here is expected on stable */ }
+  })();
+
+  $("btn-update-host").addEventListener("click", async () => {
+    const host = $("new-host").value.trim();
+    if (!host) return toast($("toast-unreachable"), "Enter the TV's address.", "err");
+    const btn = $("btn-update-host"); btn.disabled = true;
+    try {
+      const r = await api("/api/tv/address", { method: "POST", body: { host } });
+      if (r.connected) {
+        toast($("toast-unreachable"), "Connected. You're back.", "ok");
+      } else {
+        // Saved but still unreachable — say so plainly rather than claiming
+        // success, and leave the form up so it can be corrected again.
+        toast($("toast-unreachable"), r.detail || "Saved, but no answer there.", "err");
+      }
+      await refreshStatus();
+    } catch (e) {
+      toast($("toast-unreachable"), e.message, "err");
+    } finally { btn.disabled = false; }
+  });
+  $("new-host").addEventListener("keydown", e => {
+    if (e.key === "Enter") $("btn-update-host").click();
+  });
+
   $("btn-lounge-pair").addEventListener("click", async () => {
     const code = $("lounge-code").value.trim();
     if (!code) return toast($("toast-lounge"), "Enter the 12-digit code from SmartTube.", "err");
     const btn = $("btn-lounge-pair"); btn.disabled = true;
     try {
       await api("/api/lounge/pair", { method: "POST", body: { code } });
-      toast($("toast-lounge"), "Lounge paired.", "ok");
+      toast($("toast-lounge"), "Paired with SmartTube.", "ok");
       $("lounge-code").value = "";
       await refreshStatus();
     } catch (e) {

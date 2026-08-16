@@ -397,14 +397,23 @@ class QueueController:
         """Synchronous snapshot for read-only endpoints. Safe under GIL for this shape."""
         return self.state.snapshot()
 
-    async def update_tv_on(self, is_on: bool) -> None:
-        """Set TV power state and broadcast a fresh snapshot. No-op if unchanged."""
+    async def update_tv_on(self, is_on: bool) -> bool:
+        """Set TV power state and broadcast a fresh snapshot. No-op if unchanged.
+
+        Returns True only when the value actually CHANGED. Callers need that:
+        the TV-off handler wipes the queue, and the library re-emits the
+        current power state on every reconnect — so acting on the value
+        rather than the transition throws away a video the user queued while
+        the TV was off, which is exactly when they are most likely to queue
+        one.
+        """
         async with self._lock:
             if self.state.tv_on == is_on:
-                return
+                return False
             self.state.tv_on = is_on
             snap = self.state.snapshot()
         await self._broadcaster.publish("tv_power", snap)
+        return True
 
     async def set_waking(self, waking: bool) -> None:
         """Toggle the cold-boot 'waking TV' flag. Drives the UI's
@@ -708,7 +717,14 @@ class QueueController:
         async with self._lock:
             observed_video = self.state.lounge.get("video_id")
             expected_video = self.state.current.video_id if self.state.current else None
-        if expected_video and observed_video != expected_video:
+        # Both sides must be known AND match. Requiring only `expected_video`
+        # to be truthy let the None case through: with nothing of ours playing
+        # — a stalled queue after the external-switch cede, or the beta
+        # self-test which plays outside the queue by design — a foreign
+        # video's end advanced OUR queue. "We don't own anything" is not a
+        # reason to start something.
+        if observed_video is None or expected_video is None or (
+                observed_video != expected_video):
             log.info(
                 "Lounge finished for %s but current expects %s — ignoring",
                 observed_video, expected_video,
@@ -791,7 +807,17 @@ class QueueController:
             self._timer_body(gen, float(item.duration_s))
         )
 
-    async def _timer_body(self, gen: int, seconds: float) -> None:
+    # How many times the duration timer may defer to Lounge before advancing
+    # anyway. Each deferral re-reads current_time, so a device whose position
+    # genuinely advances converges long before this. It only bites when the
+    # position is FROZEN — a dormant player that the cloud cache keeps
+    # reporting at a fixed ct (invariant 4) — where deferring forever means
+    # the queue silently stops advancing and the duration fallback, which
+    # exists precisely for "Lounge cannot be trusted here", never fires.
+    MAX_LOUNGE_DEFERRALS = 12
+
+    async def _timer_body(self, gen: int, seconds: float,
+                          deferrals: int = 0) -> None:
         try:
             await self._sleeper(seconds)
         except asyncio.CancelledError:
@@ -827,7 +853,17 @@ class QueueController:
             except (TypeError, ValueError):
                 lng_dur_f = float(seconds)
             remaining = lng_dur_f - lng_ct
-            if remaining > 5.0:
+            if remaining > 5.0 and deferrals >= self.MAX_LOUNGE_DEFERRALS:
+                # Position is not moving. Deferring again would strand the
+                # queue for good, so fall through and let the duration
+                # fallback do its job.
+                log.warning(
+                    "Duration timer for %s has deferred to Lounge %d times "
+                    "and it still reports %.1fs remaining (ct=%.1f) — the "
+                    "position looks frozen, advancing anyway",
+                    current_video_id, deferrals, remaining, lng_ct,
+                )
+            elif remaining > 5.0:
                 log.info(
                     "Duration timer fired for %s but Lounge reports %.1fs remaining; "
                     "rescheduling (lng_ct=%.1f lng_dur=%.1f)",
@@ -842,7 +878,8 @@ class QueueController:
                     self._timer_gen += 1
                     next_gen = self._timer_gen
                     self._timer_task = asyncio.create_task(
-                        self._timer_body(next_gen, remaining + 5.0)
+                        self._timer_body(next_gen, remaining + 5.0,
+                                         deferrals + 1)
                     )
                 return
             log.info(
@@ -874,6 +911,17 @@ class QueueController:
             else:
                 self.state.current = None
                 self.state.current_started_at = None
+                # Nothing is playing and nothing is queued, so a leftover
+                # `paused` describes a player we no longer own — and it is
+                # not inert. add() gates should_start on `not paused`, and
+                # the replace-current branch can't rescue it because that
+                # needs `current is not None`. Leaving it set wedges the
+                # queue: every later add parks and never plays, silently.
+                # Found on hardware — a lone video ends Paused, not Stopped,
+                # so the mirror sets this on the way out of every video that
+                # plays to its end with nothing behind it.
+                self.state.paused = False
+                self.state.pause_source = None
                 # Cancel any leftover timer state for the now-cleared current.
                 self._timer_gen += 1
                 self._timer_task = None
@@ -896,6 +944,10 @@ class QueueController:
                 return
             self.state.current = None
             self.state.current_started_at = None
+            # Same reasoning as _advance's empty-queue branch: a `paused`
+            # that outlives the item it described wedges every later add.
+            self.state.paused = False
+            self.state.pause_source = None
             self._timer_gen += 1
             self._timer_task = None
             snapshot = self.state.snapshot()
@@ -931,12 +983,22 @@ class QueueController:
         launched twice), or as a stale tv_play waking the TV during
         the next one's setup. The
         cancelled tv_play raises CancelledError out of its sleep;
-        partial side-effects (POWER already sent, market://launch
-        already fired) are idempotent.
+        partial side-effects (wake key already sent, deep link already
+        fired) are idempotent.
         """
         for prior in list(self._send_tasks):
             if not prior.done():
                 prior.cancel()
+
+    def has_pending_sends(self) -> bool:
+        """Is a tv_play still in flight?
+
+        Exposed for the beta self-test, which must refuse to start while one
+        is running: _cancel_in_flight_sends only cancels tasks the controller
+        created, so it cannot see the self-test, and a probe firing alongside
+        an in-flight tv_play is two senders — the double-play shape.
+        """
+        return any(not t.done() for t in self._send_tasks)
 
     def _send_to_tv(self, item: QueueItem) -> None:
         """Fire-and-forget TV send. Failures are logged; state has already moved on."""

@@ -3,10 +3,12 @@ name: Publish container image
 # Builds a multi-arch image and pushes it to GitHub Container Registry.
 #
 #   push to main   -> ghcr.io/<owner>/smarttube-playlist:main
-#   tag v1.1       -> :1.1, :1, :latest  + a GitHub Release
+#   push to beta   -> ghcr.io/<owner>/smarttube-playlist:beta  (hardware beta testing)
+#   tag v1.01      -> :1.01, :1, :latest  + a GitHub Release
 #   pull request   -> build only, never pushed (validates the Dockerfile)
 #
-# Versions are MAJOR.MINOR (v1.0, v1.1, v2.0), cut by scripts/release.py.
+# Versions are MAJOR.MINOR with a zero-padded two-digit minor (v1.00, v1.01,
+# v2.00), cut by scripts/release.py. The legacy v1.0 tag predates the scheme.
 #
 # arm64 is built because the main audience runs this on ARM NAS boxes and
 # single-board machines. Both arches use prebuilt manylinux wheels for
@@ -18,7 +20,7 @@ name: Publish container image
 
 on:
   push:
-    branches: [main]
+    branches: [main, beta]
     tags: ['v*.*']
   pull_request:
     branches: [main]
@@ -62,9 +64,9 @@ jobs:
         uses: docker/metadata-action@v5
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
-          # type=match, not type=semver: our tags are MAJOR.MINOR (v1.0),
+          # type=match, not type=semver: our tags are MAJOR.MINOR (v1.01),
           # which is not valid semver, and the semver extractor rejects it.
-          # The regex pulls "1.1" and "1" out of a tag like v1.1, giving users
+          # The regex pulls "1.01" and "1" out of a tag like v1.01, giving users
           # both an exact pin and a floating major.
           #
           # `latest` is emitted for BOTH a push to the default branch and a
@@ -85,6 +87,17 @@ jobs:
         with:
           context: .
           platforms: linux/amd64,linux/arm64
+          # What makes the `:beta` image a beta image. Deliberately NOT a
+          # source-level default that differs between the branches: beta and
+          # main ship byte-identical app.py and Dockerfile, so a promotion
+          # merge has nothing to carry across by accident. A wrong default
+          # here would switch a TV-hijacking button on for everyone on :latest.
+          # CHANNEL carries the BRANCH name into diagnostics reports, so a
+          # pasted report says which source to read it against. Tag builds are
+          # cut from main, so they correctly report main rather than the tag.
+          build-args: |
+            CHANNEL=${{ github.ref_name == 'beta' && 'beta' || 'main' }}
+            SELF_TEST=${{ github.ref_name == 'beta' && '1' || '0' }}
           push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
@@ -127,8 +140,10 @@ jobs:
             echo "Or pin the major version with \`${IMAGE}:${VERSION%%.*}\`, or track"
             echo "the newest with \`${IMAGE}:latest\`. Older versions stay available."
             echo
-            echo "Already running it? \`docker compose pull && docker compose up -d\`"
-            echo "Your pairing is kept."
+            echo "Already running it? \`docker compose pull && docker compose up -d\`,"
+            echo "or if you installed with the one-line \`docker run\` command, see"
+            echo "[Updating](https://github.com/Alice-Sabrina-Ivy/smarttube-playlist#changing-a-setting-updating-or-removing-it)."
+            echo "Your pairing is kept either way."
           } > notes.md
 
           gh release create "$TAG" \
