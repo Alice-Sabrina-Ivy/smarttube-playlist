@@ -83,6 +83,8 @@ The padding is why `scripts/release.py` orders tags itself rather than with `git
 
 The script bumps `VERSION`, syncs the footer, commits, tags and pushes. Everything after that is CI: the image is built multi-arch and tagged `1.01`, `1` and `latest` in GHCR, then a GitHub Release is created with notes generated from the commits since the previous tag.
 
+Note `:latest` does **not** only track releases — `publish.yml` also emits it on every push to the default branch, so it follows the tip of `main`. Pin `:1.01` to move only when you choose to. The `beta` branch publishes `:beta`, built with `CHANNEL=beta SELF_TEST=1` as build args so the source stays identical on both branches.
+
 Old releases and old image tags are never touched — GitHub lists releases newest-first automatically and keeps them all, so anyone can pin `:1.01` indefinitely. There is no manifest to maintain.
 
 ## Contributing

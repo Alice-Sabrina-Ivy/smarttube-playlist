@@ -6,7 +6,7 @@ Symptoms are grouped roughly in the order you'd hit them: installing, pairing, t
 
 > **Installed with the one-line `docker run` command?** Wherever a fix below says to change something in `docker-compose.yml`, you instead delete the container (**Containers** tab → **⋮** → **Delete**) and paste the run command again with the setting added — e.g. `-e RESET_PAIRING=1`. Your pairing lives in the `smarttube-data` storage and survives.
 
-**`manifest unknown` or `denied` when starting.** Docker couldn't download the image. Check you're online and try `docker compose pull`. If it still fails, [open an issue](https://github.com/Alice-Sabrina-Ivy/smarttube-playlist/issues).
+**`manifest unknown` or `denied` when starting.** Docker couldn't download the image. Check you're online, then try again — `docker pull ghcr.io/alice-sabrina-ivy/smarttube-playlist:latest`, or `docker compose pull` if you use a compose file. If it still fails, [open an issue](https://github.com/Alice-Sabrina-Ivy/smarttube-playlist/issues).
 
 **`no configuration file provided: not found`.** Either the terminal isn't in the folder holding `docker-compose.yml`, or the file is really called `docker-compose.yml.txt` — Windows hides the extension. Type `dir` (Windows) or `ls` (Mac) to see the real filenames.
 
@@ -36,12 +36,10 @@ Symptoms are grouped roughly in the order you'd hit them: installing, pairing, t
 
 **A video shows a 10:00 duration that's obviously wrong,** or its title shows as a jumble of letters. The lookup to YouTube failed, so it fell back to an assumed 10 minutes. This isn't cosmetic: that fake length drives auto-advance, so a long video gets skipped 10 minutes in. Look for `metadata fetch failed` in the logs; if it happens often, your connection is slow to reach YouTube — raise `METADATA_TIMEOUT_S` (see [docs/CONFIGURATION.md](CONFIGURATION.md)).
 
-**Reading the logs:**
+**Reading the logs:** on Docker Desktop, click the container and open the **Logs** tab. From a terminal:
 
 ```bash
-docker compose logs -f
+docker logs -f smarttube-playlist     # or: docker compose logs -f
 ```
-
-On Docker Desktop you can also click the container and open the **Logs** tab.
 
 Still stuck? [Open an issue](https://github.com/Alice-Sabrina-Ivy/smarttube-playlist/issues) with your logs at `LOG_LEVEL=DEBUG` and which TV device you're using.

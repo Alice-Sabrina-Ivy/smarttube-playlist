@@ -8,49 +8,7 @@ No accounts to create and no third-party service to sign up for.
 
 ![The web UI: a "Now playing" card with thumbnail, progress bar and playback controls, a box for pasting a YouTube link, the upcoming queue, and a TV status panel](docs/screenshot.png)
 
-*Volume and mute work on both tested devices — see [Volume and mute](#volume-and-mute).*
-
----
-
-## Project status — work in progress
-
-Used daily on the setup it was built for, but not finished, and only proven on the two devices below.
-
-**Verified on real hardware:**
-
-| Device | Pairing | Playback | Wake from off | Volume / mute |
-|---|---|---|---|---|
-| Google TV Streamer (4K) | ✓ | ✓ | ✓ | ✓ (via HDMI-CEC) |
-| Chromecast with Google TV (4K) | ✓ | ✓ | ✓ | ✓ (device's own output — that TV has no CEC) |
-
-Each exercised end to end: pairing, Lounge, pause/resume, auto-advance, wake-from-sleep, screensaver return.
-
-### Will it work with my device?
-
-**One test answers it, in about thirty seconds, before you install anything.** Open Google's own **Google TV** app on your phone, tap the remote icon, and try to control your device with it. That app speaks the exact protocol this service uses. If it can drive your device, so can this. If it can't, nothing here will help.
-
-The reason is a single component: **Android TV Remote Service**, which Google pre-installs on Android TV and Google TV devices. It's the whole requirement.
-
-| Device | Works? | |
-|---|---|---|
-| **Google TV Streamer (4K)** | ✅ | Verified end to end |
-| **Chromecast with Google TV (4K)** | ✅ | Verified end to end |
-| **NVIDIA Shield** (all models) | ✅ probably | Same protocol; Home Assistant documents Shield-specific remote behaviour, which only makes sense if it works. Not yet confirmed by us |
-| **Android TV / Google TV** with the Play Store — onn., Xiaomi, Sony, Philips, TCL, Hisense, Nokia | ✅ probably | Carries the Remote Service by default |
-| **Amazon Fire TV** (any model) | ❌ | SmartTube runs fine there, but Fire OS has **no Android TV Remote Service**, so this app can't drive it. Amazon's own LAN remote protocol exists — it just can't launch a *specific video* into SmartTube, or tell us which app is on screen, and both are load-bearing here. Own one and want to help? [Open an issue](https://github.com/Alice-Sabrina-Ivy/smarttube-playlist/issues) — a couple of measurements would settle it for good |
-| **Roku**, incl. Roku TVs | ❌ | Not Android. Can't install SmartTube at all |
-| **Apple TV, Samsung (Tizen), LG (webOS)** | ❌ | Not Android |
-| **Older Chromecast dongles** (1st–3rd gen, Ultra, Audio) | ❌ | Cast receivers, not Android TV — only *Chromecast with Google TV* qualifies |
-| **Carrier boxes** (Bell, Sky, Rogers…) | ❓ | Depends. Many are Android TV underneath and should work; do the phone-app test |
-| **AOSP boxes with no Play Store** | ❓ | Probably not, and this is the trap below |
-
-> **Careful:** SmartTube advertises that it works *without* Google services. This app needs more than SmartTube does — it needs Google's Remote Service specifically. So "SmartTube runs on my box" does **not** mean this will. The phone-app test is the one that settles it.
-
-Tried a device that isn't listed? [Open an issue](https://github.com/Alice-Sabrina-Ivy/smarttube-playlist/issues) either way — a No is as useful as a Yes.
-
-Where this is heading: see [Roadmap](#roadmap).
-
-Expect rough edges, occasional breaking changes, and slow replies to issues.
+*Work in progress: used daily on the setup it was built for, verified end to end on the two devices below, and still changing — expect rough edges and occasional breaking changes.*
 
 ---
 
@@ -62,9 +20,30 @@ This is the easier alternative: one page on your LAN, anyone pastes a link, the 
 
 ---
 
+## Will it work with my device?
+
+**One test answers it, in about thirty seconds, before you install anything.** Open Google's own **Google TV** app on your phone, tap the remote icon, and try to control your device with it. That app speaks the exact protocol this service uses. If it can drive your device, so can this. If it can't, nothing here will help.
+
+The reason is a single component: **Android TV Remote Service**, which Google pre-installs on Android TV and Google TV devices. It's the whole requirement.
+
+**Verified end to end here:**
+
+| Device | Pairing | Playback | Wake from off | Volume / mute |
+|---|---|---|---|---|
+| Google TV Streamer (4K) | ✓ | ✓ | ✓ | ✓ (via HDMI-CEC) |
+| Chromecast with Google TV (4K) | ✓ | ✓ | ✓ | ✓ (device's own output — that TV has no CEC) |
+
+Each exercised end to end: pairing, Lounge, pause/resume, auto-advance, wake-from-sleep, screensaver return.
+
+> **Careful:** SmartTube advertises that it works *without* Google services. This app needs more than SmartTube does — it needs Google's Remote Service specifically. So "SmartTube runs on my box" does **not** mean this will. The phone-app test above is the one that settles it.
+
+Every other device — the definite noes, the maybes, and why — is in [docs/INSTALL-SMARTTUBE.md](docs/INSTALL-SMARTTUBE.md#which-devices-can-run-it). Tried one that isn't listed? [Open an issue](https://github.com/Alice-Sabrina-Ivy/smarttube-playlist/issues) either way — a No is as useful as a Yes.
+
+---
+
 ## What you'll need
 
-- A **Google TV** device — verified on the Google TV Streamer and Chromecast with Google TV. Other Android TV hardware most likely works but is unconfirmed; see [Project status](#project-status--work-in-progress).
+- A **Google TV** device — verified on the Google TV Streamer and Chromecast with Google TV. Other Android TV hardware most likely works but is unconfirmed; see [Will it work with my device?](#will-it-work-with-my-device).
 - **[SmartTube](https://smarttubeapp.github.io/)** installed on it. It's a separate project from this one, it isn't on the Play Store, and you install it yourself — **[docs/INSTALL-SMARTTUBE.md](docs/INSTALL-SMARTTUBE.md)** walks you through it.
 - A computer that can run Docker and stays on while you're watching — a PC, a Mac, a NAS, a Raspberry Pi (64-bit OS), whatever you have.
 - Both on the **same network** as the TV.
@@ -96,11 +75,7 @@ If you just want to try it, start with **Option A**. You can move it to a NAS la
 
 Run the installer and launch it. Wait until the bottom-left says **Engine running**. On Windows it may ask to install WSL 2 and reboot — let it.
 
-> **Stuck on "Docker Engine starting…"?** (Windows) Give it five minutes — the first launch is the slow one. Then, in order:
->
-> 1. **Restart the PC.** The installer asks for this and it's easy to skip. It fixes this more often than everything else combined.
-> 2. **Check virtualization is on:** Task Manager → Performance → CPU, where **Virtualization** should read *Enabled*. If it says disabled, you'll need to turn it on in your BIOS/UEFI — Intel calls it **VT-x** or *Virtualization Technology*, AMD calls it **SVM Mode**. Docker can't turn it on for you.
-> 3. Run `wsl --update` in PowerShell, then restart Docker Desktop.
+> **Stuck on "Docker Engine starting…"?** Give it five minutes on a first launch, then restart the PC — that fixes it more often than everything else combined. Still stuck: [Something not working?](#something-not-working)
 
 **2. What you're actually looking at.**
 
@@ -168,24 +143,11 @@ Then browse to `http://<that-address>:38420` from any device on the network.
 
 **Windows only:** on first run, Windows Defender Firewall asks whether to allow Docker Desktop — tick **Private networks** and allow it. Missed the prompt and nothing else can connect? *Windows Security → Firewall & network protection → Allow an app through firewall*, find Docker Desktop, tick **Private**.
 
-#### The honest catch with Docker Desktop
+#### One catch with Docker Desktop
 
 It's only alive while that computer is on, awake, and running Docker Desktop. If the machine sleeps mid-video, the TV keeps playing but the queue stops advancing and the page goes dead until it wakes.
 
 Fine for trying it out, or movie night on a desktop that's already on. For something always available, move it to a NAS or Pi — Option B.
-
-#### Changing a setting later
-
-Everything in [docs/CONFIGURATION.md](docs/CONFIGURATION.md) is optional, and you can ignore it until something needs fixing. When it does, add the setting to the same command and run it again:
-
-1. **Containers** tab → the **⋮** menu next to `smarttube-playlist` → **Delete**. Your TV pairing is safe; it lives in the `smarttube-data` storage, not in the container.
-2. Paste the command again with the setting added — `-e NAME=VALUE`, before the last line. For example, to wait longer for a slow TV to wake:
-
-```
-docker run -d --name smarttube-playlist --restart unless-stopped -p 38420:8000 -v smarttube-data:/data -e WAKE_DELAY=30 ghcr.io/alice-sabrina-ivy/smarttube-playlist:latest
-```
-
-Prefer keeping settings in a file? That's what `docker-compose.yml` is for — see [Option B](#option-b--linux-nas-or-homelab). It works on Docker Desktop too; it just needs a terminal opened in the right folder, which is the step this quick path exists to avoid.
 
 **Option A is done — skip Option B entirely and go to [Pair with your TV](#pair-with-your-tv).**
 
@@ -215,7 +177,7 @@ On the TV: **SmartTube → Settings → Remote control**. A **12-digit code** ap
 
 This uses the same YouTube Lounge protocol the phone app's "play on TV" button uses. You'll see the name in logs and the API; the UI just calls it SmartTube, since that's the app you're actually linking to.
 
-Skipping it still works, but you lose real playback position and precise end-of-video detection — see [Honest limitations](#honest-limitations).
+Skipping it still works, but you lose real playback position and precise end-of-video detection — see [Things it won't do](#things-it-wont-do).
 
 **3. Done.** Paste a YouTube URL, hit **Add to queue**.
 
@@ -239,7 +201,7 @@ If your TV is asleep, adding a video wakes it, waits for it to boot, foregrounds
 
 ---
 
-## Honest limitations
+## Things it won't do
 
 Worth knowing before you commit:
 
@@ -270,20 +232,13 @@ Cross-site requests and DNS rebinding are both blocked, pairing can't be hijacke
 
 ---
 
-## Configuration
+## Changing a setting, updating, or removing it
 
-Everything is optional and the defaults work — most people change nothing. To set one: on Option A add `-e NAME=VALUE` to the run command and run it again (see [Changing a setting later](#changing-a-setting-later)); on Option B add it under `environment:` in `docker-compose.yml`.
+All three are the same move: delete the container and run the command again.
+Your pairing is never in the container — it lives in the `smarttube-data`
+storage — so it survives all of this.
 
-Every setting, with what it's for: **[docs/CONFIGURATION.md](docs/CONFIGURATION.md)**.
-
----
-
-## Updating
-
-Your pairing is kept either way — it lives in the storage, not in the container.
-
-**If you installed with Option A** (the one-line command), open the Docker Desktop
-terminal again and paste these three lines:
+**Option A** — in the Docker Desktop terminal:
 
 ```
 docker pull ghcr.io/alice-sabrina-ivy/smarttube-playlist:latest
@@ -291,19 +246,20 @@ docker rm -f smarttube-playlist
 docker run -d --name smarttube-playlist --restart unless-stopped -p 38420:8000 -v smarttube-data:/data ghcr.io/alice-sabrina-ivy/smarttube-playlist:latest
 ```
 
-The first line fetches the new build, the second removes the old container, the
-third starts a fresh one. The `docker pull` is the part that matters: without it
-the third line happily reuses the copy already on your machine, and nothing
-changes. If you added any `-e` settings to your original command, add them to
-the third line too.
+- **Updating?** That's all three lines. The `docker pull` is the part that
+  matters — without it the last line quietly reuses the copy you already have.
+- **Changing a setting?** Skip the first line, and add `-e NAME=VALUE` to the
+  last one, anywhere before the `ghcr.io/...` part. For example
+  `-e WAKE_DELAY=30` to wait longer for a slow TV.
+- **Removing it for good?** Just the middle line, then
+  `docker volume rm smarttube-data` to delete the pairing too. Nothing was ever
+  installed on the TV.
 
-**If you installed with Option B**, in the folder with `docker-compose.yml`:
+**Option B** — in the folder with `docker-compose.yml`: `docker compose pull &&
+docker compose up -d` to update, edit `environment:` to change a setting, or
+`docker compose down -v` to remove it.
 
-```bash
-docker compose pull && docker compose up -d
-```
-
-Stopping and removing it: [docs/ADVANCED-SETUP.md](docs/ADVANCED-SETUP.md#updating-stopping-removing).
+Every setting, with what it's for: **[docs/CONFIGURATION.md](docs/CONFIGURATION.md)**.
 
 ---
 

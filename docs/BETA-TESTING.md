@@ -32,7 +32,7 @@ When it finishes, the page shows **a few short questions** — things the app ge
 
 ## The passive report
 
-The **📋 Copy diagnostics** button next to it produces the same information without touching your TV at all. Use it if you'd rather not have anything moved, or to capture a moment — see step 2 below.
+The **📋 Copy diagnostics** button next to it reports what the app can see without touching your TV at all. Use it if you'd rather not have anything moved.
 
 It contains **no credentials** — no pairing certificate, no private key, no YouTube token. It *does* include your TV's local address (like `192.168.1.42`), because that's useful for diagnosis. That's a private address that means nothing outside your own network, but if you'd rather not share it, delete the `host` line before sending.
 
@@ -97,17 +97,19 @@ If something doesn't work, these are the usual culprits — all on the device, n
 - **Volume does nothing** — HDMI-CEC volume control is usually switched off somewhere in the chain. See [CONFIGURATION.md](CONFIGURATION.md#volume-and-mute); note your TV probably calls CEC something else (*Anynet+*, *SIMPLINK*, *BRAVIA Sync*).
 - **The report shows a `current_app is empty` warning** — foreground detection isn't working, which quietly breaks several things at once. Worth reporting immediately.
 
-## When you're done
-
-Going back to the stable build:
-
-- *With a `docker-compose.yml`:* change `image:` back to end in `:latest` **and change `SELF_TEST: "1"` back to `"0"`** — that second half is the important one. Left on, the self-test button stays pressable by anyone who can reach the page. Then `docker compose pull && docker compose up -d`.
-- *With the one-line command:* delete the container and run the original command again (the one ending `:latest`). Nothing to undo — the setting lived in the beta image, not in your command.
-
-Your pairing survives either way.
-
 ## Sending it back
 
 Paste the reports, plus your device model and its software version. If something failed, say what you saw on the TV screen — that's the part the app can't observe, and usually the part that explains the rest.
 
 A run where most probes say `skipped` is normal, not a failure: several only apply when the TV is off, and others stand down when something's already playing. `unmeasurable` is different — it means the app couldn't see well enough to judge, and it's worth mentioning.
+
+## When you're done
+
+**Send your report first.** It only lives in the page — recreating the container throws it away, and after switching back the button is gone, so re-running would mean reinstalling the beta.
+
+Then, to go back to stable:
+
+- *With a `docker-compose.yml`:* change `image:` back to end in `:latest` **and change `SELF_TEST: "1"` back to `"0"`** — that second half is the important one. Left on, the self-test button stays pressable by anyone who can reach the page. Then `docker compose pull && docker compose up -d`.
+- *With the one-line command:* delete the container and run the original command again (the one ending `:latest`). Nothing to undo — the setting lived in the beta image, not in your command.
+
+Your pairing survives either way.

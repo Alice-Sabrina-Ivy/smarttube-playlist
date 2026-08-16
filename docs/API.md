@@ -17,7 +17,7 @@ POST   /api/pause                         pause playback and freeze auto-advance
 POST   /api/resume                        resume
 POST   /api/clear                         empty the queue, leave current playing
 POST   /api/seek           {to|by}        `to`: "1:23" / "90s" / "1h30m"; `by`: ±seconds. 503 without Lounge
-POST   /api/volume/{up|down|mute}         relays an HDMI-CEC volume keycode; 503 if
+POST   /api/volume/{up|down|mute}         sends a volume keycode over the paired remote; 503 if
                                           no TV is paired
 GET    /api/events                        SSE stream of queue snapshots
 POST   /api/play           {url|video_id} legacy: clear queue and replace current
@@ -55,7 +55,7 @@ POST   /api/selftest/answers   {answers}  fold the tester's answers into the rep
 `enabled: false`, because that is the field the page reads to decide whether
 to show the button at all.
 
-`POST /api/selftest` returns **200** immediately with `run_id`, `eta_s` and the probe list — the run itself takes about three minutes — so poll the `GET` for progress and, once `status` is `done`, the full report.
+`POST /api/selftest` returns **200** immediately with `run_id`, `eta_s` and the probe list — the run itself takes up to about eight minutes — so poll the `GET` for progress and, once `status` is `done`, the full report.
 
 It returns **409** while a run is already in flight, and so does **every endpoint that moves the TV**: `/api/queue`, `/api/play`, `/api/skip`, `/api/pause`, `/api/resume`, `/api/seek` and `/api/volume/*`. The self-test sends its own commands, and two senders at once is the double-play failure this project guards hardest against. `/api/clear` stays available — it only empties the queue and sends nothing to the TV.
 

@@ -19,15 +19,11 @@ services:
 | Variable | Default | What it does |
 |---|---|---|
 | `CLIENT_NAME` | `SmartTube Playlist` | Name shown on the TV during pairing |
-| `SMARTTUBE_PACKAGE` | `org.smarttube.stable` | Set to `org.smarttube.beta` for the beta build |
+| `SMARTTUBE_PACKAGE` | `org.smarttube.stable` | The SmartTube build installed on your TV. Only change this if you installed SmartTube's own beta or F-Droid build — it is unrelated to this app's `:beta` image |
 | `LOG_LEVEL` | `INFO` | Set `DEBUG` when diagnosing something. Case-insensitive; an unrecognised value falls back to `INFO` with a warning rather than failing to start |
 | `RATE_LIMIT_SECONDS` | `10` | Per-IP cool-down between queue submissions |
-| `WAKE_DELAY` | `15.0` | Minimum seconds to wait after `POWER` before launching. A floor, not a timeout — instant-on TVs report "on" in ~1s while still booting |
+| `WAKE_DELAY` | `15.0` | Minimum seconds to wait after the wake key before launching. A floor, not a timeout — instant-on TVs report "on" in ~1s while still booting |
 | `WAKE_TIMEOUT` | `30.0` | Give up waiting for the TV to report on |
-| `SELF_TEST_VIDEO` | `jNQXAC9IVRw` | Only used when `SELF_TEST=1`. The 19-second clip the self-test plays. Override it if that video isn't available where you are |
-| `SELF_TEST_VIDEO_LONG` | `aqz-KE-bpKQ` | Only used when `SELF_TEST=1`. The longer clip the self-test swaps to, so the pause/resume checks have something still playing |
-| `CHANNEL` | `stable` | Which build a diagnostics report says it came from. Baked into the image at build time (`beta` in the `:beta` image), not derived from `SELF_TEST` — so turning diagnostics on to send us a report doesn't make your stable install claim to be a beta one. Only worth setting if you build your own image |
-| `SELF_TEST` | `0` | `1` adds the **Run device self-test** button and enables `/api/diagnostics`. Off by default on stable, on by default in the `:beta` image. The self-test drives the TV — short video, pause/resume, volume — and anyone who can reach the page can press it; `/api/diagnostics` returns your LAN address, device model, firmware and event log to any caller. It never puts the device to sleep. Turn it on when helping test unusual hardware, or when we've asked you for a report |
 | `WAKE_KEYCODE` | `POWER` | Key sent to wake a sleeping device. `POWER` is a *toggle*; a device that ignores toggles while asleep can never be woken and reports no error. Try `WAKEUP` or `TV_POWER` if yours never wakes — but note `WAKEUP` is silently dropped on Google TV, so only change this if the default has failed |
 | `WAKE_POLL` | `0.5` | How often to re-check while waking |
 | `SCREENSAVER_PACKAGES` | `com.google.android.apps.tv.dreamx,com.google.android.backdrop,com.android.dreams.basic,com.neilturner.aerialviews` | Packages treated as screensavers; these swallow launch intents, so they get dismissed first |
@@ -39,6 +35,10 @@ services:
 | `DATA_DIR` | `/data` | Where pairing state is stored **inside** the container. Change the volume mount instead |
 | `ALLOWED_HOSTS` | (unset) | Comma-separated hostnames to accept in the `Host` header. Only needed behind a reverse proxy on a real domain — see [SECURITY.md](../SECURITY.md) |
 | `RESET_PAIRING` | (unset) | Set to `1` to clear all pairing on the next start. Fires **once**, then ignores itself — safe to leave set. Clear it only if you want to arm a second reset. See [SECURITY.md](../SECURITY.md#resetting-the-pairing) |
+| `SELF_TEST` | `0` | `1` adds the **Run device self-test** button and enables `/api/diagnostics`. The self-test drives the TV for several minutes and anyone who can reach the page can press it; `/api/diagnostics` reports your LAN address, device model, firmware and event log to any caller. On by default only in the `:beta` image. See [SECURITY.md](../SECURITY.md) |
+| `SELF_TEST_VIDEO` | `jNQXAC9IVRw` | The 19-second clip the self-test plays. Override if it isn't available where you are |
+| `SELF_TEST_VIDEO_LONG` | `aqz-KE-bpKQ` | The longer clip it swaps to, so the pause/resume checks have something still playing |
+| `CHANNEL` | `stable` | The build name a diagnostics report carries. Set by the image; only worth changing if you build your own |
 
 ## Volume and mute
 

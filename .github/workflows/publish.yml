@@ -139,7 +139,7 @@ jobs:
             echo
             echo "Already running it? \`docker compose pull && docker compose up -d\`,"
             echo "or if you installed with the one-line \`docker run\` command, see"
-            echo "[Updating](https://github.com/Alice-Sabrina-Ivy/smarttube-playlist#updating)."
+            echo "[Updating](https://github.com/Alice-Sabrina-Ivy/smarttube-playlist#changing-a-setting-updating-or-removing-it)."
             echo "Your pairing is kept either way."
           } > notes.md
 

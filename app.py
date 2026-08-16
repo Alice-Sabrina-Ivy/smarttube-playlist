@@ -798,7 +798,16 @@ async def _handle_is_on_change(is_on: bool) -> None:
         # every real Lounge event so the UI shows no playing state
         # even though SmartTube is genuinely playing.
         current = _get_current_app()
-        if current is not None:
+        # `if current`, not `is not None`: androidtvremote2 initialises
+        # current_app to "" and only ever fills it from an IME key-inject
+        # message, so "" means "no reading", not "some app that isn't
+        # SmartTube". Treating it as the latter pinned suppress_lounge True —
+        # permanently on a device where IME is never negotiated, which blanks
+        # every Lounge event and takes auto-advance down with it, and
+        # transiently on ALL hardware, because each reconnect builds a fresh
+        # protocol object with current_app back to "" and re-emits is_on.
+        # Leaving the flag alone beats guessing.
+        if current:
             state.last_current_app = current
             state.suppress_lounge = (current != SMARTTUBE_PACKAGE)
 
@@ -869,8 +878,10 @@ async def _wait_for_lounge_connected(timeout: float, poll: float) -> bool:
 def _wire_callbacks(remote: AndroidTVRemote) -> None:
     """Register kill-switch + availability + power callbacks on a (re)connected remote."""
     state.last_current_app = _get_current_app()
-    state.suppress_lounge = (
-        state.last_current_app is not None
+    # Same "" trap as _handle_is_on_change: an unread current_app must not
+    # read as "not SmartTube".
+    state.suppress_lounge = bool(
+        state.last_current_app
         and state.last_current_app != SMARTTUBE_PACKAGE
     )
     # Seed the diagnostics log with what the device looks like right now. The
@@ -2512,7 +2523,7 @@ async def _probe_snapshot_after(ctx: dict) -> dict:
     Also re-runs the foreground liveness check when a wake probe woke the
     device, since the first attempt correctly skipped on a sleeping TV.
     """
-    if ctx.get("woke_by_intent") or ctx.get("woke_by_key"):
+    if ctx.get("woke_by_intent") or ctx.get("woke_by_key") or ctx.get("woke"):
         try:
             ctx["foreground_recheck"] = await _probe_foreground_readability(ctx)
         except (_ProbeSkip, _ProbeUnmeasurable) as exc:
@@ -3288,8 +3299,29 @@ async def _probe_end_of_video(ctx: dict) -> dict:
     # next Stopped — belonging to the previous video — reads as "our 19s clip
     # ended after 1.5s", which is a confident wrong answer about the only
     # auto-advance coverage in the whole test.
+    #
+    # And it has to ASK. `observation` is a passive cache that only moves when
+    # SmartTube pushes — which it does on transitions "and sometimes not even
+    # then" — while `_periodic_refresh_loop` is gated on the queue owning a
+    # current item, and this probe plays outside the queue by design. Reading
+    # the cache in a loop here is the identical bug the first hardware run
+    # caught in the sampling loop below; only that one got fixed.
+    #
+    # Gated, though: request_now_playing's precondition is that SmartTube is
+    # foregrounded and playing, because polling a BACKGROUNDED SmartTube
+    # auto-foregrounds it and on a Shield can wake the device. We only poll
+    # once an earlier probe has confirmed playback.
     start_deadline = loop.time() + SELF_TEST_SWAP_TIMEOUT
+    may_poll = bool(
+        (ctx.get("played") or ctx.get("swapped"))
+        and getattr(state.remote, "is_on", False)
+    )
+    next_start_poll = 0.0
     while loop.time() < start_deadline:
+        if may_poll and loop.time() >= next_start_poll:
+            next_start_poll = loop.time() + SELF_TEST_NOW_PLAYING_INTERVAL
+            with contextlib.suppress(Exception):
+                await mon.request_now_playing()
         obs = mon.observation
         if obs.video_id == vid and obs.state == "Playing":
             break
@@ -3586,7 +3618,7 @@ _SELF_TEST_PROBES = (
     # probe documents, and "what got louder?" is the one question only the
     # tester can answer.
     ("volume", "Testing volume keys", 11.0, _probe_volume),
-    ("finish", "Watching a video reach its end", 43.0, _probe_end_of_video),
+    ("finish", "Watching a video reach its end", 60.0, _probe_end_of_video),
     ("idle", "Handing the TV back", 10.0, _probe_idle_return),
     ("snapshot_after", "Re-reading device state", 7.0, _probe_snapshot_after),
 )
@@ -4068,6 +4100,16 @@ def _self_test_verdict(probes: list, ctx: dict) -> dict:
             learned.append("the launch Intent alone wakes this device")
         elif woke_key:
             learned.append(f"this device wakes on {woke_key}")
+        elif ctx.get("woke_by_intent") or ctx.get("woke"):
+            # It woke, but nothing is creditable: the Intent landed after its
+            # window expired, or every keycode send errored. Saying "never
+            # woke" here contradicts snapshot_after in the same report, which
+            # costs a round trip with someone doing us a favour.
+            learned.append(
+                "this device woke, but we cannot say what woke it — either "
+                "the launch Intent landed late or every keycode send failed "
+                "to reach the device"
+            )
         else:
             missing.append(
                 "The device never woke, from the Intent or any keycode. That "
@@ -4389,27 +4431,18 @@ def _questions_payload() -> list:
 
 
 def _question_answers() -> dict:
-    """Tester answers, with device_model prefilled from the protocol.
+    """Tester answers, with device_profile prefilled from protocol detection.
 
-    The device already told us its manufacturer and model; asking someone to
-    type "NVIDIA SHIELD Android TV" by hand is how blanks happen. Their own
-    typed answer always wins.
+    Their own typed answer always wins. `device_model` used to be prefilled
+    here too, but that question was cut when the form went from fourteen
+    entries to nine — it duplicated the device picker directly above it — so
+    the key was injected and then discarded by every consumer.
     """
     answers = dict(_self_test_answers)
     if not (answers.get("device_profile") or "").strip():
         detected = _detect_profile()
         if detected:
             answers["device_profile"] = detected
-    if not (answers.get("device_model") or "").strip():
-        try:
-            info = dict(getattr(state.remote, "device_info", None) or {})
-            guess = " ".join(
-                x for x in (info.get("manufacturer"), info.get("model")) if x
-            )
-            if guess:
-                answers["device_model"] = guess
-        except Exception:
-            pass
     return answers
 
 
@@ -4652,11 +4685,13 @@ async def seek(req: SeekReq):
 
 @app.post("/api/volume/{action}")
 async def volume(action: str):
-    """Adjust volume by relaying a keycode over HDMI-CEC.
+    """Adjust volume by sending a keycode over the paired remote.
 
-    The streamer translates these into CEC volume commands aimed at whatever
-    is producing the sound — TV speakers, a soundbar, or an AV receiver — so
-    there is nothing to configure and no brand to pick.
+    The device decides how to deliver it, and there are two verified routes:
+    it relays a CEC command to whatever is producing the sound (TV speakers,
+    soundbar, AV receiver), or it attenuates its own HDMI output. Do NOT call
+    this "HDMI-CEC volume" — that names one mechanism of two and tells owners
+    of CEC-less TVs it cannot work for them, which is measurably false.
 
     Requires CEC volume control to be enabled on the device (Android's
     default, but not universal). When it's off the keypress is accepted and
@@ -4700,12 +4735,12 @@ async def events(request: Request):
 # ── legacy one-shot play (kept for v0 webhook callers) ─────────────────────
 @app.post("/api/play")
 async def play(req: AddReq, request: Request):
-    _reject_during_self_test()
     """LEGACY: clear queue + replace current with this item, atomically.
 
     Same rate-limit bucket as /api/queue. Backward compatible with v0 callers.
     Prefer /api/queue for new clients.
     """
+    _reject_during_self_test()
     _require_paired()
     _check_rate_limit(request)
     raw = req.url or req.video_id or ""
