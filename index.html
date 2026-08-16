@@ -759,11 +759,12 @@
       <dt>TV power</dt><dd id="meta-power">—</dd>
       <dt>SmartTube link</dt><dd id="meta-lounge">—</dd>
     </dl>
-    <div class="beta-diag">
+    <div class="beta-diag" id="beta-diag" hidden>
       <p class="card-sub">
-        <strong>Beta build.</strong> If something doesn't work on your device,
-        copy the report and send it over — it says what your TV reported, and
-        includes your TV&#39;s local address but never any credentials.
+        <strong>Device report.</strong> If something doesn&#39;t work on your
+        device, copy the report and send it over — it says what your TV
+        reported, and includes your TV&#39;s local address but never any
+        credentials.
       </p>
       <button id="btn-diag" class="muted">📋 Copy diagnostics</button>
 
@@ -1940,10 +1941,16 @@
     try {
       const s = await api("/api/selftest");
       if (s.enabled === false) {
-        $("btn-selftest").hidden = true;
-        $("st-intro").hidden = true;
+        // Hide the whole block, not just the self-test controls. "Copy
+        // diagnostics" lives in here too and calls /api/diagnostics, which
+        // answers 503 under the same flag — so hiding only the self-test
+        // left a dead button and a paragraph offering a report the server
+        // will refuse to produce. The block starts hidden in the markup and
+        // is revealed below, so a failed fetch shows nothing rather than
+        // showing something broken.
         return;
       }
+      $("beta-diag").hidden = false;
       if (s.total_budget_s) {
         // Budgets are worst case; a healthy device finishes well ahead.
         const m = Math.ceil(s.total_budget_s / 60);

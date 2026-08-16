@@ -3313,7 +3313,21 @@ def _tv_is_busy(ignore_video_ids: frozenset = frozenset()) -> bool:
     if qstate.current is not None or qstate.queue:
         return True
     remote = state.remote
-    if remote is None or not bool(getattr(remote, "is_on", False)):
+    if remote is None:
+        return False
+    # `is_on` is a property that can RAISE on a stale connection, not merely
+    # be absent — tv_play has wrapped this same read in try/except since it
+    # was written. `getattr(..., False)` only swallows AttributeError, so the
+    # bare version let a connection error escape a function every probe and
+    # the runner call. Unreadable power is treated as "not on" for the same
+    # reason the clause below is gated on power at all: the Lounge cache
+    # reports dormant players as Playing forever (invariant 4), so it may
+    # only be trusted when we positively know the device is awake.
+    try:
+        powered = bool(remote.is_on)
+    except Exception:
+        return False
+    if not powered:
         return False
     lng = qstate.lounge or {}
     video_id = lng.get("video_id")
@@ -3950,11 +3964,19 @@ async def _run_self_test(run_id: str) -> None:
     loop = asyncio.get_running_loop()
     started = loop.time()
     writes_at_start = _client_write_count
-    # No ignore-list at the START of a run: if a probe video is already
-    # playing then someone really is watching it, and it is not ours yet.
-    ctx: dict = {"was_busy": _tv_is_busy()}
+    ctx: dict = {}
 
     try:
+        # INSIDE the guard, deliberately. This runs as a background task and
+        # `_self_test_active` is already True by the time it starts, so
+        # anything that raises out here — rather than inside the try whose
+        # finally clears the flag — leaves the run "running" forever and
+        # every /api/queue and /api/play call answering 409 until the
+        # service is restarted. Nothing before the try may be fallible.
+        #
+        # No ignore-list at the START of a run: if a probe video is already
+        # playing then someone really is watching it, and it is not ours yet.
+        ctx["was_busy"] = _tv_is_busy()
         for entry in _self_test["probes"]:
             probe = entry.pop("_fn")
             entry["status"] = "running"
