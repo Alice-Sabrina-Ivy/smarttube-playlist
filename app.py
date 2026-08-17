@@ -851,7 +851,45 @@ async def _reconnect_remote() -> bool:
             old.disconnect()
         except Exception:
             log.debug("Old remote disconnect raised; continuing", exc_info=True)
-    return await _attempt_startup_connect(state.host)
+    try:
+        # androidtvremote2 puts no overall timeout on its own connect, so an
+        # unreachable host would hang whichever caller we're on — including
+        # tv_play, which is inside a user's add.
+        connected = await asyncio.wait_for(
+            _attempt_startup_connect(state.host),
+            timeout=TV_ADDRESS_CONNECT_TIMEOUT,
+        )
+    except asyncio.TimeoutError:
+        log.warning("Reconnect to %s timed out after %.0fs",
+                    state.host, TV_ADDRESS_CONNECT_TIMEOUT)
+        connected = False
+    if not connected:
+        # ALWAYS leave something retrying. We have already nulled
+        # state.remote AND called old.disconnect(), which cancels
+        # androidtvremote2's own keep-reconnecting task — so on a failure
+        # nothing on either side is trying any more. The service then
+        # reports configured:false and 503s every add forever, while the
+        # page header still says "RETRYING", and only a container restart
+        # recovers it. /api/tv/address has re-armed for this reason since
+        # the security pass; the tv_play call site never did, which made
+        # a single failed wake against a device that dropped off the LAN
+        # in standby a permanent outage.
+        _arm_startup_retry(state.host)
+    return connected
+
+
+def _arm_startup_retry(host: str) -> None:
+    """Ensure a background reconnect loop is running for `host`.
+
+    Idempotent: callers may re-arm freely without stacking duplicate loops
+    that would fight over state.remote.
+    """
+    global _startup_retry_task
+    if _startup_retry_task is not None and not _startup_retry_task.done():
+        return
+    _startup_retry_task = asyncio.create_task(
+        _retry_startup_connect_until_success(host)
+    )
 
 
 async def _wait_for_lounge_connected(timeout: float, poll: float) -> bool:
@@ -967,7 +1005,16 @@ async def _lounge_play() -> bool:
     cur = queue_controller.state.current
     if cur and state.remote is not None:
         try:
-            await tv_play(cur.video_id, cur.start_s)
+            # Through track_send, not inline. `_cancel_in_flight_sends` can
+            # only cancel tasks it created, so an inline await here put this
+            # play signal outside the guard entirely — a guest's add landing
+            # mid-resume could not cancel it, and the TV jumped back to the
+            # previously-paused video seconds after starting the new one.
+            await queue_controller.track_send(tv_play(cur.video_id, cur.start_s))
+            return True
+        except asyncio.CancelledError:
+            # A newer send superseded us. That is the guard working, not a
+            # failure — something else is driving the TV now.
             return True
         except Exception:
             log.warning("tv_play during resume failed", exc_info=True)
@@ -1128,11 +1175,7 @@ async def _start_lounge_monitor() -> None:
         # it will yank the user out of whatever app they are in every 3
         # seconds, forever. Pinned by
         # test_the_refresh_gate_depends_on_pairing_to_stay_shut.
-        should_refresh=lambda: (
-            queue_controller.state.current is not None
-            and not queue_controller.state.paused
-            and not state.suppress_lounge
-        ),
+        should_refresh=_should_refresh_lounge,
         # Persist a refreshed loungeIdToken to disk so the next startup
         # uses the fresh token instead of trying the expired one. Without
         # this, every container restart after a token expiry would fail
@@ -1144,6 +1187,51 @@ async def _start_lounge_monitor() -> None:
     state.lounge_monitor.load_auth(auth)
     await state.lounge_monitor.start()
     log.info("Lounge monitor started")
+
+
+def _lounge_shows_external_playback() -> bool:
+    """Is Lounge actively reporting playback the queue does NOT own?
+
+    That happens whenever someone starts a video from the TV remote, or when
+    our own external-switch logic cedes control. The UI renders a full
+    now-playing card from this observation, and `/api/skip` already acts on
+    it — so it is playback we are displaying, and its position needs to keep
+    up like any other.
+
+    `Playing` specifically, and a real `current_time`: the Lounge cloud cache
+    reports dormant players as Paused/Stopped indefinitely (invariant 4), and
+    refreshing off a ghost is what used to resurrect old videos in the UI.
+    """
+    if queue_controller.state.current is not None:
+        return False
+    lng = queue_controller.state.lounge or {}
+    return bool(
+        lng.get("available")
+        and lng.get("video_id")
+        and lng.get("current_time") is not None
+        and lng.get("state") == "Playing"
+    )
+
+
+def _should_refresh_lounge() -> bool:
+    """Gate for LoungeMonitor's periodic position poll.
+
+    `suppress_lounge` is the safety-critical clause and is checked FIRST:
+    polling a backgrounded SmartTube auto-foregrounds it (a YouTube protocol
+    behaviour that can even wake a Shield), so nothing below may override it.
+
+    Beyond that we refresh for a video we own, and — added in v1.02 — for
+    external playback we are displaying. Without the second case the position
+    of a video started from the TV remote froze on screen: measured on
+    hardware sitting at 254.94 for the entire time it was watched, because
+    the poll that would have moved it was gated on owning a current item.
+    """
+    if state.suppress_lounge:
+        return False
+    if (queue_controller.state.current is not None
+            and not queue_controller.state.paused):
+        return True
+    return _lounge_shows_external_playback()
 
 
 async def _stop_lounge_monitor() -> None:
@@ -1286,6 +1374,22 @@ async def tv_play(video_id: str, start_s: Optional[int] = None) -> None:
     if start_s and start_s > 0:
         deep_link += f"&t={start_s}"
 
+    # A failed reconnect in the wake block above leaves state.remote None.
+    # Everything below dereferences it — the screensaver key and BOTH
+    # deep-link sites — so without this the add died with an AttributeError
+    # that _send_to_tv swallowed as a generic "TV send failed", giving no
+    # hint that the connection was gone. _reconnect_remote has already
+    # re-armed the background retry, so the honest thing here is to stop
+    # and let that reconnect.
+    if state.remote is None:
+        log.warning(
+            "No remote connection after wake/reconnect; cannot launch %s. "
+            "A background retry is running; the add will need to be repeated "
+            "once the TV is reachable.",
+            video_id,
+        )
+        return
+
     current_app = _get_current_app()
 
     # Dismiss the screensaver if it's foreground. Verified empirically:
@@ -1334,8 +1438,8 @@ async def tv_play(video_id: str, start_s: Optional[int] = None) -> None:
     # session isn't fully alive: even if Lounge cache reports state
     # for some video, Lounge.play() and Lounge.setPlaylist against a
     # dormant SmartTube are unreliable (verified empirically — the
-    # user-reported "video shows but doesn't start playing" was
-    # exactly this case). The deep link is the right primitive here:
+    # symptom is the video appearing on screen but never starting).
+    # The deep link is the right primitive here:
     # Android resolves `vnd.youtube.launch://` to SmartTube's Intent
     # handler, which launches SmartTube AND kicks playback fresh in
     # one step. Do NOT add a separate app-launch command before this:
@@ -1374,8 +1478,22 @@ async def tv_play(video_id: str, start_s: Optional[int] = None) -> None:
                 break
             await asyncio.sleep(LOUNGE_OBSERVATION_POLL)
         obs = state.lounge_monitor.observation
+        # A position sitting at the END of the video is not evidence that it
+        # is playing — it is evidence that it just FINISHED. That matters
+        # because the same clip can legitimately appear twice in a row in the
+        # queue: when the first one ends we start the second, Lounge still
+        # reports the old instance (same video_id) near its duration, and
+        # every test below passes. tv_play then "skipped" as redundant and
+        # sent NOTHING AT ALL, so the second copy never played and everything
+        # behind it stranded. Measured 3/3 on hardware with a three-item queue.
+        obs_at_end = (
+            obs.current_time is not None
+            and obs.duration is not None
+            and obs.duration > 0
+            and (obs.duration - obs.current_time) <= 5.0
+        )
         if (obs.video_id == video_id and obs.available
-                and obs.current_time is not None):
+                and obs.current_time is not None and not obs_at_end):
             if obs.state == "Playing":
                 log.info("SmartTube already playing %s @ %.1fs — skipping",
                          video_id, obs.current_time)
@@ -1430,13 +1548,36 @@ async def tv_play(video_id: str, start_s: Optional[int] = None) -> None:
             obs.state == "Playing"
             and obs.video_id is not None
             and obs.current_time is not None
+            # ...and not sitting at the end of whatever it was playing. A
+            # setPlaylist needs a LIVE PlaybackActivity to receive it; at
+            # end-of-video that activity is tearing down, so the command is
+            # accepted and does nothing, SmartTube drops to the launcher, and
+            # the item we just started never plays. This is the queue's normal
+            # handoff — the previous video ending is exactly why we are here —
+            # so it is the common case, not an edge one. The deep link below
+            # kicks playback fresh through Android's Intent system instead.
+            and not obs_at_end
         )
         if smarttube_actively_playing:
             try:
-                await state.lounge_monitor.play_video(video_id, start_s)
-                log.info("Sent %s%s via Lounge.setPlaylist (smooth swap)",
-                         video_id, f" @ {start_s}s" if start_s else "")
-                return
+                # The RETURN VALUE is load-bearing, not decoration. pyytlounge's
+                # _command returns False WITHOUT raising whenever the bind
+                # channel answers 400 "Unknown SID", 410 "Gone" or 401
+                # "Expired" — i.e. an expired session on an otherwise healthy
+                # install. Discarding it meant the add was reported started,
+                # item_started was published, the card ticked, and nothing at
+                # all happened on the TV. The same response also drives
+                # pyytlounge's _connection_lost(), so the silently-dropped add
+                # is the very moment the session wedges — which is why this
+                # presents as "it worked until it didn't".
+                if await state.lounge_monitor.play_video(video_id, start_s):
+                    log.info("Sent %s%s via Lounge.setPlaylist (smooth swap)",
+                             video_id, f" @ {start_s}s" if start_s else "")
+                    return
+                log.warning(
+                    "Lounge.setPlaylist for %s returned False (session likely "
+                    "expired); falling back to deep link", video_id,
+                )
             except Exception:
                 log.warning("Lounge.play_video failed; falling back to deep link",
                             exc_info=True)
@@ -1600,9 +1741,8 @@ async def lifespan(_app: FastAPI):
     # Watchdog: revive the Lounge monitor if its subscribe task dies.
     # See _lounge_watchdog for context — without this, an unhandled
     # exception in the monitor would leave Playback Sync OFFLINE until
-    # someone manually restarts the container (a user reported exactly
-    # this after a power outage where the NAS came back before their
-    # router did).
+    # someone manually restarts the container — observed in production
+    # after a power outage where the NAS came back before the router did.
     watchdog_task = asyncio.create_task(_lounge_watchdog())
 
     try:
@@ -4606,6 +4746,19 @@ async def skip():
             await asyncio.sleep(0.5)
             if _get_current_app() in SCREENSAVER_PACKAGES:
                 break
+            # Re-check the PREMISE, not just the destination. This loop can
+            # run for over a second, and /api/queue stays open throughout —
+            # a guest's add landing here starts a video, and resending BACK
+            # then backs the TV straight out of it, twice, while the queue's
+            # card keeps ticking for something no longer on screen.
+            if (queue_controller.state.current is not None
+                    or queue_controller.state.queue
+                    or queue_controller.state.waking):
+                log.info(
+                    "Idle retry abandoned — something started playing while "
+                    "we were returning the TV to its screensaver"
+                )
+                break
             log.info("Idle sequence didn't reach screensaver; resending %s",
                      keycodes[-1])
             try:
@@ -4684,6 +4837,12 @@ async def seek(req: SeekReq):
     ok = await state.lounge_monitor.seek_to(target)
     if not ok:
         raise HTTPException(502, "Lounge seek_to call failed")
+    # Re-anchor the auto-advance timer. It was scheduled once, from the full
+    # duration, when the item began — a seek moves the playhead without
+    # telling it. Seeking FORWARD therefore left it firing late by the size
+    # of the jump, and "late" is precisely the window in which the video ends
+    # first and the kill-switch strands everything still queued.
+    await queue_controller.reschedule_timer_for_position(target)
     return {"ok": True, "target": target}
 
 

@@ -121,6 +121,17 @@ def _blank_lounge() -> dict:
 # the delay; flickers don't.
 KILL_SWITCH_DEBOUNCE = 3.0
 
+# Grace period after an item starts playing, during which a SmartTube ->
+# not-SmartTube transition is attributed to our own handoff rather than to the
+# user. Every advance between queue items goes SmartTube -> launcher ->
+# SmartTube: the old player tears down, Android shows the launcher for a beat,
+# and the new Intent brings it back. Without this the kill-switch fires in
+# that gap and discards the item we JUST started, stranding everything behind
+# it — measured on hardware, the second of three queued videos cleared about
+# three seconds in. The 3s debounce alone does not cover it, because the
+# launcher can still be foreground when the debounce expires.
+KILL_SWITCH_START_GRACE = 12.0
+
 # Time to wait after Lounge disconnects before assuming the player
 # closed (vs a brief network blip / reconnect cycle). Empirically the
 # subscribe loop reconnects within 1-2s for transient blips. SmartTube
@@ -139,6 +150,18 @@ PLAYER_CLOSE_VERIFY_DELAY = 8.0
 # what we DON'T want to mis-detect as an external switch). 5s is
 # comfortable above typical setPlaylist propagation (1-2s).
 EXTERNAL_SWITCH_DEBOUNCE = 5.0
+
+# How close to `duration` the Lounge position must be for us to treat the
+# current item as having played to its end. Same 5s window lounge.py uses to
+# decide a Stopped transition is a real finish, and deliberately the same
+# number: the two must not disagree about what "ended" means.
+NEAR_END_SECONDS = 5.0
+
+# How far ahead of the current item's own elapsed time a Lounge position may
+# be before we treat it as belonging to the PREVIOUS item. Absorbs launch
+# latency and clock skew; small enough that a frame from the video we just
+# left (typically parked at its end) is caught.
+OBSERVATION_STALENESS_SLACK = 5.0
 
 
 @dataclass
@@ -219,6 +242,14 @@ class QueueController:
         self._cast_play = play_button_callable
         # Track in-flight TV-send tasks so callers (e.g. shutdown) can await them.
         self._send_tasks: set[asyncio.Task] = set()
+        # Serializes /api/resume. Distinct from _lock because the resume path
+        # awaits network work (_cast_play) that must not run concurrently but
+        # equally must not be held across the state lock.
+        self._resume_lock = asyncio.Lock()
+        # True once the current item's duration timer has come due at least
+        # once. See _timer_body for why this, and not the Lounge position,
+        # is what the kill-switch must trust about "did it finish".
+        self._duration_elapsed = False
         # External-switch debounce: when Lounge reports a video_id that
         # doesn't match state.current.video_id, we wait this many
         # seconds before assuming the user switched videos via the
@@ -339,8 +370,21 @@ class QueueController:
 
         If the queue stalled with no current playing (e.g. paused-timer-fire
         cleared it) and there are items queued, start the next one."""
-        if self._cast_play is not None:
-            await self._cast_play()
+        # Serialize the whole thing. `_cast_play` used to run BEFORE the lock,
+        # so the idempotence check below could not short-circuit a second
+        # concurrent call — and `_cast_play` can spend RESUME_VERIFY_TIMEOUT
+        # and then a further tv_play verify before deep-linking, a ~6s window
+        # in which the UI leaves the Play button enabled. Two impatient
+        # clicks meant two play signals for one video (invariant 1).
+        async with self._resume_lock:
+            async with self._lock:
+                if not self.state.paused and self.state.current is not None:
+                    return
+            if self._cast_play is not None:
+                await self._cast_play()
+            await self._resume_locked()
+
+    async def _resume_locked(self) -> None:
         async with self._lock:
             if not self.state.paused and self.state.current is not None:
                 return
@@ -512,6 +556,49 @@ class QueueController:
                 "(was a flicker), not firing"
             )
             return
+        started = self.state.current_started_at
+        if started is not None:
+            try:
+                since_start = (self._clock() - started).total_seconds()
+            except Exception:
+                since_start = None
+            if since_start is not None and 0 <= since_start < KILL_SWITCH_START_GRACE:
+                log.info(
+                    "Kill-switch debounce: current item started %.1fs ago; "
+                    "treating the foreground gap as our own handoff",
+                    since_start,
+                )
+                return
+        if self.has_pending_sends():
+            # OUR OWN launch is in flight, and it is what is moving the
+            # foreground around: SmartTube tears down its player, Android
+            # shows the launcher for a beat, then the Intent brings it back.
+            # Reading that churn as the user leaving is how a freshly started
+            # item got discarded seconds in.
+            log.info(
+                "Kill-switch debounce: our own launch is still in flight; "
+                "not firing against foreground churn we caused"
+            )
+            return
+        if self.state.waking:
+            # A launch is in flight. The debounce only re-read current_app,
+            # so a video added within the window — while the TV is waking and
+            # the foreground legitimately reads as the launcher — was wiped by
+            # the transition that PRECEDED it. Everything queued behind it
+            # then sat there, since the kill-switch does not advance.
+            log.info(
+                "Kill-switch debounce: a launch is in flight (waking); "
+                "not firing against state that has moved on"
+            )
+            return
+        if not current:
+            # Unreadable foreground is not evidence of anything. Same "" trap
+            # as the timer's check: on a device that never negotiates IME this
+            # would fire the kill-switch on every transition callback.
+            log.info(
+                "Kill-switch debounce: foreground unreadable; not firing"
+            )
+            return
         log.info(
             "Kill-switch: SmartTube confirmed not-foreground after debounce "
             "(current=%s)", current,
@@ -533,6 +620,7 @@ class QueueController:
         # Routine position updates — emit a lightweight snapshot, no state-machine action.
         if event_type == "lounge.position":
             await self._broadcaster.publish("lounge_update", snapshot)
+            await self._maybe_advance_at_end_of_video(observation)
             return
 
         await self._broadcaster.publish("lounge_update", snapshot)
@@ -541,6 +629,7 @@ class QueueController:
             await self._on_lounge_finished()
         elif event_type == "lounge.state":
             await self._sync_paused_from_lounge(observation)
+            await self._maybe_advance_at_end_of_video(observation)
         elif event_type == "lounge.disconnected":
             await self._on_lounge_disconnected()
         elif event_type == "lounge.now_playing":
@@ -757,6 +846,26 @@ class QueueController:
         await self._broadcaster.publish("paused_toggled", snap)
 
     async def _kill_switch(self) -> None:
+        # SmartTube leaves the foreground for two very different reasons and
+        # they need opposite handling. The user opening Netflix is what this
+        # was written for. But a video REACHING ITS END also does it —
+        # SmartTube tears down the player and drops to the launcher — and
+        # treating that as "they walked away" cancelled the duration timer
+        # and cleared `current` while leaving state.queue untouched, so
+        # everything still queued was stranded permanently. Measured at 2 of
+        # 5 runs on real hardware; the timer normally wins the race, and
+        # loses whenever it deferred to a Lounge position that lagged near
+        # the end of the video.
+        if self.state.queue and self._current_item_finished():
+            log.info(
+                "SmartTube left foreground at end of %s (ct=%s/%s) — "
+                "advancing the queue rather than clearing it",
+                self.state.current.video_id if self.state.current else None,
+                (self.state.lounge or {}).get("current_time"),
+                (self.state.lounge or {}).get("duration"),
+            )
+            await self._advance(reason="finished_at_killswitch")
+            return
         await self._cancel_timer()
         async with self._lock:
             had_state = (
@@ -793,6 +902,18 @@ class QueueController:
         Caller MUST hold self._lock."""
         self.state.current = item
         self.state.current_started_at = self._clock()
+        # New item, new clock: whatever the previous one's timer concluded
+        # says nothing about this one.
+        self._duration_elapsed = False
+        # Nor does the previous one's Lounge frame, which is still sitting in
+        # state.lounge parked at ITS end — that is why we advanced. The
+        # video_id guard normally separates them, but two queue entries can
+        # share a video_id (the same clip queued twice is ordinary), and then
+        # the stale frame passes every check and declares this brand-new item
+        # already finished. A hardware soak caught exactly that: the second of
+        # two identical shorts ran 3.7s before being advanced off its
+        # predecessor's frame. The next Lounge event repopulates this.
+        self.state.lounge = _blank_lounge()
         self._schedule_timer_locked(item)
 
     def _schedule_timer_locked(self, item: QueueItem) -> None:
@@ -828,6 +949,15 @@ class QueueController:
                 return                  # superseded by another schedule/cancel
             if self.state.current is None:
                 return                  # nothing to advance from (defensive)
+            # The item's whole nominal length has now elapsed. Record it
+            # BEFORE the deferral logic: a deferral means only that Lounge's
+            # cached position disagrees, and that cache is measurably stale
+            # at exactly this moment (10.0 of 19.0 on hardware, nine seconds
+            # behind, because SmartTube stops pushing near the end). The
+            # kill-switch needs to know the duration ran out even when the
+            # position says otherwise, or it treats a finished video as a
+            # user walking away and strands the rest of the queue.
+            self._duration_elapsed = True
             current_video_id = self.state.current.video_id
             lng = dict(self.state.lounge)
 
@@ -882,30 +1012,135 @@ class QueueController:
                                          deferrals + 1)
                     )
                 return
+            # Says what was OBSERVED, not what we are about to do. The
+            # branches below can still route to _end_current, and this line
+            # used to claim "advancing" before they ran — so every log of a
+            # stalled queue cheerfully reported that it had advanced, which
+            # sent the 2026-08-16 investigation down the wrong path for a
+            # while. Each exit now logs its own outcome.
             log.info(
-                "Duration timer fired for %s; Lounge ct=%.1f within 5s of "
-                "duration=%.1f — advancing (Lounge.finished did not fire)",
+                "Duration timer fired for %s; Lounge ct=%.1f is within 5s of "
+                "duration=%.1f (Lounge.finished did not fire)",
                 current_video_id, lng_ct, lng_dur_f,
             )
 
         # Timer fired legitimately; behavior depends on paused + foreground state.
-        if self.state.paused:
+        # `paused` here is ambiguous and the two readings need opposite
+        # handling: a user who pressed Pause wants nothing to happen, but a
+        # video that reached its last frame ALSO reports Paused — measured on
+        # the reference hardware, a lone video ends Paused rather than
+        # Stopped, and `_sync_paused_from_lounge` mirrors that just as this
+        # timer comes due. Treating the second case as the first abandoned
+        # every remaining queue item, immediately after logging "advancing".
+        if self.state.paused and not self._lounge_says_finished():
+            log.info(
+                "Timer fired while paused (source=%s) and not at end of video "
+                "— clearing current without advancing",
+                self.state.pause_source,
+            )
             await self._end_current(reason="paused_timer")
             return
 
         current_app = self._safe_current_app()
-        if current_app is not None and current_app != self._smarttube_package:
+        # Truthiness, not `is not None`: androidtvremote2 initialises
+        # current_app to "" and only fills it from an IME key-inject message,
+        # so on any device that never negotiates IME it stays "" forever.
+        # Reading that as "some other app" made every video end here instead
+        # of advancing — auto-advance never worked at all on that hardware.
+        if current_app and current_app != self._smarttube_package:
             log.info("Timer fired but SmartTube not foreground (%s); stopping", current_app)
             await self._end_current(reason="killswitch_at_fire")
             return
 
+        log.info("Duration timer advancing the queue for %s", current_video_id)
         await self._advance(reason="timer")
+
+    def _current_item_finished(self) -> bool:
+        """Has the item we own played to its end?
+
+        Two independent pieces of evidence, either of which is enough:
+
+        * the duration timer has come due (`_duration_elapsed`) — the item's
+          whole nominal length has passed; or
+        * the Lounge position is within NEAR_END_SECONDS of the duration.
+
+        Neither alone is sufficient in practice. The position is measurably
+        stale right at the end (SmartTube stops pushing, and our poll is 3s
+        apart), and the timer can be pending when a video ends early. Taken
+        together they separate "the video finished" from "the user did
+        something", which is the question both the timer and the kill-switch
+        actually need answered.
+        """
+        if self._duration_elapsed:
+            return True
+        return self._lounge_says_finished()
+
+    def _lounge_says_finished(self) -> bool:
+        """Is the Lounge observation showing our item at its end?
+
+        Requires the observation to be about OUR video and to carry a real
+        position — the cloud cache reports dormant players indefinitely
+        (invariant 4), so a video_id alone proves nothing.
+        """
+        cur = self.state.current
+        lng = self.state.lounge or {}
+        if cur is None or not lng.get("available"):
+            return False
+        if lng.get("video_id") != cur.video_id:
+            return False
+        ct = lng.get("current_time")
+        dur = lng.get("duration")
+        if ct is None or not dur or dur <= 0:
+            return False
+        if self._observation_predates_current(float(ct)):
+            return False
+        return (float(dur) - float(ct)) <= NEAR_END_SECONDS
+
+    def _observation_predates_current(self, ct: float) -> bool:
+        """Is this position from BEFORE the item we are now playing?
+
+        Blanking `state.lounge` when an item begins is not enough: SmartTube
+        keeps pushing about the PREVIOUS playback for several seconds after
+        we have moved on, so the stale frame simply arrives again. The
+        video_id guard separates them only when the ids differ, and the same
+        clip queued twice is ordinary.
+
+        Time is the discriminator that always works. An item that became
+        current N seconds ago cannot honestly be at N + slack seconds in.
+        Measured: a video 7s into its life reported at 17.7s, which is what
+        declared it finished and skipped it.
+
+        `current_started_at` is stamped when playback starts, so `elapsed`
+        never under-counts; the slack then absorbs launch latency and clock
+        skew, and `start_s` covers a deliberate offset.
+        """
+        cur = self.state.current
+        started = self.state.current_started_at
+        if cur is None or started is None:
+            return False
+        try:
+            elapsed = (self._clock() - started).total_seconds()
+        except Exception:
+            return False
+        offset = float(cur.start_s or 0)
+        return ct > (elapsed + offset + OBSERVATION_STALENESS_SLACK)
 
     async def _advance(self, reason: str) -> None:
         """Pop next item if any, begin it; otherwise idle. Always emits an event."""
         async with self._lock:
             next_item = self.state.queue.pop(0) if self.state.queue else None
             if next_item:
+                # A `paused` that described the item we are LEAVING must not
+                # carry onto the one we are starting. The empty-queue branch
+                # below has reset it since the 2026-08-16 hardware fix, but
+                # this branch did not — so advancing out of a paused video
+                # (a Skip while paused, or a BACK-out that fires FINISHED)
+                # left paused=True over a video that is genuinely playing:
+                # the page shows it frozen at 0:00 with Play lit, and the
+                # next add parks in the queue because add() gates
+                # should_start on `not paused`.
+                self.state.paused = False
+                self.state.pause_source = None
                 self._begin_locked(next_item)
                 event = "item_started"
             else:
@@ -1011,7 +1246,115 @@ class QueueController:
                 raise
             except Exception:
                 log.exception("TV send failed for %s", item.video_id)
+                return
+            # Playback has, as far as we can tell, only just started. The
+            # duration timer has been counting since the item was QUEUED —
+            # through WAKE_DELAY (15s) and the whole launch — so without this
+            # it comes due that much early. A healthy Lounge hides it: the
+            # defer branch sees time remaining and reschedules. An
+            # out-of-sync Lounge has nothing to defer on, so the timer
+            # advanced while the video was still playing — a live production
+            # failure on v1.0.
+            await self._anchor_timer_to_playback_start(item)
 
         task = asyncio.create_task(_runner())
         self._send_tasks.add(task)
         task.add_done_callback(self._send_tasks.discard)
+
+    async def _maybe_advance_at_end_of_video(self, observation: dict) -> None:
+        """Start the next video the moment Lounge shows this one finished.
+
+        A video with nothing behind it ends **Paused**, not Stopped, so
+        `lounge.finished` never fires for it and we would otherwise wait out
+        the duration timer — which may itself have deferred on a stale
+        position, adding seconds more.
+
+        Requires the item's full duration to have elapsed AS WELL AS the
+        position sitting at the end. The position alone is not enough: a user
+        pausing three seconds from the end looks identical, and skipping
+        their video for them would be worse than being a little late.
+        """
+        async with self._lock:
+            cur = self.state.current
+            if cur is None or not self.state.queue:
+                return
+            if not self._duration_elapsed:
+                return
+            if not observation.get("available"):
+                return
+            if observation.get("video_id") != cur.video_id:
+                return
+            ct = observation.get("current_time")
+            dur = observation.get("duration")
+            if ct is None or not dur or float(dur) <= 0:
+                return
+            if observation.get("state") not in ("Paused", "Stopped"):
+                return
+            if (float(dur) - float(ct)) > NEAR_END_SECONDS:
+                return
+            ended = cur.video_id
+        log.info(
+            "Lounge shows %s parked at its end (%.1f/%.1f) and its duration has "
+            "elapsed — advancing now rather than waiting for the timer",
+            ended, float(ct), float(dur),
+        )
+        await self._advance(reason="lounge_end_of_video")
+
+    async def _anchor_timer_to_playback_start(self, item: QueueItem) -> None:
+        """Restart the duration timer now that the launch has completed.
+
+        Only for the item we just launched, and only while it is still
+        current — an add that superseded us mid-launch owns the timer now.
+        """
+        async with self._lock:
+            cur = self.state.current
+            if cur is None or cur.id != item.id or item.duration_s is None:
+                return
+            # The clock restarts, so whatever the old timer concluded about
+            # this item's length having elapsed no longer holds.
+            self._duration_elapsed = False
+            # Re-stamp the start too. It was set in `_begin_locked`, i.e.
+            # before the wake and the launch, which made the UI's wall-clock
+            # estimate open at 0:15 or more on a cold start and made every
+            # "how far in is this item" comparison too generous.
+            self.state.current_started_at = self._clock()
+            self._timer_gen += 1
+            gen = self._timer_gen
+            self._timer_task = asyncio.create_task(
+                self._timer_body(gen, float(item.duration_s))
+            )
+        log.debug("Duration timer anchored to playback start for %s (%ss)",
+                  item.video_id, item.duration_s)
+
+    async def reschedule_timer_for_position(self, position_s: float) -> None:
+        """Re-anchor the duration timer after the playhead moved externally.
+
+        No-op for livestreams (no duration) and when nothing is playing.
+        """
+        async with self._lock:
+            cur = self.state.current
+            if cur is None or cur.duration_s is None:
+                return
+            remaining = max(0.0, float(cur.duration_s) - float(position_s))
+            self._timer_gen += 1
+            gen = self._timer_gen
+            self._timer_task = asyncio.create_task(
+                self._timer_body(gen, remaining)
+            )
+        log.info("Duration timer re-anchored to %.1fs remaining after seek to %.1fs",
+                 remaining, position_s)
+
+    def track_send(self, coro) -> asyncio.Task:
+        """Run an externally-created TV send under the concurrency guard.
+
+        `_cancel_in_flight_sends` can only cancel tasks it knows about, so
+        any play signal created outside `_send_to_tv` is invisible to it —
+        which is how the resume path came to sit outside invariant 1. Route
+        such sends through here and they behave like any other: they cancel
+        whatever was in flight, and a later send can cancel them.
+        """
+        self._cancel_in_flight_sends()
+        task = asyncio.create_task(coro)
+        self._send_tasks.add(task)
+        task.add_done_callback(self._send_tasks.discard)
+        return task
