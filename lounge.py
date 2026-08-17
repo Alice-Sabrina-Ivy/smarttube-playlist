@@ -347,24 +347,38 @@ class LoungeMonitor:
             return False
         try:
             ok = await self._api.play_video(video_id)
+            if not ok:
+                # setPlaylist itself was refused — pyytlounge answers 400
+                # "Unknown SID" / 410 "Gone" / 401 "Expired" with False and no
+                # exception. NOTHING reached the TV, so the caller's deep-link
+                # fallback is exactly right.
+                return False
             if start_s and start_s > 0:
                 # Give SmartTube a moment to load the media before seeking.
                 await asyncio.sleep(1.0)
+                seek_ok = False
                 try:
-                    await self._api.seek_to(start_s)
+                    # The bool matters as much as the exception: `_command`
+                    # reports a dead session by returning False.
+                    seek_ok = bool(await self._api.seek_to(start_s))
                 except Exception:
-                    # Report FAILURE, don't swallow it. The caller treats a
-                    # False as "fall back to the deep link", and the deep
-                    # link carries &t=<start_s> — so the offset the user
-                    # actually asked for gets honoured. Swallowing this
-                    # meant a pasted ?t=300 link silently played from 0:00
-                    # while the API returned 200 and the log claimed the
-                    # offset had been sent.
-                    log.warning("Lounge seek_to(%s) failed; reporting the start "
-                                "as unsuccessful so the caller can deep link "
-                                "with the offset instead", start_s, exc_info=True)
-                    return False
-            return bool(ok)
+                    log.warning("Lounge seek_to(%s) raised", start_s,
+                                exc_info=True)
+                if not seek_ok:
+                    # STILL a success, and this is the load-bearing part.
+                    # The caller answers False by sending a deep link, and
+                    # setPlaylist has already started the video — so returning
+                    # False here means two play signals for one add, which is
+                    # invariant 1 and audible as the clip restarting a second
+                    # or two in. Losing the offset is the lesser harm: the
+                    # video is playing, just from the beginning.
+                    log.warning(
+                        "Lounge setPlaylist for %s landed but the %ss offset "
+                        "did not apply; leaving it playing from the start "
+                        "rather than sending a second play signal",
+                        video_id, start_s,
+                    )
+            return True
         except Exception:
             log.warning("Lounge play_video(%s) failed", video_id, exc_info=True)
             return False

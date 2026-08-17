@@ -1297,7 +1297,7 @@ async def _lounge_watchdog() -> None:
             log.exception("Lounge watchdog restart failed; will retry next tick")
 
 
-async def tv_play(video_id: str, start_s: Optional[int] = None) -> None:
+async def tv_play(video_id: str, start_s: Optional[int] = None) -> Optional[float]:
     """Send a single video to SmartTube on the TV. If the TV is off, wakes
     it first; if SmartTube isn't foreground, launches it. Then pushes the
     video via Lounge (preferred) or via the YouTube deep link (fallback).
@@ -1519,7 +1519,12 @@ async def tv_play(video_id: str, start_s: Optional[int] = None) -> None:
             if obs.state == "Playing":
                 log.info("SmartTube already playing %s @ %.1fs — skipping",
                          video_id, obs.current_time)
-                return
+                # We sent nothing and playback is already part-way through.
+                # Reporting the position lets the caller size the duration
+                # timer to what is LEFT: it used to re-arm the full length
+                # from now, so taking ownership of a video five minutes into
+                # its ten gave it a fresh ten-minute countdown.
+                return float(obs.current_time)
             # In-place resume only for real mid-playback pauses (ct > 1s).
             # Paused at ct≈0 is a dormant load, not a user pause — fall
             # through to setPlaylist.
@@ -1544,7 +1549,9 @@ async def tv_play(video_id: str, start_s: Optional[int] = None) -> None:
                                 "sent Lounge.play() (verified resume)",
                                 video_id, obs.current_time,
                             )
-                            return
+                            # Resumed in place, so playback carries on from
+                            # where it was rather than restarting.
+                            return float(obs.current_time)
                         await asyncio.sleep(RESUME_VERIFY_POLL)
                     log.info(
                         "Lounge.play() did not transition %s to Playing within %.1fs "
@@ -2015,9 +2022,17 @@ async def tv_address(req: TvAddressReq):
         # so without this a wrong address means nothing is trying at all and
         # the only recovery is restarting the container — which is exactly
         # the one-shot denial of service this endpoint is supposed not to be.
-        _startup_retry_task = asyncio.create_task(
-            _retry_startup_connect_until_success(host)
-        )
+        #
+        # Through _arm_startup_retry, not by assigning the global directly.
+        # _reconnect_remote now arms a loop of its own when it fails, so
+        # creating a second one here overwrote the only handle to the first:
+        # both woke on the same backoff, both connected, and when the address
+        # was later corrected two AndroidTVRemote objects ended up wired to
+        # the callbacks with one of them unreachable — duplicate kill-switch
+        # scheduling and a leaked TLS session that even shutdown could not
+        # close. The helper's idempotence check is what prevents that, so it
+        # has to govern both call sites.
+        _arm_startup_retry(host)
         return {
             "ok": True,
             "host": host,

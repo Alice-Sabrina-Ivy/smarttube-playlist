@@ -26,6 +26,21 @@ on:
     branches: [main]
   workflow_dispatch:
 
+# Merging a release PR starts TWO of these: one from the push to main (the
+# merge commit, which is still PRE-bump) and one dispatched by
+# release-on-merge.yml on the new tag. Both push `:latest`, and whichever
+# finished last owned it — so `:latest` could be an image whose footer and
+# /api/status report the previous version, permanently, while `:1.02` was
+# correct and nothing outside said the two disagreed. docker-compose.yml and
+# the release notes both point people at `:latest`.
+#
+# Serialised rather than cancelled: the runs build different refs and both
+# results are wanted, and cancelling mid-push would abandon a partly-written
+# manifest. The queued one runs after, so the tag build lands last.
+concurrency:
+  group: publish-${{ github.repository }}
+  cancel-in-progress: false
+
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}
