@@ -95,3 +95,85 @@ jobs:
             echo "git fetch origin && git push origin main --tags"
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
+
+  # Carries the release onto `beta` so device testers run the same app, without
+  # anyone maintaining a second pull request in parallel with the first.
+  #
+  # This is a MERGE, never a fast-forward: beta legitimately carries one commit
+  # main does not, and always will. `docker-compose.yml` is the entire
+  # divergence — it pins `:beta` instead of `:latest` and sets SELF_TEST="1" —
+  # and git preserves beta's copy by itself, because a release that does not
+  # touch that file gives the merge nothing to argue about.
+  #
+  # So the interesting case is the one where a release DOES touch it. Then the
+  # merge conflicts, this job fails, and beta is left exactly as it was. That
+  # is the correct outcome and the reason there is no `-X ours` here: choosing
+  # a side automatically is how beta's `:beta` pin would eventually get
+  # replaced by `:latest` and point every tester at the wrong image. Resolve it
+  # by hand, keeping beta's tag and SELF_TEST value.
+  promote-to-beta:
+    needs: release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      actions: write
+
+    steps:
+      - name: Check out beta
+        uses: actions/checkout@v4
+        with:
+          ref: beta
+          fetch-depth: 0
+
+      - name: Identify the committer
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Merge main into beta
+        id: merge
+        run: |
+          set -euo pipefail
+          git fetch origin main --tags
+          VERSION="$(git show origin/main:VERSION)"
+          if git merge --no-ff origin/main -m "Merge v${VERSION} into beta
+
+          Automated by release-on-merge.yml so beta tracks releases without a
+          second pull request. docker-compose.yml is beta's own and is left
+          alone; if a release ever changes it this merge conflicts on purpose."
+          then
+            echo "merged=true" >> "$GITHUB_OUTPUT"
+          else
+            git merge --abort || true
+            echo "::error::main does not merge cleanly into beta. Almost"\
+                 "certainly docker-compose.yml, which is beta's only"\
+                 "divergence. Resolve by hand, KEEPING beta's :beta image tag"\
+                 "and SELF_TEST=1, then push beta. Nothing was pushed."
+            exit 1
+          fi
+
+      - name: Confirm beta kept its own compose
+        run: |
+          set -euo pipefail
+          # Cheap insurance against the merge silently taking main's side. The
+          # cost of getting this wrong is every tester's fresh install pulling
+          # :latest and quietly leaving beta behind.
+          if ! grep -q "smarttube-playlist:beta" docker-compose.yml; then
+            echo "::error::docker-compose.yml no longer pins :beta after the"\
+                 "merge. Refusing to push."
+            exit 1
+          fi
+          echo "docker-compose.yml still pins :beta" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Push beta
+        run: git push origin beta
+
+      - name: Build the :beta image
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          # Same GITHUB_TOKEN suppression as the tag push above — without an
+          # explicit dispatch, beta would sit on new code with a stale image.
+          gh workflow run publish.yml --ref beta
+          echo "Dispatched publish.yml for beta" >> "$GITHUB_STEP_SUMMARY"
