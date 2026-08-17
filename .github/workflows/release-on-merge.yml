@@ -1,0 +1,97 @@
+name: Cut a release when a release PR merges
+
+# Merging a `release/*` PR into main runs scripts/release.py --minor, which
+# bumps VERSION, syncs the footer in index.html, commits, tags and pushes.
+# publish.yml then builds the image and opens the GitHub release.
+#
+# Deliberately narrow: it fires ONLY for a merged pull request whose head
+# branch starts with `release/`. An ordinary bugfix PR merging to main must
+# not mint a version — that is why this is not simply `on: push: main`.
+#
+# TWO THINGS WORTH KNOWING BEFORE YOU RELY ON IT
+#
+# 1. A tag pushed with GITHUB_TOKEN does NOT trigger other workflows. GitHub
+#    suppresses that to stop workflows retriggering each other forever, so
+#    publish.yml would never see the tag. Rather than require a personal
+#    access token, this dispatches publish.yml explicitly on the new tag —
+#    publish.yml already accepts workflow_dispatch, and its image tags and
+#    release job both key off `github.ref`, which is the tag ref when
+#    dispatched that way.
+#
+# 2. It pushes to GITHUB ONLY. The Forgejo mirror is a second push URL
+#    configured on the maintainer's local `origin`, which CI knows nothing
+#    about. After a release, mirror it from a local clone:
+#        git fetch origin && git push origin main --tags
+#
+# To release without merging a PR, run scripts/release.py locally — it does
+# exactly the same thing.
+
+on:
+  pull_request:
+    types: [closed]
+    branches: [main]
+
+jobs:
+  release:
+    # `merged` is the load-bearing half: `closed` fires for abandoned PRs too,
+    # and cutting a version from a PR somebody rejected would be worse than
+    # not automating this at all.
+    if: >
+      github.event.pull_request.merged == true &&
+      startsWith(github.event.pull_request.head.ref, 'release/')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write      # commit the bump, push the tag
+      actions: write       # dispatch publish.yml for the new tag
+
+    steps:
+      - name: Check out main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          # Full history AND tags: release.py reads every existing tag to work
+          # out the newest version and to refuse a version already taken under
+          # the other spelling (1.1 vs 1.01). A shallow clone would make it
+          # believe the repo has never been released.
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Identify the committer
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Cut the release
+        id: cut
+        run: |
+          set -euo pipefail
+          python scripts/release.py --minor
+          VERSION="$(cat VERSION)"
+          echo "tag=v${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "Released v${VERSION}" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Build the image for the new tag
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          TAG="${{ steps.cut.outputs.tag }}"
+          # See note 1 above — without this the tag sits there and no image
+          # is ever built for it.
+          gh workflow run publish.yml --ref "$TAG"
+          echo "Dispatched publish.yml for $TAG" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Remind about the Forgejo mirror
+        run: |
+          {
+            echo ""
+            echo "**Mirror still to do.** CI pushed to GitHub only; run this locally:"
+            echo ""
+            echo '```'
+            echo "git fetch origin && git push origin main --tags"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
