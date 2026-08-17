@@ -219,6 +219,26 @@ OBSERVATION_TRUST_AFTER = 10.0
 # someone's video. Keep it tight.
 END_PARK_SLACK = 1.5
 
+# How long an item may be current without Lounge ever reporting it playing
+# before we conclude the launch failed and move on.
+#
+# The failure this exists for costs a whole session. A link to a video that
+# cannot play — deleted, private, region-blocked, or mistyped — fails its
+# metadata scrape, so `_fallback()` gives it the 600s default duration. The
+# deep link goes out, SmartTube loads nothing and parks at ct 0, and every
+# path that could move the queue on is shut at once: the position is nowhere
+# near the end, the duration timer is ten minutes away, and the kill-switch
+# never fires because SmartTube sits in the foreground on its own error
+# screen. Measured on hardware: the queue held for the full ten minutes, and
+# Play did not help — only Skip did, which a guest has no way to guess.
+#
+# Generous on purpose. A cold start from a sleeping device measures 29.4s from
+# the add to the first frame, and this is timed from the launch COMPLETING,
+# by which point a healthy video starts within seconds. Being wrong here skips
+# a video that would have played, so the window is set well past anything
+# measured rather than close to it.
+LAUNCH_CONFIRM_TIMEOUT = 45.0
+
 
 @dataclass
 class QueueState:
@@ -323,6 +343,12 @@ class QueueController:
         # cannot do when two consecutive queue entries share a clip.
         self._finish_consumed_vid: Optional[str] = None
         self._finish_consumed_at: Optional[datetime] = None
+        # Has Lounge ever reported the CURRENT item actually playing? A launch
+        # that silently produced nothing looks identical to one still in
+        # progress until this flips. See LAUNCH_CONFIRM_TIMEOUT.
+        self._playback_confirmed = False
+        self._launch_check_task: Optional[asyncio.Task] = None
+        self._launch_gen = 0
         # External-switch debounce: when Lounge reports a video_id that
         # doesn't match state.current.video_id, we wait this many
         # seconds before assuming the user switched videos via the
@@ -570,6 +596,12 @@ class QueueController:
         Safe to call multiple times. Use from FastAPI lifespan teardown and
         from test cleanup."""
         await self._cancel_timer()
+        # The launch-confirmation check has its own clock, so _cancel_timer
+        # does not touch it and it would outlive the controller.
+        self._launch_gen += 1
+        if self._launch_check_task is not None and not self._launch_check_task.done():
+            self._launch_check_task.cancel()
+        self._launch_check_task = None
         for t in list(self._send_tasks):
             if not t.done():
                 t.cancel()
@@ -721,12 +753,25 @@ class QueueController:
         mirror pause-state from Lounge play_state changes)."""
         async with self._lock:
             self.state.lounge = dict(observation)
+            # Once we have seen our own item playing, it is not a failed
+            # launch however it behaves afterwards.
+            cur = self.state.current
+            if (cur is not None and observation.get("available")
+                    and observation.get("video_id") == cur.video_id):
+                # Either signal will do, and the second matters: a viewer who
+                # pauses in the first few seconds may never produce a Playing
+                # event we see, and a position past zero already proves the
+                # video ran.
+                if (observation.get("state") == "Playing"
+                        or (observation.get("current_time") or 0) > 0):
+                    self._playback_confirmed = True
             snapshot = self.state.snapshot()
 
         # Routine position updates — emit a lightweight snapshot, no state-machine action.
         if event_type == "lounge.position":
             await self._broadcaster.publish("lounge_update", snapshot)
             await self._maybe_advance_at_end_of_video(observation)
+            await self._maybe_skip_a_launch_that_never_started(observation)
             return
 
         await self._broadcaster.publish("lounge_update", snapshot)
@@ -736,6 +781,7 @@ class QueueController:
         elif event_type == "lounge.state":
             await self._sync_paused_from_lounge(observation)
             await self._maybe_advance_at_end_of_video(observation)
+            await self._maybe_skip_a_launch_that_never_started(observation)
         elif event_type == "lounge.disconnected":
             await self._on_lounge_disconnected()
         elif event_type == "lounge.now_playing":
@@ -1058,6 +1104,8 @@ class QueueController:
         # says nothing about this one, and neither does where its playhead was.
         self._duration_elapsed = False
         self._playhead_origin_at = None
+        # And this item has not been seen playing yet, whatever the last one did.
+        self._playback_confirmed = False
         # Nor does the previous one's Lounge frame, which is still sitting in
         # state.lounge parked at ITS end — that is why we advanced. The
         # video_id guard normally separates them, but two queue entries can
@@ -1068,6 +1116,14 @@ class QueueController:
         # predecessor's frame. The next Lounge event repopulates this.
         self.state.lounge = _blank_lounge()
         self._schedule_timer_locked(item)
+        # A launch that produces nothing goes QUIET, so it cannot be caught by
+        # waiting for an event: the dud parks Paused, `should_refresh()` gates
+        # the position poll on `not paused`, and the event stream we would be
+        # listening to stops. It needs its own clock.
+        self._launch_gen += 1
+        self._launch_check_task = asyncio.create_task(
+            self._confirm_launch_after(item, self._launch_gen)
+        )
 
     def _schedule_timer_locked(self, item: QueueItem) -> None:
         """Caller MUST hold self._lock. No-op for livestreams (duration_s is None)."""
@@ -1578,6 +1634,96 @@ class QueueController:
             ended, float(ct), float(dur),
         )
         await self._advance(reason="lounge_end_of_video")
+
+    def _launch_failed(self, observation: dict) -> bool:
+        """Has the current item been current a long while without ever playing?
+
+        Positive evidence only: Lounge reporting OUR video, and reporting it
+        not playing, long past any healthy launch. Silence proves nothing — a
+        Lounge we cannot hear from says nothing about what the TV is doing,
+        and guessing there would skip good videos.
+        """
+        cur = self.state.current
+        started = self.state.current_started_at
+        if cur is None or started is None or self._playback_confirmed:
+            return False
+        if not observation.get("available"):
+            return False
+        if observation.get("video_id") != cur.video_id:
+            return False
+        if observation.get("state") == "Playing":
+            return False
+        # Still at the very start. A video that ran and stopped sits wherever
+        # it got to; one that never began sits at zero — measured, a dud parks
+        # at exactly 0.0 Paused. Requiring this keeps the check off anything
+        # that did play, however it ended up.
+        ct = observation.get("current_time")
+        if ct is None or float(ct) > 0.5:
+            return False
+        try:
+            elapsed = (self._clock() - started).total_seconds()
+        except Exception:
+            return False
+        return elapsed >= LAUNCH_CONFIRM_TIMEOUT
+
+    async def _confirm_launch_after(self, item: QueueItem, gen: int) -> None:
+        """Check LAUNCH_CONFIRM_TIMEOUT after an item became current.
+
+        Re-arms if the clock moved under it. `_anchor_timer_to_playback_start`
+        re-stamps `current_started_at` once the launch completes, and the
+        check measures elapsed from that — so a check scheduled at begin can
+        come due a few seconds before its own test can pass. The first version
+        of this returned False there and never ran again, which looked correct
+        in a test and did nothing at all on the device.
+        """
+        wait = LAUNCH_CONFIRM_TIMEOUT
+        for _ in range(4):
+            try:
+                await self._sleeper(wait)
+            except asyncio.CancelledError:
+                return
+            if gen != self._launch_gen:
+                return                      # a later item owns this check now
+            cur = self.state.current
+            if cur is None or cur.id != item.id:
+                return
+            started = self.state.current_started_at
+            if started is None:
+                return
+            try:
+                elapsed = (self._clock() - started).total_seconds()
+            except Exception:
+                return
+            if elapsed >= LAUNCH_CONFIRM_TIMEOUT:
+                break
+            wait = max(0.5, LAUNCH_CONFIRM_TIMEOUT - elapsed)
+        await self._maybe_skip_a_launch_that_never_started(
+            dict(self.state.lounge or {})
+        )
+
+    async def _maybe_skip_a_launch_that_never_started(self, observation: dict) -> None:
+        """Move on from a video that was never going to play.
+
+        See LAUNCH_CONFIRM_TIMEOUT for what this costs when it is missing: a
+        single unavailable link holds the queue for its whole scraped
+        duration, and Play does not recover it.
+        """
+        async with self._lock:
+            if not self._launch_failed(observation):
+                return
+            failed = self.state.current.video_id
+            has_next = bool(self.state.queue)
+        log.warning(
+            "%s has been current for over %.0fs and Lounge has never reported "
+            "it playing (state=%s @ %s) — treating the launch as failed and %s",
+            failed, LAUNCH_CONFIRM_TIMEOUT, observation.get("state"),
+            observation.get("current_time"),
+            "moving to the next item" if has_next else "clearing it",
+        )
+        if has_next:
+            await self._advance(reason="launch_never_started")
+        else:
+            await self._end_current(reason="launch_never_started")
 
     async def _anchor_timer_to_playback_start(
         self, item: QueueItem, position_s: Optional[float] = None,
