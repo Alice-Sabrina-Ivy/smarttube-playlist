@@ -834,9 +834,12 @@
     <h2 id="seek-title" class="card-title">▌ Seek</h2>
     <div id="seek-current" class="seek-current">— / —</div>
     <div class="controls seek-quick">
-      <button data-seek-by="-30" type="button" class="muted">⏪ 30s</button>
+      <!-- Order is the layout: these wrap into a 2x2, so the small jumps sit
+           on the top row and the big ones underneath, each row reading
+           back/forward left to right. -->
       <button data-seek-by="-10" type="button" class="muted">⏪ 10s</button>
       <button data-seek-by="10"  type="button" class="muted">10s ⏩</button>
+      <button data-seek-by="-30" type="button" class="muted">⏪ 30s</button>
       <button data-seek-by="30"  type="button" class="muted">30s ⏩</button>
     </div>
     <label for="seek-input">Jump to:</label>
