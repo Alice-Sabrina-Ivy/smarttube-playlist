@@ -87,6 +87,21 @@ STOPPED_PERSISTED_DELAY = 5.0
 # being undetectable for ages.
 STUCK_CT_POLL_THRESHOLD = 5  # 5 polls × 3s = 15s
 
+# How often the periodic refresh asks SmartTube for its current state.
+# Module-level rather than a local so tests can patch it — when a timing
+# constant is only reachable as a local, no test can exercise the behaviour
+# it governs, which is how the wedge below survived the whole suite.
+REFRESH_INTERVAL = 3.0
+
+# Consecutive get_now_playing() failures before we stop believing the
+# session and force a reconnect. The loop used to swallow these forever on
+# the assumption that "the subscribe loop will reconnect if needed" — true
+# only when subscribe() itself raises. When the session dies underneath a
+# subscribe that is still blocked, nothing ever noticed and the monitor
+# reported itself healthy indefinitely (measured: over an hour in
+# production, recoverable only by restarting the container).
+MAX_REFRESH_FAILURES = 3
+
 
 @dataclass
 class LoungeObservation:
@@ -239,7 +254,26 @@ class LoungeMonitor:
 
     @property
     def is_connected(self) -> bool:
-        return self._api is not None and self._observation.available
+        """True only when the library agrees the session is live.
+
+        `_observation.available` is set once at connect and cleared only by
+        `_teardown()`, so on its own it is not evidence of anything: when
+        pyytlounge's `_connection_lost()` clears `_sid`/`_gsession` (it does
+        so on HTTP 400 "Unknown SID", 410 "Gone" and 401 "Expired") every
+        command starts failing instantly while this kept answering True.
+        That answer feeds /api/status, the UI's Lounge badge, and tv_play's
+        decision to spend LOUNGE_CONNECT_TIMEOUT waiting for a reply that
+        can never come.
+        """
+        api = self._api
+        if api is None or not self._observation.available:
+            return False
+        try:
+            return bool(api.connected())
+        except Exception:
+            # A library that cannot answer is not a session we should
+            # advertise as usable.
+            return False
 
     # ── pairing (called from /api/lounge/pair endpoint) ──────────────────────
 
@@ -319,7 +353,17 @@ class LoungeMonitor:
                 try:
                     await self._api.seek_to(start_s)
                 except Exception:
-                    log.warning("Lounge seek_to(%s) failed", start_s, exc_info=True)
+                    # Report FAILURE, don't swallow it. The caller treats a
+                    # False as "fall back to the deep link", and the deep
+                    # link carries &t=<start_s> — so the offset the user
+                    # actually asked for gets honoured. Swallowing this
+                    # meant a pasted ?t=300 link silently played from 0:00
+                    # while the API returned 200 and the log claimed the
+                    # offset had been sent.
+                    log.warning("Lounge seek_to(%s) failed; reporting the start "
+                                "as unsuccessful so the caller can deep link "
+                                "with the offset instead", start_s, exc_info=True)
+                    return False
             return bool(ok)
         except Exception:
             log.warning("Lounge play_video(%s) failed", video_id, exc_info=True)
@@ -467,9 +511,16 @@ class LoungeMonitor:
         Without this, remote-pause / navigate-to-home events take
         minutes to propagate to our UI.
         """
-        REFRESH_INTERVAL = 3.0
-        last_ct: Optional[float] = None
+        # A sentinel, not None, for "we have taken no reading yet". The
+        # detector used to seed last_ct with None and skip the comparison
+        # while it stayed None — so a ct that was NEVER populated (the exact
+        # signature of a wedged session) could never register as stuck, and
+        # the only self-healing path in the monitor was unreachable in the
+        # case it most needed to fire. With a sentinel, None == None counts.
+        _NO_READING = object()
+        last_ct = _NO_READING
         stuck_polls = 0
+        consecutive_failures = 0
         while not self._stopped:
             try:
                 await asyncio.sleep(REFRESH_INTERVAL)
@@ -477,8 +528,9 @@ class LoungeMonitor:
                 return
             api = self._api
             if api is None or not self._observation.available:
-                last_ct = None
+                last_ct = _NO_READING
                 stuck_polls = 0
+                consecutive_failures = 0
                 continue
             # Only refresh when our host (the queue controller) has an
             # active item to track. Otherwise the refresh keeps pulling
@@ -488,25 +540,42 @@ class LoungeMonitor:
             # naturally stays empty when nothing is queued.
             try:
                 if not self._should_refresh():
-                    last_ct = None
+                    last_ct = _NO_READING
                     stuck_polls = 0
+                    consecutive_failures = 0
                     continue
             except Exception:
                 pass
             try:
                 await api.get_now_playing()
+                consecutive_failures = 0
             except asyncio.CancelledError:
                 return
             except Exception:
-                log.debug("Lounge periodic get_now_playing failed; subscribe "
-                          "loop will reconnect if needed", exc_info=True)
+                consecutive_failures += 1
+                log.debug("Lounge periodic get_now_playing failed (%d in a row)",
+                          consecutive_failures, exc_info=True)
+                if consecutive_failures >= MAX_REFRESH_FAILURES:
+                    # Do NOT keep waiting for the subscribe loop to notice.
+                    # It only reconnects when subscribe() itself raises, and
+                    # a session can die underneath a subscribe that stays
+                    # blocked — which is precisely the wedge this guards.
+                    log.info(
+                        "Lounge get_now_playing failed %d times in a row — "
+                        "tearing down so the subscribe loop rebuilds the session",
+                        consecutive_failures,
+                    )
+                    consecutive_failures = 0
+                    last_ct = _NO_READING
+                    stuck_polls = 0
+                    await self._teardown()
                 continue
             # Detect stuck ct. The get_now_playing response is processed
             # asynchronously via _on_now_playing; by the time we check
             # the next loop iteration, observation should reflect it.
             # Compare against the previous loop's observation.
             current_ct = self._observation.current_time
-            if last_ct is not None and current_ct == last_ct:
+            if last_ct is not _NO_READING and current_ct == last_ct:
                 stuck_polls += 1
                 if stuck_polls >= STUCK_CT_POLL_THRESHOLD:
                     log.info(
@@ -516,7 +585,7 @@ class LoungeMonitor:
                         int(stuck_polls * REFRESH_INTERVAL),
                     )
                     stuck_polls = 0
-                    last_ct = None
+                    last_ct = _NO_READING
                     # Tear down the current session. The subscribe loop
                     # will create a fresh one on its next iteration,
                     # which triggers SmartTube to push current state on
@@ -632,6 +701,12 @@ class LoungeMonitor:
         new_state = _state_to_str(getattr(event, "state", None))
         if new_state is not None and new_state != "Stopped":
             self._observation.state = new_state
+            # SmartTube reports plenty of recoveries through nowPlaying
+            # rather than onStateChange. Only _on_playback_state used to
+            # cancel the pending FINISHED timer, so a recovery arriving on
+            # this path left it armed — see the re-arm site for what that
+            # then did to the next Stopped.
+            self._cancel_stopped_timer()
         await self._safe_emit(EVENT_POSITION, self._observation)
         if new_video and new_video != old_video:
             await self._safe_emit(EVENT_NOW_PLAYING, self._observation)
@@ -661,10 +736,8 @@ class LoungeMonitor:
         # State changed away from Stopped — cancel any pending
         # "persistent Stopped" timer (this was an ad-insertion blip or
         # similar brief transition, not a real end).
-        if new_state != "Stopped" and self._stopped_persisted_task is not None:
-            if not self._stopped_persisted_task.done():
-                self._stopped_persisted_task.cancel()
-            self._stopped_persisted_task = None
+        if new_state != "Stopped":
+            self._cancel_stopped_timer()
 
         if new_state != old_state:
             await self._safe_emit(EVENT_STATE, self._observation)
@@ -703,9 +776,24 @@ class LoungeMonitor:
                         ct_now if ct_now is not None else -1,
                         dur_now, STOPPED_PERSISTED_DELAY,
                     )
+                    # Cancel before re-arming. Without this a timer left
+                    # pending by a recovery we saw through nowPlaying would
+                    # simply be overwritten here — still scheduled, still
+                    # holding its ORIGINAL deadline — and would then fire on
+                    # this new Stopped after whatever was left of its window.
+                    # A 5s ad-break debounce became ~1s and the ad break
+                    # skipped the video.
+                    self._cancel_stopped_timer()
                     self._stopped_persisted_task = asyncio.create_task(
                         self._fire_finished_if_stopped_persists()
                     )
+
+    def _cancel_stopped_timer(self) -> None:
+        """Cancel and forget any pending persistent-Stopped FINISHED timer."""
+        task = self._stopped_persisted_task
+        self._stopped_persisted_task = None
+        if task is not None and not task.done():
+            task.cancel()
 
     async def _fire_finished_if_stopped_persists(self) -> None:
         """Fire FINISHED if state stays Stopped for STOPPED_PERSISTED_DELAY.
