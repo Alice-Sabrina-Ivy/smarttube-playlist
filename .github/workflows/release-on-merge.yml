@@ -35,6 +35,23 @@ on:
     types: [closed]
     branches: [main]
 
+# One release at a time. Two merged release PRs a minute apart, or a re-run,
+# would otherwise cut versions simultaneously.
+#
+# That is survivable today, but only by an ordering accident worth not relying
+# on: release.py pushes the bump commit BEFORE the tag, so the job that checked
+# out first wins and the other has its push refused and dies with its tag still
+# only on the runner. Nothing half-finished escapes — but a failed run appears
+# in the Actions tab at the exact moment someone is shipping, and they have to
+# work out that it was harmless.
+#
+# `cancel-in-progress: false` is the load-bearing half. Cancelling a release
+# mid-push is the one way to produce the half-state the ordering above avoids:
+# a bump commit pushed with no tag behind it.
+concurrency:
+  group: release-on-merge
+  cancel-in-progress: false
+
 jobs:
   release:
     # `merged` is the load-bearing half: `closed` fires for abandoned PRs too,
