@@ -37,8 +37,21 @@ on:
 # Serialised rather than cancelled: the runs build different refs and both
 # results are wanted, and cancelling mid-push would abandon a partly-written
 # manifest. The queued one runs after, so the tag build lands last.
+# Split by what the run COMPETES FOR, not by workflow. A queued run cancels
+# the previously PENDING run in its group — `cancel-in-progress: false` only
+# protects the one already executing — and a release merge produces THREE runs
+# of this workflow: the push to main, the dispatch on the new tag, and the
+# dispatch on beta. With one shared group the beta dispatch arrived third and
+# cancelled the tag build while it was still queued behind the main build, so
+# the tag and the release commit went public with no image, no GitHub Release,
+# and `:latest` left on the pre-bump build — while both release jobs reported
+# success, because `gh workflow run` is fire-and-forget.
+#
+# Only the main-push and tag runs contend: both push `:latest`, so they must
+# serialise and the tag must land last. beta never touches `:latest` and has
+# no reason to queue behind them.
 concurrency:
-  group: publish-${{ github.repository }}
+  group: publish-${{ github.repository }}-${{ github.ref_name == 'beta' && 'beta' || 'latest' }}
   cancel-in-progress: false
 
 env:

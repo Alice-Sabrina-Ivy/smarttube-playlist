@@ -18,12 +18,13 @@ card appeared, the progress bar ticked along — and nothing was playing on the 
 This turned out to be the same fault that would later make the app stop responding
 altogether, which is why it always seemed to work fine right up until it didn't.
 
-**The app no longer needs restarting when it loses the TV.** Two separate problems could
-leave it permanently stuck: it could lose its connection to the TV with nothing left
-trying to reconnect, and it could lose its link to SmartTube while still reporting
-everything as fine. Both looked identical from the outside — the page claimed to be
-connected and retrying while neither was true, and only restarting it helped. It now
-notices and recovers on its own.
+**The app no longer needs restarting when it loses the TV.** Three separate problems
+could leave it permanently stuck: it could lose its connection to the TV with nothing
+left trying to reconnect; it could lose its link to SmartTube while still reporting
+everything as fine; and its own attempt to repair that link never actually ended the
+dead one, so the repair quietly did nothing for as long as the app kept running. They
+looked identical from the outside — the page claimed to be connected and retrying while
+neither was true, and only restarting it helped. It now notices and recovers on its own.
 
 **The progress bar could show a different video's time.** After starting a new video the
 bar sometimes kept showing the previous one's position and length, so a ten-minute video
@@ -47,11 +48,19 @@ playing, and nothing was sent to the TV at all.
 something in SmartTube directly, the app would show it but the time never moved. It now
 keeps up, and pausing or leaving SmartTube is reflected properly.
 
+**A link that can't play no longer stops everything.** Paste a video that has been
+deleted, made private, blocked in your country, or simply mistyped, and the queue used
+to stop dead on it for ten minutes — with Play doing nothing, so the only way out was
+Skip, if you worked out that was the problem. It now gives the video about 45 seconds
+to start and then moves on to the next one.
+
 **Smaller fixes:**
 
 - Pressing Play twice while a video was resuming could start it twice over, with the
   audible stutter that causes.
-- Links with a start time (`?t=90`) could silently play from the beginning instead.
+- Links with a start time (`?t=90`) used to be dropped without trace when the jump
+  failed; the app now records it. The video still starts from the beginning in that
+  case — restarting it to apply the offset would be worse than losing the offset.
 - Seeking didn't tell the app when the video would now end, so it could move on late.
 - Returning the TV to its screensaver could back out of a video someone had just added.
 - On some devices auto-advance never worked at all, because the app couldn't read which

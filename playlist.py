@@ -1619,9 +1619,31 @@ class QueueController:
                 return
             if observation.get("video_id") != cur.video_id:
                 return
+            # One ending, two dispatches. `_on_playback_state` emits POSITION
+            # and then STATE from a single device event carrying the same
+            # observation, and both land here — so without this the second
+            # re-applies the frame to the item the first just started, popping
+            # and discarding it. Deterministic with two consecutive entries
+            # sharing a clip, which is the case the release notes advertise as
+            # fixed. `_on_lounge_finished` has had this guard since the same
+            # day; this path was missed.
+            if (self._finish_consumed_vid == observation.get("video_id")
+                    and self._finish_consumed_at is not None):
+                try:
+                    since = (self._clock() - self._finish_consumed_at).total_seconds()
+                except Exception:
+                    since = None
+                if since is not None and 0 <= since < FINISH_CONSUMED_WINDOW:
+                    return
             ct = observation.get("current_time")
             dur = observation.get("duration")
             if ct is None or not dur or float(dur) <= 0:
+                return
+            # And a frame that predates the item cannot end it. This function
+            # reads its ARGUMENT rather than `state.lounge`, so `_begin_locked`
+            # blanking that field — which is what protects the other finish
+            # checks — does not cover this one at all.
+            if self._observation_predates_current(float(ct)):
                 return
             if observation.get("state") not in ("Paused", "Stopped"):
                 return
@@ -1646,6 +1668,13 @@ class QueueController:
         cur = self.state.current
         started = self.state.current_started_at
         if cur is None or started is None or self._playback_confirmed:
+            return False
+        # Somebody pressed Pause. A dud parks itself Paused with nobody
+        # touching anything, and only the Lounge mirror sets `pause_source` —
+        # so this is what separates them. It matters because pausing while the
+        # video is still buffering produces the dud signature exactly: ct is
+        # 0.0, so the `> 0` clause below never latches `_playback_confirmed`.
+        if self.state.pause_source is not None:
             return False
         if not observation.get("available"):
             return False
