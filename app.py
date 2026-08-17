@@ -1175,6 +1175,12 @@ async def _start_lounge_monitor() -> None:
         # it will yank the user out of whatever app they are in every 3
         # seconds, forever. Pinned by
         # test_the_refresh_gate_depends_on_pairing_to_stay_shut.
+        #
+        # v1.02 added a second way in: `_lounge_shows_external_playback()`
+        # refreshes for playback the queue does not own, and it does not read
+        # `current`, so the first clause could not protect it. It carries its
+        # own `state.remote is None` check for that reason — the coupling is
+        # now stated in both places rather than resting on one of them.
         should_refresh=_should_refresh_lounge,
         # Persist a refreshed loungeIdToken to disk so the next startup
         # uses the fresh token instead of trying the expired one. Without
@@ -1201,7 +1207,23 @@ def _lounge_shows_external_playback() -> bool:
     `Playing` specifically, and a real `current_time`: the Lounge cloud cache
     reports dormant players as Paused/Stopped indefinitely (invariant 4), and
     refreshing off a ghost is what used to resurrect old videos in the UI.
+
+    Requires a live remote, and that is not incidental — see the SAFETY
+    COUPLING note above `should_refresh=`. `suppress_lounge` is written only
+    from current_app callbacks, so with no remote it is permanently False and
+    protects nothing; what kept this gate shut was that `_require_paired()`
+    503s /api/queue, so `current` could never be set. This clause does not
+    read `current`, so without the remote check it reopened the gate in
+    exactly that state — and there the cloud cache reports the last video as
+    Playing at a frozen position forever (invariant 4), which polls a
+    possibly-backgrounded SmartTube every 3s (auto-foregrounding it, and on a
+    Shield waking the device) and then trips the stuck-ct detector into a
+    teardown/reconnect cycle on top. With no remote we cannot tell whether
+    SmartTube is foreground, so we do not poll. Pinned by
+    test_refresh_gate_stays_shut_with_no_remote.
     """
+    if state.remote is None:
+        return False
     if queue_controller.state.current is not None:
         return False
     lng = queue_controller.state.lounge or {}

@@ -34,7 +34,7 @@ import contextlib
 import logging
 import uuid
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Awaitable, Callable, Optional, Protocol
 
 log = logging.getLogger("smarttube-playlist.queue")
@@ -250,6 +250,17 @@ class QueueController:
         # once. See _timer_body for why this, and not the Lounge position,
         # is what the kill-switch must trust about "did it finish".
         self._duration_elapsed = False
+        # Where the PLAYHEAD started, which is not the same question as when
+        # the item became current — and `current_started_at` is the answer to
+        # the second one. It is read by the kill-switch's start grace ("did we
+        # just hand off?"), by the frontend's STARTING badge and by its
+        # wall-clock progress estimate, so moving it to follow a seek broke all
+        # three: a rewind to 0:04 re-armed the 12s grace on a video that had
+        # been playing for three quarters of an hour, and made the card claim
+        # "STARTING…" straight after an action that proves playback is live.
+        # Only `_observation_predates_current` wants the playhead origin, so it
+        # gets its own field. None means "same as current_started_at".
+        self._playhead_origin_at: Optional[datetime] = None
         # External-switch debounce: when Lounge reports a video_id that
         # doesn't match state.current.video_id, we wait this many
         # seconds before assuming the user switched videos via the
@@ -806,6 +817,31 @@ class QueueController:
         async with self._lock:
             observed_video = self.state.lounge.get("video_id")
             expected_video = self.state.current.video_id if self.state.current else None
+        # DELIBERATELY no wall-clock staleness test here, and it must stay that
+        # way. `_observation_predates_current` looks like the right tool — the
+        # video_id match below separates items only when the ids DIFFER, and
+        # two consecutive queue entries sharing one is ordinary, so a FINISHED
+        # belonging to the item we just left can be credited to its successor.
+        # It was tried and it is strictly worse than the bug it fixes.
+        #
+        # That test asks "is the position ahead of the wall clock since this
+        # item became current", and the position legitimately runs ahead in
+        # cases nothing re-anchors: an idle-add that takes ownership of a video
+        # already playing (tv_play's skip-redundant branch sends nothing, so
+        # playback is mid-way while we have just stamped the clock), an
+        # in-place resume, and any seek made with the TV's own remote, which we
+        # never see. In every one of those a genuine end-of-video FINISHED gets
+        # discarded — and unlike a missed near-end position there is no
+        # fallback, because `_duration_elapsed` is false too and the kill-switch
+        # then clears `current` and strands the queue. Trading a rare dropped
+        # item for a reachable strand is the wrong way round.
+        #
+        # The remaining double-advance is real but bounded: one queue item can
+        # be popped and superseded when the same clip is queued twice in a row.
+        # Fixing it needs a discriminator that does not assume the playhead
+        # tracks the wall clock. Tests:
+        # test_a_finished_after_a_remote_fast_forward_still_advances,
+        # test_a_finished_for_a_video_we_took_ownership_of_midway_still_advances.
         # Both sides must be known AND match. Requiring only `expected_video`
         # to be truthy let the None case through: with nothing of ours playing
         # — a stalled queue after the external-switch cede, or the beta
@@ -903,8 +939,9 @@ class QueueController:
         self.state.current = item
         self.state.current_started_at = self._clock()
         # New item, new clock: whatever the previous one's timer concluded
-        # says nothing about this one.
+        # says nothing about this one, and neither does where its playhead was.
         self._duration_elapsed = False
+        self._playhead_origin_at = None
         # Nor does the previous one's Lounge frame, which is still sitting in
         # state.lounge parked at ITS end — that is why we advanced. The
         # video_id guard normally separates them, but two queue entries can
@@ -1115,7 +1152,7 @@ class QueueController:
         skew, and `start_s` covers a deliberate offset.
         """
         cur = self.state.current
-        started = self.state.current_started_at
+        started = self._playhead_origin_at or self.state.current_started_at
         if cur is None or started is None:
             return False
         try:
@@ -1313,6 +1350,7 @@ class QueueController:
             # The clock restarts, so whatever the old timer concluded about
             # this item's length having elapsed no longer holds.
             self._duration_elapsed = False
+            self._playhead_origin_at = None
             # Re-stamp the start too. It was set in `_begin_locked`, i.e.
             # before the wake and the launch, which made the UI's wall-clock
             # estimate open at 0:15 or more on a cold start and made every
@@ -1336,6 +1374,31 @@ class QueueController:
             if cur is None or cur.duration_s is None:
                 return
             remaining = max(0.0, float(cur.duration_s) - float(position_s))
+            # Move the PLAYHEAD ORIGIN with the playhead, not just the timer.
+            # `_observation_predates_current` calls a position stale when it
+            # runs ahead of the time since that origin, which after a forward
+            # seek every truthful position does — permanently, since elapsed
+            # can never catch up. That silently switched off the Lounge half
+            # of both finish checks for the rest of the item, and with it the
+            # `paused and not _lounge_says_finished()` guard in _timer_body:
+            # a lone video ends Paused, so the timer then cleared `current`
+            # and left everything behind it queued with nothing to start it —
+            # the stranding this release exists to fix, reachable by seeking.
+            #
+            # Its OWN field, deliberately: `current_started_at` answers "when
+            # did this item become current", and the kill-switch start grace,
+            # the STARTING badge and the frontend's progress estimate all read
+            # it for that. See the field's definition in __init__.
+            offset = float(cur.start_s or 0)
+            self._playhead_origin_at = self._clock() - timedelta(
+                seconds=max(0.0, float(position_s) - offset)
+            )
+            # And the item's nominal length demonstrably has NOT elapsed at a
+            # position the user just seeked back to. `_current_item_finished`
+            # short-circuits on this flag ahead of any position check, so
+            # leaving it set let the next kill-switch advance the queue off a
+            # video that had just been rewound.
+            self._duration_elapsed = False
             self._timer_gen += 1
             gen = self._timer_gen
             self._timer_task = asyncio.create_task(

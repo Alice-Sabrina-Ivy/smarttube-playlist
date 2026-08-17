@@ -1,12 +1,16 @@
 name: Cut a release when a release PR merges
 
-# Merging a `release/*` PR into main runs scripts/release.py --minor, which
-# bumps VERSION, syncs the footer in index.html, commits, tags and pushes.
+# Merging a `release/*` PR into main runs scripts/release.py, which bumps
+# VERSION, syncs the footer in index.html, commits, tags and pushes.
 # publish.yml then builds the image and opens the GitHub release.
 #
 # Deliberately narrow: it fires ONLY for a merged pull request whose head
 # branch starts with `release/`. An ordinary bugfix PR merging to main must
 # not mint a version — that is why this is not simply `on: push: main`.
+#
+# The version being released is READ FROM THE BRANCH NAME, so the branch has
+# to be `release/vMAJOR.MINOR` with a zero-padded two-digit minor. That is
+# what makes the job safe to re-run; see the note on the version step below.
 #
 # TWO THINGS WORTH KNOWING BEFORE YOU RELY ON IT
 #
@@ -65,12 +69,81 @@ jobs:
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-      - name: Cut the release
-        id: cut
+      # The version comes from the PR's own branch name, never from bumping
+      # whatever main currently says. That is what makes this job safe to
+      # re-run.
+      #
+      # Every side effect of a release happens inside release.py — bump,
+      # commit, tag, push both — ahead of the steps below that build the
+      # image. So a failure anywhere after that push (a rejected tag push, a
+      # transient `gh workflow run` error) leaves the run red with THIS job as
+      # the failed one, and the obvious control, "Re-run failed jobs", re-runs
+      # it. With `--minor` the re-run read the version the first attempt had
+      # just written, bumped it AGAIN, and cut the next version: every guard
+      # passed because that tag was genuinely free, so it published an image
+      # and a GitHub Release whose body read "No changelog entry yet", took
+      # `:latest` and `:1` with it, and stranded the real notes one release
+      # back. `release.py --check` could not see it afterwards — VERSION, the
+      # footer and the newest tag all agreed.
+      #
+      # With an explicit `--set`, a re-run asks for the same version and dies
+      # on release.py's own "already exists" guard, which is the correct
+      # outcome. Pinned by
+      # test_the_release_version_comes_from_the_pr_not_from_mains_version_file.
+      - name: Work out which version this PR releases
+        id: version
+        env:
+          HEAD_REF: ${{ github.event.pull_request.head.ref }}
         run: |
           set -euo pipefail
-          python scripts/release.py --minor
-          VERSION="$(cat VERSION)"
+          # release/v1.02 -> 1.02, and release/1.02 too. Anything else is a
+          # branch we cannot name a version from, so stop rather than guess.
+          VERSION="${HEAD_REF#release/}"
+          VERSION="${VERSION#v}"
+          # Same canonical form scripts/release.py accepts, so the two cannot
+          # disagree about what a version is. MINOR is zero-padded to two
+          # digits and carries no surplus zeros: 00, 01, 09, 10, 100 — but not
+          # 1 (under-padded, a different image tag) and not 001 or 010
+          # (over-padded, a third spelling of a release that already exists).
+          # MAJOR takes no leading zero. Validating it HERE rather than leaving
+          # it to release.py matters: otherwise the changelog gate below fails
+          # first and blames a missing heading, which is the wrong diagnosis
+          # and invites someone to commit a section for a version that can
+          # never exist. Pinned by tests/test_release.py.
+          if ! printf '%s' "$VERSION" | grep -Eq '^(0|[1-9][0-9]*)\.(0[0-9]|[1-9][0-9]+)$'; then
+            echo "::error::Cannot read a version from head branch '${HEAD_REF}'."\
+                 "Name the branch release/vMAJOR.MINOR with a zero-padded"\
+                 "two-digit minor, e.g. release/v1.02."
+            exit 1
+          fi
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "tag=v${VERSION}" >> "$GITHUB_OUTPUT"
+
+      # Before the tag exists, while there is still something to prevent.
+      # publish.yml pulls the release body from a literal `## v<version>`
+      # heading in CHANGELOG.md and falls back to "No changelog entry for ...
+      # yet." — silently, and the tag and image are immutable by the time
+      # anybody reads it.
+      - name: Require a changelog entry for it
+        env:
+          TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          set -euo pipefail
+          if ! grep -qxF "## ${TAG}" CHANGELOG.md; then
+            echo "::error::CHANGELOG.md has no '## ${TAG}' heading, so the"\
+                 "release would publish with an empty body. Add the section"\
+                 "to the release PR first."
+            exit 1
+          fi
+          echo "CHANGELOG.md has notes for ${TAG}" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Cut the release
+        id: cut
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          python scripts/release.py --set "$VERSION"
           echo "tag=v${VERSION}" >> "$GITHUB_OUTPUT"
           echo "Released v${VERSION}" >> "$GITHUB_STEP_SUMMARY"
 

@@ -399,8 +399,16 @@ class LoungeMonitor:
         if self._api is None:
             return False
         try:
-            await self._api.seek_to(seconds)
-            return True
+            # The RETURN VALUE is load-bearing, exactly as it is in play_video.
+            # pyytlounge's `_command` returns False WITHOUT raising when the
+            # bind channel answers 400 "Unknown SID", 410 "Gone" or 401
+            # "Expired" — and `connected()` cannot see that coming, because it
+            # is a purely local check on the cached SID. Discarding it made
+            # /api/seek answer 200 for a seek the device never received, and
+            # the caller then re-anchors the duration timer and the playhead
+            # origin to a position playback never reached — which strands the
+            # queue when the video really ends.
+            return bool(await self._api.seek_to(seconds))
         except Exception:
             log.warning("Lounge seek_to(%s) failed", seconds, exc_info=True)
             return False
