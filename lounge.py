@@ -195,6 +195,16 @@ class LoungeMonitor:
         self._api: Optional[YtLoungeApi] = None
         self._listener = _LoungeListener(self)
         self._subscribe_task: Optional[asyncio.Task] = None
+        # The in-flight `subscribe()` call, as its own task so `_teardown`
+        # can end it. pyytlounge blocks there on an untimed streaming GET and
+        # only re-checks `connected()` after an event arrives, and
+        # `disconnect()` does not close that stream — so without this a
+        # teardown left the loop parked on a dead session forever.
+        self._subscribe_call: Optional[asyncio.Task] = None
+        # Set by `_teardown` immediately before it cancels `_subscribe_call`,
+        # so the loop can tell "we ended this session on purpose, reconnect"
+        # from "the monitor is being stopped".
+        self._teardown_interrupt = False
         self._refresh_task: Optional[asyncio.Task] = None
         # Timer that fires EVENT_FINISHED if state stays Stopped
         # mid-playback for STOPPED_PERSISTED_DELAY seconds. Distinguishes
@@ -500,6 +510,21 @@ class LoungeMonitor:
         api, self._api = self._api, None
         was_available = self._observation.available
         self._observation = LoungeObservation()
+        # END THE SUBSCRIBE, don't just stop believing in it. `disconnect()`
+        # POSTs a terminate over a SEPARATE request and leaves the streaming
+        # response open, and pyytlounge only re-checks `connected()` after the
+        # next event — which on a quiet session never comes. Without this
+        # cancel the loop stayed parked inside `subscribe()` and no teardown
+        # path ever recovered: not the stuck-ct self-heal, not the
+        # consecutive-failure teardown, not `request_reconnect_now`. The
+        # watchdog could not see it either, because it tests `task.done()` and
+        # a blocked task is not done. Measured on hardware: Lounge died 15s
+        # into a session and was still dead seven minutes later with the video
+        # playing throughout.
+        sub = self._subscribe_call
+        if sub is not None and not sub.done():
+            self._teardown_interrupt = True
+            sub.cancel()
         with contextlib.suppress(Exception):
             await api.disconnect()
         with contextlib.suppress(Exception):
@@ -674,11 +699,25 @@ class LoungeMonitor:
                     continue
                 backoff = 5.0
             try:
-                await self._api.subscribe()
+                # As its own task, so `_teardown` can end it — see the note
+                # there. Awaiting `subscribe()` inline made every teardown
+                # path a no-op that killed Lounge for the process lifetime.
+                sub = asyncio.create_task(self._api.subscribe())
+                self._subscribe_call = sub
+                try:
+                    await sub
+                finally:
+                    self._subscribe_call = None
                 # subscribe() returning normally means the session ended.
                 log.info("Lounge subscribe ended; tearing down for reconnect")
                 await self._teardown()
             except asyncio.CancelledError:
+                if self._teardown_interrupt:
+                    # OUR OWN teardown ended that session. Loop round and
+                    # reconnect; the monitor is not being stopped.
+                    self._teardown_interrupt = False
+                    log.info("Lounge session ended by teardown; reconnecting")
+                    continue
                 raise
             except Exception:
                 log.warning("Lounge subscribe error; will reconnect", exc_info=True)

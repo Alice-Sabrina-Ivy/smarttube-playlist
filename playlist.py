@@ -1160,6 +1160,14 @@ class QueueController:
         # person who pressed Pause in our own UI told us plainly.
         if self.state.paused and (self.state.pause_source == "ui"
                                   or not self._lounge_says_finished()):
+            # Clear without advancing. NOTE what happens next, because it
+            # surprises people and it is deliberate rather than a gap:
+            # `current` goes None while the queue keeps its items, and
+            # `resume()` then starts the NEXT one — pinned by
+            # test_unpause_with_idle_current_and_queued_item_starts_next.
+            # Measured on hardware: paused at 634.9 of 635 with one item
+            # queued, and the card emptied seven seconds later with the queue
+            # intact but not moving until Play was pressed.
             log.info(
                 "Timer fired while paused (source=%s) and not treating it as "
                 "end of video — clearing current without advancing",
