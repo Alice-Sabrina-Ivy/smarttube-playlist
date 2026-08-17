@@ -18,10 +18,10 @@ name: Cut a release when a release PR merges
 #    release job both key off `github.ref`, which is the tag ref when
 #    dispatched that way.
 #
-# 2. It pushes to GITHUB ONLY. The Forgejo mirror is a second push URL
-#    configured on the maintainer's local `origin`, which CI knows nothing
-#    about. After a release, mirror it from a local clone:
-#        git fetch origin && git push origin main --tags
+# 2. Nothing here needs to know about the Forgejo mirror. It is a PULL
+#    mirror that fetches from GitHub on its own schedule, so it follows
+#    whatever lands here without being pushed to. It is also read-only:
+#    never add a push step for it.
 #
 # To release without merging a PR, run scripts/release.py locally — it does
 # exactly the same thing.
@@ -84,17 +84,6 @@ jobs:
           # is ever built for it.
           gh workflow run publish.yml --ref "$TAG"
           echo "Dispatched publish.yml for $TAG" >> "$GITHUB_STEP_SUMMARY"
-
-      - name: Remind about the Forgejo mirror
-        run: |
-          {
-            echo ""
-            echo "**Mirror still to do.** CI pushed to GitHub only; run this locally:"
-            echo ""
-            echo '```'
-            echo "git fetch origin && git push origin main --tags"
-            echo '```'
-          } >> "$GITHUB_STEP_SUMMARY"
 
   # Carries the release onto `beta` so device testers run the same app, without
   # anyone maintaining a second pull request in parallel with the first.
