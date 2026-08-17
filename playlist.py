@@ -203,6 +203,22 @@ OBSERVATION_STALENESS_SLACK = 5.0
 # queue still full — the exact stranding this release exists to close.
 OBSERVATION_TRUST_AFTER = 10.0
 
+# How close to `duration` a position must be to count as "parked on the last
+# frame" rather than "paused near the end".
+#
+# Much tighter than NEAR_END_SECONDS, and measured rather than chosen: a video
+# that plays out lands within a second of its duration on this hardware —
+# 18.566 of 19.0, and 634.42 of 635.0 in the skip run. Someone pausing lands
+# wherever they pressed the button. That separation is what lets the queue hand
+# off from a video that ended EARLY in wall-clock terms (a SponsorBlock skip
+# means the duration timer has not come due) without skipping a pause made two
+# or three seconds from the end.
+#
+# Wrong in the tight direction just means waiting for the duration timer, which
+# is what happened before this existed. Wrong in the loose direction skips
+# someone's video. Keep it tight.
+END_PARK_SLACK = 1.5
+
 
 @dataclass
 class QueueState:
@@ -1505,17 +1521,44 @@ class QueueController:
         the duration timer — which may itself have deferred on a stale
         position, adding seconds more.
 
-        Requires the item's full duration to have elapsed AS WELL AS the
-        position sitting at the end. The position alone is not enough: a user
-        pausing three seconds from the end looks identical, and skipping
-        their video for them would be worse than being a little late.
+        Reaching the end is the signal; the duration timer is a fallback, and
+        REQUIRING it here shut this path exactly when it was needed. Measured
+        on hardware with the playhead moved on the device (a SponsorBlock
+        skip): the video played out to 634.42 of 635, parked Paused, and the
+        queue sat there over a minute with the next item waiting. The timer
+        had not come due because the video finished ten minutes early in
+        wall-clock terms; `lounge.finished` never fired because a lone video
+        ends Paused rather than Stopped; and the kill-switch never ran because
+        SmartTube stayed foreground on its ended-video screen, so there was no
+        transition to trigger it. Three independent paths, all shut at once.
+
+        What must still be respected is an explicit pause — a user pausing
+        three seconds from the end looks identical to an ending, and skipping
+        their video for them would be worse than being late. `pause_source`
+        answers that directly, and it is a far better discriminator than a
+        clock a skip has already invalidated. A pause made with the TV's own
+        remote at that range stays genuinely ambiguous; being a few seconds
+        eager there is the cheaper error than stranding the queue on every
+        video SponsorBlock has touched.
         """
         async with self._lock:
             cur = self.state.current
             if cur is None or not self.state.queue:
                 return
-            if not self._duration_elapsed:
+            if self.state.pause_source == "ui":
                 return
+            parked_at_end = False
+            if not self._duration_elapsed:
+                ct0, dur0 = observation.get("current_time"), observation.get("duration")
+                try:
+                    parked_at_end = (
+                        ct0 is not None and dur0
+                        and (float(dur0) - float(ct0)) <= END_PARK_SLACK
+                    )
+                except (TypeError, ValueError):
+                    parked_at_end = False
+                if not parked_at_end:
+                    return
             if not observation.get("available"):
                 return
             if observation.get("video_id") != cur.video_id:
