@@ -184,6 +184,25 @@ FINISH_CONSUMED_WINDOW = 3.0
 # left (typically parked at its end) is caught.
 OBSERVATION_STALENESS_SLACK = 5.0
 
+# How long after an item becomes current we still doubt a position that runs
+# ahead of the wall clock. After this, we believe it.
+#
+# The staleness test exists for one measured bug: the second of two identical
+# shorts was advanced off its predecessor's frame 3.7s in, because SmartTube
+# keeps pushing about the previous playback for a few seconds and a shared
+# video_id defeats the id guard. That is a SHORT-LIVED hazard.
+#
+# Treating it as permanent is what broke. A playhead legitimately runs ahead of
+# wall-clock elapsed for the rest of a video whenever something moves it that
+# we never see — and on this project's own reference setup that is routine, not
+# exotic: SponsorBlock cuts segments out on the device, so a video with a
+# minute of sponsor in it reaches its end a minute early. Every truthful frame
+# was then called stale, `_lounge_says_finished()` answered False for the whole
+# item, and since the video also finishes before its duration timer comes due,
+# the kill-switch found no evidence of a finish and cleared `current` with the
+# queue still full — the exact stranding this release exists to close.
+OBSERVATION_TRUST_AFTER = 10.0
+
 
 @dataclass
 class QueueState:
@@ -1304,6 +1323,13 @@ class QueueController:
         try:
             elapsed = (self._clock() - started).total_seconds()
         except Exception:
+            return False
+        if elapsed >= OBSERVATION_TRUST_AFTER:
+            # Long past the window in which a frame about the PREVIOUS item can
+            # still arrive, so a position ahead of the wall clock is something
+            # that moved the playhead — a SponsorBlock skip, a seek on the TV's
+            # own remote, playback we adopted mid-way — not a stale frame. See
+            # the constant for what calling these stale cost.
             return False
         offset = float(cur.start_s or 0)
         return ct > (elapsed + offset + OBSERVATION_STALENESS_SLACK)
