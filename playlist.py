@@ -1650,10 +1650,18 @@ class QueueController:
             if (float(dur) - float(ct)) > NEAR_END_SECONDS:
                 return
             ended = cur.video_id
+            elapsed_reason = self._duration_elapsed
+        # Say WHICH test passed. There are two branches here and the second —
+        # parked at the end with the duration NOT elapsed — is the common one
+        # on any video a skip has shortened, which is what this path was
+        # widened to catch. Naming the wrong one is how "the log says X" costs
+        # somebody an afternoon; that already happened once in this file.
         log.info(
-            "Lounge shows %s parked at its end (%.1f/%.1f) and its duration has "
-            "elapsed — advancing now rather than waiting for the timer",
+            "Lounge shows %s parked at its end (%.1f/%.1f) and %s — advancing "
+            "now rather than waiting for the timer",
             ended, float(ct), float(dur),
+            "its duration has elapsed" if elapsed_reason
+            else "it is within %.1fs of its duration" % END_PARK_SLACK,
         )
         await self._advance(reason="lounge_end_of_video")
 
