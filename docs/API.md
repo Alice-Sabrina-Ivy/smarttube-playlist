@@ -16,7 +16,8 @@ POST   /api/skip                          next video, or screensaver if empty
 POST   /api/pause                         pause playback and freeze auto-advance
 POST   /api/resume                        resume
 POST   /api/clear                         empty the queue, leave current playing
-POST   /api/seek           {to|by}        `to`: "1:23" / "90s" / "1h30m"; `by`: ±seconds. 503 without Lounge
+POST   /api/seek           {to|by}        `to`: "1:23" / "90s" / "1h30m"; `by`: ±seconds. 503 without Lounge.
+                                          Also re-anchors auto-advance to the new position (see below)
 POST   /api/volume/{up|down|mute}         sends a volume keycode over the paired remote; 503 if
                                           no TV is paired
 GET    /api/events                        SSE stream of queue snapshots
@@ -28,6 +29,20 @@ POST   /api/pair/finish    {code}         6-character code from the TV
 POST   /api/pair/cancel                   abort an in-progress pairing
 POST   /api/lounge/pair    {code}         12-digit code from SmartTube; 409 if already paired
 ```
+
+### Seeking moves the auto-advance countdown too
+
+`/api/seek` is not purely a playback command. Auto-advance is backed by a
+timer sized to the video's length when it started, and a seek moves the
+playhead without telling it — so before v1.02 a jump forward left the queue
+advancing late by the size of the jump, and "late" is precisely the window in
+which the video ends first and the next item never starts. The endpoint now
+re-anchors that timer, and the app's idea of where the playhead is, to the
+position you seeked to.
+
+Nothing to pass for it; it happens whenever the seek succeeds **for a video the queue owns**. Seeking playback somebody started on the TV itself still works — the endpoint only needs a live Lounge session — but there is no countdown of ours behind it to move, so nothing is re-anchored. A seek the
+device rejects returns **502** and changes nothing, which matters because
+acting on a seek that never landed is worse than not seeking at all.
 
 ### Recovering a TV that moved
 

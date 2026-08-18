@@ -87,6 +87,21 @@ STOPPED_PERSISTED_DELAY = 5.0
 # being undetectable for ages.
 STUCK_CT_POLL_THRESHOLD = 5  # 5 polls × 3s = 15s
 
+# How often the periodic refresh asks SmartTube for its current state.
+# Module-level rather than a local so tests can patch it — when a timing
+# constant is only reachable as a local, no test can exercise the behaviour
+# it governs, which is how the wedge below survived the whole suite.
+REFRESH_INTERVAL = 3.0
+
+# Consecutive get_now_playing() failures before we stop believing the
+# session and force a reconnect. The loop used to swallow these forever on
+# the assumption that "the subscribe loop will reconnect if needed" — true
+# only when subscribe() itself raises. When the session dies underneath a
+# subscribe that is still blocked, nothing ever noticed and the monitor
+# reported itself healthy indefinitely (measured: over an hour in
+# production, recoverable only by restarting the container).
+MAX_REFRESH_FAILURES = 3
+
 
 @dataclass
 class LoungeObservation:
@@ -180,6 +195,16 @@ class LoungeMonitor:
         self._api: Optional[YtLoungeApi] = None
         self._listener = _LoungeListener(self)
         self._subscribe_task: Optional[asyncio.Task] = None
+        # The in-flight `subscribe()` call, as its own task so `_teardown`
+        # can end it. pyytlounge blocks there on an untimed streaming GET and
+        # only re-checks `connected()` after an event arrives, and
+        # `disconnect()` does not close that stream — so without this a
+        # teardown left the loop parked on a dead session forever.
+        self._subscribe_call: Optional[asyncio.Task] = None
+        # Set by `_teardown` immediately before it cancels `_subscribe_call`,
+        # so the loop can tell "we ended this session on purpose, reconnect"
+        # from "the monitor is being stopped".
+        self._teardown_interrupt = False
         self._refresh_task: Optional[asyncio.Task] = None
         # Timer that fires EVENT_FINISHED if state stays Stopped
         # mid-playback for STOPPED_PERSISTED_DELAY seconds. Distinguishes
@@ -239,7 +264,26 @@ class LoungeMonitor:
 
     @property
     def is_connected(self) -> bool:
-        return self._api is not None and self._observation.available
+        """True only when the library agrees the session is live.
+
+        `_observation.available` is set once at connect and cleared only by
+        `_teardown()`, so on its own it is not evidence of anything: when
+        pyytlounge's `_connection_lost()` clears `_sid`/`_gsession` (it does
+        so on HTTP 400 "Unknown SID", 410 "Gone" and 401 "Expired") every
+        command starts failing instantly while this kept answering True.
+        That answer feeds /api/status, the UI's Lounge badge, and tv_play's
+        decision to spend LOUNGE_CONNECT_TIMEOUT waiting for a reply that
+        can never come.
+        """
+        api = self._api
+        if api is None or not self._observation.available:
+            return False
+        try:
+            return bool(api.connected())
+        except Exception:
+            # A library that cannot answer is not a session we should
+            # advertise as usable.
+            return False
 
     # ── pairing (called from /api/lounge/pair endpoint) ──────────────────────
 
@@ -313,14 +357,38 @@ class LoungeMonitor:
             return False
         try:
             ok = await self._api.play_video(video_id)
+            if not ok:
+                # setPlaylist itself was refused — pyytlounge answers 400
+                # "Unknown SID" / 410 "Gone" / 401 "Expired" with False and no
+                # exception. NOTHING reached the TV, so the caller's deep-link
+                # fallback is exactly right.
+                return False
             if start_s and start_s > 0:
                 # Give SmartTube a moment to load the media before seeking.
                 await asyncio.sleep(1.0)
+                seek_ok = False
                 try:
-                    await self._api.seek_to(start_s)
+                    # The bool matters as much as the exception: `_command`
+                    # reports a dead session by returning False.
+                    seek_ok = bool(await self._api.seek_to(start_s))
                 except Exception:
-                    log.warning("Lounge seek_to(%s) failed", start_s, exc_info=True)
-            return bool(ok)
+                    log.warning("Lounge seek_to(%s) raised", start_s,
+                                exc_info=True)
+                if not seek_ok:
+                    # STILL a success, and this is the load-bearing part.
+                    # The caller answers False by sending a deep link, and
+                    # setPlaylist has already started the video — so returning
+                    # False here means two play signals for one add, which is
+                    # invariant 1 and audible as the clip restarting a second
+                    # or two in. Losing the offset is the lesser harm: the
+                    # video is playing, just from the beginning.
+                    log.warning(
+                        "Lounge setPlaylist for %s landed but the %ss offset "
+                        "did not apply; leaving it playing from the start "
+                        "rather than sending a second play signal",
+                        video_id, start_s,
+                    )
+            return True
         except Exception:
             log.warning("Lounge play_video(%s) failed", video_id, exc_info=True)
             return False
@@ -329,8 +397,15 @@ class LoungeMonitor:
         if self._api is None:
             return False
         try:
-            await self._api.pause()
-            return True
+            # Load-bearing return value, same as seek_to and play_video below:
+            # all three are a bare `return await self._command(...)` in
+            # pyytlounge, and `_command` answers 400 "Unknown SID", 410 "Gone"
+            # and 401 "Expired" with False and no exception. Hardcoding True
+            # here skipped the MEDIA_PAUSE keycode fallback — the only one
+            # there is — while QueueController.pause set paused/pause_source
+            # anyway, so the TV played on under a UI that said paused and the
+            # duration timer later ended a video still on screen.
+            return bool(await self._api.pause())
         except Exception:
             log.warning("Lounge pause failed", exc_info=True)
             return False
@@ -339,8 +414,11 @@ class LoungeMonitor:
         if self._api is None:
             return False
         try:
-            await self._api.play()
-            return True
+            # Same reasoning as pause. Milder here, because _lounge_play
+            # verifies the state actually reaches Playing and falls through
+            # to tv_play when it does not — but that verification should not
+            # be the only thing catching a session that is already dead.
+            return bool(await self._api.play())
         except Exception:
             log.warning("Lounge play failed", exc_info=True)
             return False
@@ -355,8 +433,16 @@ class LoungeMonitor:
         if self._api is None:
             return False
         try:
-            await self._api.seek_to(seconds)
-            return True
+            # The RETURN VALUE is load-bearing, exactly as it is in play_video.
+            # pyytlounge's `_command` returns False WITHOUT raising when the
+            # bind channel answers 400 "Unknown SID", 410 "Gone" or 401
+            # "Expired" — and `connected()` cannot see that coming, because it
+            # is a purely local check on the cached SID. Discarding it made
+            # /api/seek answer 200 for a seek the device never received, and
+            # the caller then re-anchors the duration timer and the playhead
+            # origin to a position playback never reached — which strands the
+            # queue when the video really ends.
+            return bool(await self._api.seek_to(seconds))
         except Exception:
             log.warning("Lounge seek_to(%s) failed", seconds, exc_info=True)
             return False
@@ -428,17 +514,50 @@ class LoungeMonitor:
         except Exception:
             log.warning("Lounge get_now_playing on connect failed", exc_info=True)
 
-    async def _teardown(self) -> None:
+    async def _teardown(self, *, notify: bool = True) -> None:
+        """Drop the session. `notify=False` for a SELF-HEAL.
+
+        The DISCONNECTED emit means "the player went away" to the queue
+        controller, which schedules a player-close verify and can clear
+        `current`. That is right when subscribe() genuinely ended; it is
+        wrong when WE tore the session down to rebuild it, because the
+        video is still playing. A ~17s network blip between the container
+        and YouTube would otherwise clear the card and strand the queue.
+        """
         if self._api is None:
             return
         api, self._api = self._api, None
         was_available = self._observation.available
         self._observation = LoungeObservation()
+        # END THE SUBSCRIBE, don't just stop believing in it. `disconnect()`
+        # POSTs a terminate over a SEPARATE request and leaves the streaming
+        # response open, and pyytlounge only re-checks `connected()` after the
+        # next event — which on a quiet session never comes. Without this
+        # cancel the loop stayed parked inside `subscribe()` and no teardown
+        # path ever recovered: not the stuck-ct self-heal, not the
+        # consecutive-failure teardown, not `request_reconnect_now`. The
+        # watchdog could not see it either, because it tests `task.done()` and
+        # a blocked task is not done. Measured on hardware: Lounge died 15s
+        # into a session and was still dead seven minutes later with the video
+        # playing throughout.
+        # ...but never the task we are RUNNING ON. pyytlounge awaits event
+        # listeners inline inside subscribe(), and an onDisconnected event
+        # routes here through `_on_disconnected_event` — so on that path this
+        # IS the subscribe task. Cancelling it makes the next await raise
+        # CancelledError, which `suppress(Exception)` cannot catch, and the
+        # disconnect, the `__aexit__` that closes the aiohttp session, and the
+        # DISCONNECTED emit are all skipped. Returning from the listener
+        # unwinds subscribe() by itself, so there is nothing to cancel there.
+        sub = self._subscribe_call
+        if (sub is not None and not sub.done()
+                and sub is not asyncio.current_task()):
+            self._teardown_interrupt = True
+            sub.cancel()
         with contextlib.suppress(Exception):
             await api.disconnect()
         with contextlib.suppress(Exception):
             await api.__aexit__(None, None, None)
-        if was_available:
+        if was_available and notify:
             await self._safe_emit(EVENT_DISCONNECTED, self._observation)
 
     async def _periodic_refresh_loop(self) -> None:
@@ -467,9 +586,16 @@ class LoungeMonitor:
         Without this, remote-pause / navigate-to-home events take
         minutes to propagate to our UI.
         """
-        REFRESH_INTERVAL = 3.0
-        last_ct: Optional[float] = None
+        # A sentinel, not None, for "we have taken no reading yet". The
+        # detector used to seed last_ct with None and skip the comparison
+        # while it stayed None — so a ct that was NEVER populated (the exact
+        # signature of a wedged session) could never register as stuck, and
+        # the only self-healing path in the monitor was unreachable in the
+        # case it most needed to fire. With a sentinel, None == None counts.
+        _NO_READING = object()
+        last_ct = _NO_READING
         stuck_polls = 0
+        consecutive_failures = 0
         while not self._stopped:
             try:
                 await asyncio.sleep(REFRESH_INTERVAL)
@@ -477,8 +603,9 @@ class LoungeMonitor:
                 return
             api = self._api
             if api is None or not self._observation.available:
-                last_ct = None
+                last_ct = _NO_READING
                 stuck_polls = 0
+                consecutive_failures = 0
                 continue
             # Only refresh when our host (the queue controller) has an
             # active item to track. Otherwise the refresh keeps pulling
@@ -488,25 +615,42 @@ class LoungeMonitor:
             # naturally stays empty when nothing is queued.
             try:
                 if not self._should_refresh():
-                    last_ct = None
+                    last_ct = _NO_READING
                     stuck_polls = 0
+                    consecutive_failures = 0
                     continue
             except Exception:
                 pass
             try:
                 await api.get_now_playing()
+                consecutive_failures = 0
             except asyncio.CancelledError:
                 return
             except Exception:
-                log.debug("Lounge periodic get_now_playing failed; subscribe "
-                          "loop will reconnect if needed", exc_info=True)
+                consecutive_failures += 1
+                log.debug("Lounge periodic get_now_playing failed (%d in a row)",
+                          consecutive_failures, exc_info=True)
+                if consecutive_failures >= MAX_REFRESH_FAILURES:
+                    # Do NOT keep waiting for the subscribe loop to notice.
+                    # It only reconnects when subscribe() itself raises, and
+                    # a session can die underneath a subscribe that stays
+                    # blocked — which is precisely the wedge this guards.
+                    log.info(
+                        "Lounge get_now_playing failed %d times in a row — "
+                        "tearing down so the subscribe loop rebuilds the session",
+                        consecutive_failures,
+                    )
+                    consecutive_failures = 0
+                    last_ct = _NO_READING
+                    stuck_polls = 0
+                    await self._teardown(notify=False)
                 continue
             # Detect stuck ct. The get_now_playing response is processed
             # asynchronously via _on_now_playing; by the time we check
             # the next loop iteration, observation should reflect it.
             # Compare against the previous loop's observation.
             current_ct = self._observation.current_time
-            if last_ct is not None and current_ct == last_ct:
+            if last_ct is not _NO_READING and current_ct == last_ct:
                 stuck_polls += 1
                 if stuck_polls >= STUCK_CT_POLL_THRESHOLD:
                     log.info(
@@ -516,12 +660,12 @@ class LoungeMonitor:
                         int(stuck_polls * REFRESH_INTERVAL),
                     )
                     stuck_polls = 0
-                    last_ct = None
+                    last_ct = _NO_READING
                     # Tear down the current session. The subscribe loop
                     # will create a fresh one on its next iteration,
                     # which triggers SmartTube to push current state on
                     # connect (see _connect's get_now_playing call).
-                    await self._teardown()
+                    await self._teardown(notify=False)
                     continue
             else:
                 stuck_polls = 0
@@ -583,11 +727,25 @@ class LoungeMonitor:
                     continue
                 backoff = 5.0
             try:
-                await self._api.subscribe()
+                # As its own task, so `_teardown` can end it — see the note
+                # there. Awaiting `subscribe()` inline made every teardown
+                # path a no-op that killed Lounge for the process lifetime.
+                sub = asyncio.create_task(self._api.subscribe())
+                self._subscribe_call = sub
+                try:
+                    await sub
+                finally:
+                    self._subscribe_call = None
                 # subscribe() returning normally means the session ended.
                 log.info("Lounge subscribe ended; tearing down for reconnect")
                 await self._teardown()
             except asyncio.CancelledError:
+                if self._teardown_interrupt:
+                    # OUR OWN teardown ended that session. Loop round and
+                    # reconnect; the monitor is not being stopped.
+                    self._teardown_interrupt = False
+                    log.info("Lounge session ended by teardown; reconnecting")
+                    continue
                 raise
             except Exception:
                 log.warning("Lounge subscribe error; will reconnect", exc_info=True)
@@ -632,6 +790,12 @@ class LoungeMonitor:
         new_state = _state_to_str(getattr(event, "state", None))
         if new_state is not None and new_state != "Stopped":
             self._observation.state = new_state
+            # SmartTube reports plenty of recoveries through nowPlaying
+            # rather than onStateChange. Only _on_playback_state used to
+            # cancel the pending FINISHED timer, so a recovery arriving on
+            # this path left it armed — see the re-arm site for what that
+            # then did to the next Stopped.
+            self._cancel_stopped_timer()
         await self._safe_emit(EVENT_POSITION, self._observation)
         if new_video and new_video != old_video:
             await self._safe_emit(EVENT_NOW_PLAYING, self._observation)
@@ -661,10 +825,8 @@ class LoungeMonitor:
         # State changed away from Stopped — cancel any pending
         # "persistent Stopped" timer (this was an ad-insertion blip or
         # similar brief transition, not a real end).
-        if new_state != "Stopped" and self._stopped_persisted_task is not None:
-            if not self._stopped_persisted_task.done():
-                self._stopped_persisted_task.cancel()
-            self._stopped_persisted_task = None
+        if new_state != "Stopped":
+            self._cancel_stopped_timer()
 
         if new_state != old_state:
             await self._safe_emit(EVENT_STATE, self._observation)
@@ -703,9 +865,24 @@ class LoungeMonitor:
                         ct_now if ct_now is not None else -1,
                         dur_now, STOPPED_PERSISTED_DELAY,
                     )
+                    # Cancel before re-arming. Without this a timer left
+                    # pending by a recovery we saw through nowPlaying would
+                    # simply be overwritten here — still scheduled, still
+                    # holding its ORIGINAL deadline — and would then fire on
+                    # this new Stopped after whatever was left of its window.
+                    # A 5s ad-break debounce became ~1s and the ad break
+                    # skipped the video.
+                    self._cancel_stopped_timer()
                     self._stopped_persisted_task = asyncio.create_task(
                         self._fire_finished_if_stopped_persists()
                     )
+
+    def _cancel_stopped_timer(self) -> None:
+        """Cancel and forget any pending persistent-Stopped FINISHED timer."""
+        task = self._stopped_persisted_task
+        self._stopped_persisted_task = None
+        if task is not None and not task.done():
+            task.cancel()
 
     async def _fire_finished_if_stopped_persists(self) -> None:
         """Fire FINISHED if state stays Stopped for STOPPED_PERSISTED_DELAY.
