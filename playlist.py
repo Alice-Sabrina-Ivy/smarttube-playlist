@@ -1088,6 +1088,39 @@ class QueueController:
            Treat None observed_video as "we don't actually know" and
            skip the advance.
         """
+        if self.has_pending_sends() or self.state.waking:
+            # OUR OWN launch is still in flight, so the current item cannot
+            # have ended — it has not started. Sixth and last of the sites
+            # that could disown an item mid-launch.
+            #
+            # FINISH_CONSUMED_WINDOW alone does not cover this. Three seconds
+            # is right for the double-dispatch it was written for and useless
+            # for a REPEAT: two consecutive entries sharing a video_id is
+            # ordinary, it is precisely what the id guard cannot separate, and
+            # a cold start spends ~15s in the WAKE_DELAY floor before the
+            # Intent is even sent. The previous instance's FINISHED then lands
+            # with every other check open and the second copy is advanced off
+            # having never played.
+            #
+            # THIS IS NOT THE GUARD THAT WAS REVERTED. That one was a
+            # wall-clock staleness test, and it discarded genuine finishes in
+            # the three cases where the playhead legitimately runs ahead of the
+            # clock — an idle add adopting playback already in progress, an
+            # in-place resume, and a seek made on the TV's own remote — with
+            # nothing underneath to catch them. This asks a different question,
+            # one with a definite answer rather than an inference, and it is
+            # true only while a send of ours is actually running. The narrow
+            # cost: the adopt and resume paths return quickly but not
+            # instantly, so a real ending inside that window is ignored — and
+            # there the duration timer HAS been anchored to the adopted
+            # position, so the queue moves on a moment later rather than
+            # stranding. Late, not lost.
+            log.debug(
+                "Lounge FINISHED ignored: our own launch is still in flight "
+                "(pending_sends=%s waking=%s)",
+                self.has_pending_sends(), self.state.waking,
+            )
+            return
         async with self._lock:
             observed_video = self.state.lounge.get("video_id")
             expected_video = self.state.current.video_id if self.state.current else None
