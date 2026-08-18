@@ -54,9 +54,17 @@ to ask.
 **Adding a video to a sleeping device that last played something else.** The app would
 start the video and then immediately stop tracking it: it played, but with no now-playing
 card, no countdown, and anything queued behind it left sitting there. YouTube's servers go
-on reporting the last thing you watched as still playing, and two separate checks read
+on reporting the last thing you watched as still playing, and several parts of the app read
 that as "somebody has picked something else on the TV" while the new video was still being
-launched. Both now wait for the launch to finish before drawing that conclusion.
+launched.
+
+**The same thing could skip a video you had queued twice in a row.** When two entries are
+the same video, the app cannot tell a late report about the first copy from one about the
+second — they carry the same id — so on a slow start the second copy was treated as already
+finished and skipped before it had played.
+
+Six different parts of the app can decide it no longer owns the current video. All six now
+wait for the video to finish starting before drawing that conclusion.
 
 **A link that can't play no longer stops everything.** Paste a video that has been
 deleted, made private, blocked in your country, or simply mistyped, and the queue used
