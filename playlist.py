@@ -239,6 +239,23 @@ END_PARK_SLACK = 1.5
 # measured rather than close to it.
 LAUNCH_CONFIRM_TIMEOUT = 45.0
 
+# How many launches may fail to start, back to back, before we stop trying.
+#
+# The 45s rescue above is right for ONE bad link. But a device can stop playing
+# ANYTHING: measured on the reference Google TV Streamer, SmartTube lost the
+# ability to mint a proof-of-origin token and refused every video, reporting
+# only "Probably no internet connection" while YouTube answered its API calls
+# normally. In that state the rescue marches through the whole queue at 45s an
+# item and empties it silently, with nothing on screen to say why — five
+# queued videos gone in four minutes.
+#
+# Past this many in a row the problem is plainly not the video. Stop advancing,
+# clear `current` so nothing pretends to be playing, and leave the queue where
+# it is so it is still there when the device recovers. Any video that actually
+# plays resets the count, so an ordinary bad link among good ones still just
+# gets skipped.
+LAUNCH_FAILURE_LIMIT = 3
+
 
 @dataclass
 class QueueState:
@@ -347,6 +364,8 @@ class QueueController:
         # that silently produced nothing looks identical to one still in
         # progress until this flips. See LAUNCH_CONFIRM_TIMEOUT.
         self._playback_confirmed = False
+        # Consecutive launches that never started. See LAUNCH_FAILURE_LIMIT.
+        self._consecutive_launch_failures = 0
         self._launch_check_task: Optional[asyncio.Task] = None
         self._launch_gen = 0
         # External-switch debounce: when Lounge reports a video_id that
@@ -764,6 +783,9 @@ class QueueController:
                 if (observation.get("state") == "Playing"
                         or (observation.get("current_time") or 0) > 0):
                     self._playback_confirmed = True
+                    # Something played, so the device is fine and whatever
+                    # failed before it was about those videos, not the TV.
+                    self._consecutive_launch_failures = 0
             snapshot = self.state.snapshot()
 
         # Routine position updates — emit a lightweight snapshot, no state-machine action.
@@ -1790,13 +1812,28 @@ class QueueController:
                 return
             failed = self.state.current.video_id
             has_next = bool(self.state.queue)
+            self._consecutive_launch_failures += 1
+        give_up = self._consecutive_launch_failures >= LAUNCH_FAILURE_LIMIT
         log.warning(
             "%s has been current for over %.0fs and Lounge has never reported "
             "it playing (state=%s @ %s) — treating the launch as failed and %s",
             failed, LAUNCH_CONFIRM_TIMEOUT, observation.get("state"),
             observation.get("current_time"),
-            "moving to the next item" if has_next else "clearing it",
+            "moving to the next item" if has_next and not give_up
+            else "clearing it",
         )
+        if give_up:
+            # Not this video's fault. Keep the queue — it is still what the
+            # viewer asked for, and it will play when the device recovers.
+            log.error(
+                "%d launches in a row never started. The device is not playing "
+                "anything — SmartTube can get into this state and report only "
+                "'no internet connection'. Leaving %d queued item(s) alone "
+                "rather than skipping through them; try again once it plays.",
+                self._consecutive_launch_failures, len(self.state.queue),
+            )
+            await self._end_current(reason="device_plays_nothing")
+            return
         if has_next:
             await self._advance(reason="launch_never_started")
         else:
