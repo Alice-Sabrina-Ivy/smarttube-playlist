@@ -32,8 +32,11 @@ produce.
 
 What happens after the tag is pushed is CI's job, not this script's:
 .github/workflows/publish.yml builds the multi-arch image, tags it
-`1.01`, `1`, and `latest` in GHCR, and creates the GitHub Release with notes
-generated from the commits since the previous tag. Old releases and old image
+`1.01`, `1`, and `latest` in GHCR, and creates the GitHub Release whose body
+is the matching `## v<version>` section of CHANGELOG.md, extracted verbatim —
+NOT generated from the commit log. release-on-merge.yml refuses to cut a
+version that has no such heading, because the fallback body is silent and the
+tag is immutable by the time anyone reads it. Old releases and old image
 tags stay available forever — GitHub lists them newest-first automatically, so
 there is no manifest to maintain.
 

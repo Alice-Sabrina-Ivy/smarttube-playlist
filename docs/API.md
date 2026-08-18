@@ -40,7 +40,7 @@ which the video ends first and the next item never starts. The endpoint now
 re-anchors that timer, and the app's idea of where the playhead is, to the
 position you seeked to.
 
-Nothing to pass for it; it happens whenever the seek succeeds. A seek the
+Nothing to pass for it; it happens whenever the seek succeeds **for a video the queue owns**. Seeking playback somebody started on the TV itself still works — the endpoint only needs a live Lounge session — but there is no countdown of ours behind it to move, so nothing is re-anchored. A seek the
 device rejects returns **502** and changes nothing, which matters because
 acting on a seek that never landed is worse than not seeking at all.
 

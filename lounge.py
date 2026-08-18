@@ -397,8 +397,15 @@ class LoungeMonitor:
         if self._api is None:
             return False
         try:
-            await self._api.pause()
-            return True
+            # Load-bearing return value, same as seek_to and play_video below:
+            # all three are a bare `return await self._command(...)` in
+            # pyytlounge, and `_command` answers 400 "Unknown SID", 410 "Gone"
+            # and 401 "Expired" with False and no exception. Hardcoding True
+            # here skipped the MEDIA_PAUSE keycode fallback — the only one
+            # there is — while QueueController.pause set paused/pause_source
+            # anyway, so the TV played on under a UI that said paused and the
+            # duration timer later ended a video still on screen.
+            return bool(await self._api.pause())
         except Exception:
             log.warning("Lounge pause failed", exc_info=True)
             return False
@@ -407,8 +414,11 @@ class LoungeMonitor:
         if self._api is None:
             return False
         try:
-            await self._api.play()
-            return True
+            # Same reasoning as pause. Milder here, because _lounge_play
+            # verifies the state actually reaches Playing and falls through
+            # to tv_play when it does not — but that verification should not
+            # be the only thing catching a session that is already dead.
+            return bool(await self._api.play())
         except Exception:
             log.warning("Lounge play failed", exc_info=True)
             return False

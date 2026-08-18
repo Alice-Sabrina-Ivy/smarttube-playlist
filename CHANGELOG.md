@@ -46,7 +46,17 @@ playing, and nothing was sent to the TV at all.
 
 **Videos you start on the TV yourself now show a live position.** If someone picked
 something in SmartTube directly, the app would show it but the time never moved. It now
-keeps up, and pausing or leaving SmartTube is reflected properly.
+keeps up, and pausing or leaving SmartTube is reflected properly. It needs your device to
+be awake and the app to be able to tell what is on screen; where it cannot, the position
+stays still rather than risk pulling SmartTube to the front — or waking the device — just
+to ask.
+
+**Adding a video to a sleeping device that last played something else.** The app would
+start the video and then immediately stop tracking it: it played, but with no now-playing
+card, no countdown, and anything queued behind it left sitting there. YouTube's servers go
+on reporting the last thing you watched as still playing, and two separate checks read
+that as "somebody has picked something else on the TV" while the new video was still being
+launched. Both now wait for the launch to finish before drawing that conclusion.
 
 **A link that can't play no longer stops everything.** Paste a video that has been
 deleted, made private, blocked in your country, or simply mistyped, and the queue used
@@ -65,6 +75,13 @@ to start and then moves on to the next one.
 - Returning the TV to its screensaver could back out of a video someone had just added.
 - On some devices auto-advance never worked at all, because the app couldn't read which
   app was on screen and assumed the worst.
+- One more route to the same stall: if the countdown ran out at the very moment the video
+  ended and SmartTube dropped to its home screen, the queue could still stop dead with
+  everything still in it.
+- A video shorter than the time it takes to start one — a Short, on a device waking from
+  sleep — could be skipped before it had played at all.
+- Pause could report success after the link to SmartTube had quietly expired, leaving the
+  TV playing on under a page that said it was paused, with only Resume able to recover it.
 
 ---
 

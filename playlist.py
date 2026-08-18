@@ -157,6 +157,17 @@ PLAYER_CLOSE_VERIFY_DELAY = 8.0
 # comfortable above typical setPlaylist propagation (1-2s).
 EXTERNAL_SWITCH_DEBOUNCE = 5.0
 
+# How many times the cede check may stand off while a launch of OUR OWN is
+# still in flight, before giving up and leaving the item alone.
+#
+# 24 x EXTERNAL_SWITCH_DEBOUNCE = 120s, which covers tv_play's slowest
+# documented path: two full WAKE_TIMEOUTs (the reconnect-and-retry), the
+# WAKE_DELAY floor, the screensaver dismiss, then branch B's Lounge connect and
+# observation polls — about 93s. Pinned by
+# test_the_cede_recheck_budget_covers_a_worst_case_launch, which reads the real
+# constants rather than the millisecond stubs every other test patches in.
+EXTERNAL_SWITCH_RECHECK_LIMIT = 24
+
 # How close to `duration` the Lounge position must be for us to treat the
 # current item as having played to its end. Same 5s window lounge.py uses to
 # decide a Stopped transition is a real finish, and deliberately the same
@@ -238,6 +249,27 @@ END_PARK_SLACK = 1.5
 # a video that would have played, so the window is set well past anything
 # measured rather than close to it.
 LAUNCH_CONFIRM_TIMEOUT = 45.0
+
+# How long the duration timer stands off while our OWN launch is still in
+# flight, before looking again.
+#
+# `_begin_locked` arms the timer with the item's full length the moment it
+# becomes current, but `_anchor_timer_to_playback_start` only re-anchors it
+# once the launch RETURNS — a cold start spends ~15s in the WAKE_DELAY floor
+# alone, and 29.5s POST-to-first-frame was measured end to end. Anything
+# shorter than that latency therefore comes due before its video has begun,
+# and both of the timer's exits at that point are destructive. Bounded by the
+# same deferral counter the Lounge branch uses, so a launch that never returns
+# cannot defer the queue for ever.
+#
+# Sized against tv_play's own worst case, not guessed: two full WAKE_TIMEOUTs
+# (30s each, the reconnect-and-retry path) plus the WAKE_DELAY floor is ~72s,
+# so 12 x 8s = 96s of budget clears it. Exhausting the budget is a SAFE
+# degradation rather than a failure — it falls through to the behaviour this
+# stand-off replaced — but it should not happen on a launch that is merely
+# slow, or the stand-off does nothing on exactly the cold start it was written
+# for.
+TIMER_LAUNCH_REARM = 8.0
 
 # How many launches may fail to start, back to back, before we stop trying.
 #
@@ -373,6 +405,7 @@ class QueueController:
         # seconds before assuming the user switched videos via the
         # physical remote (vs our own auto-advance race window).
         self._external_switch_task: Optional[asyncio.Task] = None
+        self._player_close_task: Optional[asyncio.Task] = None
 
     # ── public API ───────────────────────────────────────────────────────────
 
@@ -620,6 +653,16 @@ class QueueController:
         if self._launch_check_task is not None and not self._launch_check_task.done():
             self._launch_check_task.cancel()
         self._launch_check_task = None
+        # The external-switch verify has its own clock too, and since it grew
+        # re-checks it can be pending for minutes. It was never in this list.
+        if (self._external_switch_task is not None
+                and not self._external_switch_task.done()):
+            self._external_switch_task.cancel()
+        self._external_switch_task = None
+        if (self._player_close_task is not None
+                and not self._player_close_task.done()):
+            self._player_close_task.cancel()
+        self._player_close_task = None
         for t in list(self._send_tasks):
             if not t.done():
                 t.cancel()
@@ -837,14 +880,46 @@ class QueueController:
             "verify in %.1fs",
             current_vid, PLAYER_CLOSE_VERIFY_DELAY,
         )
-        asyncio.create_task(
+        if (self._player_close_task is not None
+                and not self._player_close_task.done()):
+            self._player_close_task.cancel()
+        self._player_close_task = asyncio.create_task(
             self._verify_player_closed_after_delay(current_vid)
         )
 
-    async def _verify_player_closed_after_delay(self, expected_vid: str) -> None:
+    async def _verify_player_closed_after_delay(self, expected_vid: str,
+                                                attempt: int = 0) -> None:
         try:
             await asyncio.sleep(PLAYER_CLOSE_VERIFY_DELAY)
         except asyncio.CancelledError:
+            return
+        # Same stale-cache problem as the cede, and the same answer. This path
+        # decides "the player closed" from the Lounge video_id differing from
+        # ours, and while a launch of OUR OWN is in flight that difference
+        # means only that the cloud cache still names the last-played video
+        # (invariant 4) — the player we are about to open has not opened yet.
+        #
+        # It matters more here than anywhere else, because this calls
+        # `_kill_switch()` DIRECTLY rather than `_kill_switch_after_debounce()`,
+        # so none of the guards the kill-switch grew apply. Found on hardware:
+        # the cede stood off four times and this fired straight through it,
+        # clearing `current` while the clip went on to play unowned.
+        if self.has_pending_sends() or self.state.waking:
+            if attempt >= EXTERNAL_SWITCH_RECHECK_LIMIT:
+                log.info(
+                    "Player-close verify for %s: our own launch is STILL in "
+                    "flight after %d re-checks; leaving the item alone",
+                    expected_vid, attempt,
+                )
+                return
+            log.debug(
+                "Player-close verify for %s deferred: our own launch is in "
+                "flight (pending_sends=%s waking=%s)",
+                expected_vid, self.has_pending_sends(), self.state.waking,
+            )
+            self._player_close_task = asyncio.create_task(
+                self._verify_player_closed_after_delay(expected_vid, attempt + 1)
+            )
             return
         async with self._lock:
             # State may have changed during the wait (user added a new
@@ -914,11 +989,48 @@ class QueueController:
         )
 
     async def _verify_external_switch(
-        self, expected_our_vid: str, observed_vid: str,
+        self, expected_our_vid: str, observed_vid: str, attempt: int = 0,
     ) -> None:
         try:
             await asyncio.sleep(EXTERNAL_SWITCH_DEBOUNCE)
         except asyncio.CancelledError:
+            return
+        # OUR OWN launch may still be in flight, and while it is, a foreign
+        # video_id is not evidence that anybody chose anything: the Lounge
+        # "current playlist" lives on YouTube's cloud and goes on naming the
+        # last-played video indefinitely (invariant 4). Found on hardware
+        # adding to a SLEEPING device — v1.02's `_NO_READING` sentinel makes
+        # the stuck-ct detector fire when the position was never populated,
+        # that teardown reconnects and pulls exactly the stale frame, and this
+        # check then cleared `current` before the deep link had been sent. The
+        # clip played with nothing owning it: no card, no auto-advance, and
+        # everything queued behind it stranded.
+        #
+        # Stand off rather than return: `_on_lounge_now_playing` fires on
+        # Lounge events, and SmartTube only pushes on transitions, so a bare
+        # return can abandon a GENUINE switch that never gets re-reported.
+        # Same reasoning, and same shape, as the kill-switch's re-checks and
+        # the duration timer's launch stand-off.
+        if self.has_pending_sends() or self.state.waking:
+            if attempt >= EXTERNAL_SWITCH_RECHECK_LIMIT:
+                # Give up by doing NOTHING. Ceding on a timeout would put the
+                # bug back on exactly the slow device most likely to hit it.
+                log.info(
+                    "External-switch check for %s: our own launch is STILL in "
+                    "flight after %d re-checks; leaving the item alone",
+                    expected_our_vid, attempt,
+                )
+                return
+            log.debug(
+                "External-switch check for %s deferred: our own launch is in "
+                "flight (pending_sends=%s waking=%s); re-checking in %.1fs",
+                expected_our_vid, self.has_pending_sends(), self.state.waking,
+                EXTERNAL_SWITCH_DEBOUNCE,
+            )
+            self._external_switch_task = asyncio.create_task(
+                self._verify_external_switch(expected_our_vid, observed_vid,
+                                             attempt + 1)
+            )
             return
         async with self._lock:
             cur = self.state.current
@@ -1280,6 +1392,50 @@ class QueueController:
                 current_video_id, lng_ct, lng_dur_f,
             )
 
+        # OUR OWN launch may still be in flight, and every exit below is
+        # destructive. `_begin_locked` arms this timer with the item's full
+        # length the instant it becomes current; `_anchor_timer_to_playback_start`
+        # only re-anchors it once `_play` RETURNS. So anything shorter than the
+        # launch latency — a Short, which YT_REGEX accepts as first-class input,
+        # against a cold start whose WAKE_DELAY floor alone is ~15s — comes due
+        # before its video has begun. `state.lounge` was blanked at begin, so the
+        # Lounge branch above cannot rescue it either, and `_end_current` would
+        # additionally cancel the very send that was about to start the video.
+        #
+        # Re-arm rather than return. Returning ABANDONS the decision instead of
+        # deferring it, which is the same mistake the kill-switch made before it
+        # grew KILL_SWITCH_RECHECK_LIMIT. `_kill_switch_after_debounce` already
+        # stands off on these two exact conditions; the timer's identical
+        # foreground decision had no equivalent.
+        if self.has_pending_sends() or self.state.waking:
+            if deferrals >= self.MAX_LOUNGE_DEFERRALS:
+                log.warning(
+                    "Duration timer for %s has stood off %d times and a launch "
+                    "is STILL in flight; proceeding rather than deferring for "
+                    "ever", current_video_id, deferrals,
+                )
+            else:
+                async with self._lock:
+                    # Verify nothing changed while we held no lock.
+                    if (gen != self._timer_gen
+                            or self.state.current is None
+                            or self.state.current.video_id != current_video_id):
+                        return
+                    log.info(
+                        "Duration timer fired for %s while our own launch is "
+                        "still in flight (pending_sends=%s waking=%s); "
+                        "re-arming in %.1fs",
+                        current_video_id, self.has_pending_sends(),
+                        self.state.waking, TIMER_LAUNCH_REARM,
+                    )
+                    self._timer_gen += 1
+                    next_gen = self._timer_gen
+                    self._timer_task = asyncio.create_task(
+                        self._timer_body(next_gen, TIMER_LAUNCH_REARM,
+                                         deferrals + 1)
+                    )
+                return
+
         # Timer fired legitimately; behavior depends on paused + foreground state.
         # `paused` here is ambiguous and the two readings need opposite
         # handling: a user who pressed Pause wants nothing to happen, but a
@@ -1321,6 +1477,48 @@ class QueueController:
         # Reading that as "some other app" made every video end here instead
         # of advancing — auto-advance never worked at all on that hardware.
         if current_app and current_app != self._smarttube_package:
+            # Two different situations look identical from here, and `_kill_switch`
+            # was taught to separate them in this same release: the video ENDED
+            # and SmartTube dropped to the launcher, or somebody walked away
+            # mid-video. Clearing is right for the second and strands the queue
+            # for the first — and the two RACE at end-of-video, because the
+            # kill-switch sits behind its 3s debounce while this timer does not.
+            # Whichever lands first clears `current`; the other then finds
+            # nothing to own and clears too.
+            #
+            # Use the SAME test the kill-switch uses, deliberately. An earlier
+            # attempt here used `_lounge_says_finished()` on the reasoning that
+            # `_duration_elapsed` is trivially True by this point, so
+            # `_current_item_finished()` would advance for "the user opened
+            # Netflix and our timer came due". That reasoning is wrong twice
+            # over, and it made the fix a no-op in the two commonest shapes:
+            #
+            #   * `_lounge_says_finished()` needs a POPULATED observation, and
+            #     the very thing that gets us into this branch — SmartTube
+            #     leaving the foreground — is what sets `suppress_lounge`, after
+            #     which `_on_lounge_event` forwards a blank frame. So with no
+            #     Lounge pairing at all, or with one blanked a moment earlier,
+            #     it is always False and the queue stranded exactly as before.
+            #     Measured on the harness: both shapes gave current=None with
+            #     the queue still full and nothing played.
+            #   * The guard against a wrong scraped duration — the `_fallback()`
+            #     600s case, which is the real "still watching" hazard — is
+            #     `_lounge_contradicts_finish()`, and `_current_item_finished()`
+            #     already consults it. `_lounge_says_finished()` does not.
+            #
+            # The kill-switch makes this identical call, and the timer normally
+            # WINS the race against it (no debounce), so a stricter test here
+            # does not add caution — it just decides the outcome differently
+            # from the mechanism that was supposed to be authoritative, and then
+            # clears `current` so the kill-switch finds nothing to own.
+            if self.state.queue and self._current_item_finished():
+                log.info(
+                    "Timer fired with SmartTube not foreground (%s), but Lounge "
+                    "shows %s reached its end — advancing rather than stranding "
+                    "the queue", current_app, current_video_id,
+                )
+                await self._advance(reason="finished_at_timer")
+                return
             log.info("Timer fired but SmartTube not foreground (%s); stopping", current_app)
             await self._end_current(reason="killswitch_at_fire")
             return
@@ -1412,6 +1610,17 @@ class QueueController:
         cur = self.state.current
         lng = self.state.lounge or {}
         if cur is None or not lng.get("available"):
+            return False
+        if cur.duration_s is None:
+            # A livestream has no end to reach, so no frame can show it at
+            # one. The DVR window still reports a length and a viewer parked
+            # at the live edge sits right on it, and this check has no `state`
+            # gate at all — so without this it reads True continuously during
+            # live viewing, and the kill-switch consults it: any HOME press
+            # with something queued would hijack the TV back to SmartTube.
+            # Every sibling path bails on the same test; `_schedule_timer_locked`
+            # never arms a timer for one and `_lounge_contradicts_finish`
+            # cannot veto one, so nothing downstream would catch it.
             return False
         if lng.get("video_id") != cur.video_id:
             return False
@@ -1649,6 +1858,15 @@ class QueueController:
         async with self._lock:
             cur = self.state.current
             if cur is None or not self.state.queue:
+                return
+            if cur.duration_s is None:
+                # Livestream: no end for us to detect. This path reads only
+                # the observation's own ct and duration, so a DVR window
+                # reporting a length puts a viewer parked at the live edge
+                # within END_PARK_SLACK of it — and `pause_source` does not
+                # save us, because `_sync_paused_from_lounge` runs first and
+                # stamps "lounge" while only "ui" is refused. Livestreams
+                # never auto-advance; the user skips them by hand.
                 return
             if self.state.pause_source == "ui":
                 return

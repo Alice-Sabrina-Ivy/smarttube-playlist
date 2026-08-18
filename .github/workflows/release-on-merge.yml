@@ -22,6 +22,27 @@ name: Cut a release when a release PR merges
 #    release job both key off `github.ref`, which is the tag ref when
 #    dispatched that way.
 #
+#    That dispatch is its OWN job (`publish-tag`), for two reasons that both
+#    come down to `gh workflow run` being fire-and-forget.
+#
+#    It WAITS for the run it started, because otherwise a tag build that never
+#    produced an image is indistinguishable from one that did. publish.yml
+#    keys `:latest` writers into a single concurrency group so the tag lands
+#    after the main build, and a newly queued run cancels the previously
+#    PENDING run in a group — `cancel-in-progress: false` only protects the
+#    one already executing. So an ordinary push to main while the tag build
+#    sits in that queue silently kills it, leaving the tag and the release
+#    commit public with no `:1.02`, no `:1`, no `:latest` and no GitHub
+#    Release, and every job green.
+#
+#    It is SEPARATE from `release` so that "Re-run failed jobs" can recover.
+#    Everything irreversible happens inside release.py in the `release` job;
+#    with the dispatch in that same job, a transient failure after the push
+#    left the only recovery control re-running a step that correctly dies on
+#    release.py's "already exists" guard, so the dispatch stayed unreachable
+#    and `promote-to-beta` stayed skipped for ever. Split out, a re-run
+#    re-dispatches and nothing re-cuts.
+#
 # 2. Nothing here needs to know about the Forgejo mirror. It is a PULL
 #    mirror that fetches from GitHub on its own schedule, so it follows
 #    whatever lands here without being pushed to. It is also read-only:
@@ -63,7 +84,8 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write      # commit the bump, push the tag
-      actions: write       # dispatch publish.yml for the new tag
+    outputs:
+      tag: ${{ steps.cut.outputs.tag }}
 
     steps:
       - name: Check out main
@@ -105,7 +127,9 @@ jobs:
       #
       # With an explicit `--set`, a re-run asks for the same version and dies
       # on release.py's own "already exists" guard, which is the correct
-      # outcome. Pinned by
+      # outcome for THIS job. Note the dispatch no longer lives here — it is
+      # the `publish-tag` job below — precisely so that "Re-run failed jobs"
+      # can retry the image build without re-entering this guard. Pinned by
       # test_the_release_version_comes_from_the_pr_not_from_mains_version_file.
       - name: Work out which version this PR releases
         id: version
@@ -164,19 +188,88 @@ jobs:
           echo "tag=v${VERSION}" >> "$GITHUB_OUTPUT"
           echo "Released v${VERSION}" >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Build the image for the new tag
+
+
+  # See note 1 above. Separate job so a re-run can reach it, and it waits so a
+  # build that was cancelled while queued cannot pass for one that shipped.
+  publish-tag:
+    needs: release
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write       # dispatch publish.yml, and read the run it starts
+
+    steps:
+      - name: Build the image for the new tag, and wait for it
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.release.outputs.tag }}
+          REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
-          TAG="${{ steps.cut.outputs.tag }}"
-          # See note 1 above — without this the tag sits there and no image
-          # is ever built for it.
-          gh workflow run publish.yml --ref "$TAG"
-          echo "Dispatched publish.yml for $TAG" >> "$GITHUB_STEP_SUMMARY"
+          # An empty tag would dispatch on the default branch and then happily
+          # watch a main build succeed, reporting a release that never built.
+          if [ -z "${TAG:-}" ]; then
+            echo "::error::No tag came through from the release job."
+            exit 1
+          fi
+
+          # What is already there for this tag. Normally nothing — the tag was
+          # created moments ago — but on a RE-RUN the previous attempt's run
+          # exists, and polling for "the newest run" would latch onto it
+          # instantly and watch a build that already finished.
+          BEFORE="$(gh run list --repo "$REPO" --workflow publish.yml --branch "$TAG" --limit 1 --json databaseId --jq '.[0].databaseId // empty' || true)"
+
+          # Without this the tag just sits there and no image is built for it.
+          gh workflow run publish.yml --ref "$TAG" --repo "$REPO"
+
+          # `gh workflow run` returns before the run exists, so poll for it
+          # rather than assume. Filtering on the tag ref is what makes this
+          # unambiguous: a tag-triggered run reports the tag as its headBranch,
+          # and nothing else ever dispatches publish.yml on a tag.
+          #
+          # `|| true` matters under `set -e`: a single transient API error in a
+          # command substitution would otherwise abort the whole step, and the
+          # build it was watching would carry on unwatched.
+          RUN_ID=""
+          for _ in $(seq 1 30); do
+            sleep 5
+            CANDIDATE="$(gh run list --repo "$REPO" --workflow publish.yml --branch "$TAG" --limit 1 --json databaseId --jq '.[0].databaseId // empty' || true)"
+            if [ -n "$CANDIDATE" ] && [ "$CANDIDATE" != "$BEFORE" ]; then
+              RUN_ID="$CANDIDATE"
+              break
+            fi
+          done
+          if [ -z "$RUN_ID" ]; then
+            echo "::error::Dispatched publish.yml for ${TAG} but could not find"\
+                 "the run within 150s. The dispatch itself SUCCEEDED, so a build"\
+                 "is probably running: check the Actions tab BEFORE re-running"\
+                 "this job, or you will start a second build of the same tag."
+            exit 1
+          fi
+
+          echo "Watching publish.yml run ${RUN_ID} for ${TAG}" >> "$GITHUB_STEP_SUMMARY"
+          # --exit-status is the point of the wait: it fails this job on
+          # anything but success, so "cancelled while still queued" can no
+          # longer read as shipped.
+          if ! gh run watch "$RUN_ID" --repo "$REPO" --exit-status; then
+            echo "::error::The image build for ${TAG} did not succeed (run"\
+                 "${RUN_ID}). The tag and the release commit are already public,"\
+                 "so nothing is behind them until this is fixed. Most likely a"\
+                 "push to main queued behind it cancelled it — see note 1."\
+                 "Re-run this job to dispatch again."
+            exit 1
+          fi
+          echo "Published the image for ${TAG}" >> "$GITHUB_STEP_SUMMARY"
 
   # Carries the release onto `beta` so device testers run the same app, without
   # anyone maintaining a second pull request in parallel with the first.
+  #
+  # `needs: release`, NOT `needs: publish-tag`, and that is deliberate: a tag
+  # image build that fails or gets cancelled has nothing to do with beta, and
+  # gating the promotion on it would skip beta for an unrelated reason. The
+  # consequence to know when reading a half-red release: beta can be merged,
+  # pushed and rebuilt as `:beta` while `:1.02` and `:1` do not exist yet and
+  # `:latest` is still the pre-bump image. Re-run publish-tag.
   #
   # This is a MERGE, never a fast-forward: beta legitimately carries one commit
   # main does not, and always will. `docker-compose.yml` is the entire

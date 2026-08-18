@@ -863,6 +863,16 @@ async def _reconnect_remote() -> bool:
         log.warning("Reconnect to %s timed out after %.0fs",
                     state.host, TV_ADDRESS_CONNECT_TIMEOUT)
         connected = False
+    except asyncio.CancelledError:
+        # Re-arm BEFORE re-raising. tv_play runs inside a task the controller
+        # cancels as a matter of routine — a new add supersedes an in-flight
+        # send, the duration timer comes due and empties the queue — and a
+        # cancellation delivered during this await would otherwise unwind
+        # straight past the re-arm below, leaving exactly the permanent
+        # outage it exists to prevent: no remote, the library's own
+        # keep-reconnecting task already cancelled, and nothing armed.
+        _arm_startup_retry(state.host)
+        raise
     if not connected:
         # ALWAYS leave something retrying. We have already nulled
         # state.remote AND called old.disconnect(), which cancels
@@ -878,6 +888,11 @@ async def _reconnect_remote() -> bool:
     return connected
 
 
+# Set once, in the lifespan's teardown, before anything is cancelled. Nothing
+# resets it: a process that has begun shutting down never un-shuts-down.
+_shutting_down = False
+
+
 def _arm_startup_retry(host: str) -> None:
     """Ensure a background reconnect loop is running for `host`.
 
@@ -885,6 +900,14 @@ def _arm_startup_retry(host: str) -> None:
     that would fight over state.remote.
     """
     global _startup_retry_task
+    if _shutting_down:
+        # Teardown cancels _startup_retry_task BEFORE queue_controller.shutdown()
+        # cancels the in-flight tv_play sends, so a tv_play inside
+        # _reconnect_remote at that moment would arm a loop with nothing left
+        # to cancel it — the exact residue the teardown comment warns about,
+        # reintroduced from a new direction by the CancelledError re-arm.
+        log.debug("Not arming a startup retry for %s: shutting down", host)
+        return
     if _startup_retry_task is not None and not _startup_retry_task.done():
         return
     _startup_retry_task = asyncio.create_task(
@@ -1221,8 +1244,37 @@ def _lounge_shows_external_playback() -> bool:
     teardown/reconnect cycle on top. With no remote we cannot tell whether
     SmartTube is foreground, so we do not poll. Pinned by
     test_refresh_gate_stays_shut_with_no_remote.
+
+    A remote is necessary but NOT sufficient, and the two extra gates below
+    are the rest of that same coupling:
+
+    - POWER. A paired, reachable, *sleeping* device satisfies `remote is not
+      None`, and the cloud cache goes on reporting the last video as Playing
+      at a frozen position for as long as it likes (invariant 4). Polling
+      there is the harm described above with nothing to end it, since nothing
+      about a sleeping device changes. `_tv_is_busy()` gates the identical
+      Lounge expression on `is_on` for the identical reason — including
+      treating an unreadable `is_on` as "not on", because the property raises
+      on a stale connection rather than merely being absent.
+    - A FOREGROUND READING. `suppress_lounge` is only ever written from a
+      current_app callback, and androidtvremote2 fills `current_app` from an
+      IME key-inject message and nothing else — so on a device that never
+      negotiates IME the flag is permanently False and, again, protects
+      nothing. Without any reading we cannot know polling is safe.
+
+    Pinned by test_refresh_gate_stays_shut_on_a_sleeping_device,
+    test_refresh_gate_survives_a_remote_whose_power_read_raises and
+    test_refresh_gate_stays_shut_when_the_foreground_is_unknown.
     """
     if state.remote is None:
+        return False
+    try:
+        powered = bool(state.remote.is_on)
+    except Exception:
+        return False
+    if not powered:
+        return False
+    if not state.last_current_app:
         return False
     if queue_controller.state.current is not None:
         return False
@@ -1777,6 +1829,11 @@ async def lifespan(_app: FastAPI):
     try:
         yield
     finally:
+        # Before ANY cancellation: _reconnect_remote re-arms the retry loop
+        # when it is cancelled, and the tv_play that triggers that is cancelled
+        # further down, after _startup_retry_task has already been dealt with.
+        global _shutting_down
+        _shutting_down = True
         watchdog_task.cancel()
         with contextlib.suppress(BaseException):
             await watchdog_task
@@ -4898,7 +4955,17 @@ async def seek(req: SeekReq):
     # telling it. Seeking FORWARD therefore left it firing late by the size
     # of the jump, and "late" is precisely the window in which the video ends
     # first and the kill-switch strands everything still queued.
-    await queue_controller.reschedule_timer_for_position(target, seeking_vid)
+    #
+    # Only when the seek was for a video WE own. Seek is deliberately offered
+    # over external playback too (the frontend gates it on hasCurrent ||
+    # loungeActive), and there `seeking_vid` is None — which the reschedule
+    # reads as "match anything", skipping the very ownership guard captured
+    # above. An add landing during the seek_to round trip would then get the
+    # foreign position clamped onto it and a near-zero timer armed. Nothing
+    # of ours is anchored to that playhead, so there is nothing to re-anchor.
+    if seeking_vid is not None:
+        await queue_controller.reschedule_timer_for_position(target,
+                                                             seeking_vid)
     return {"ok": True, "target": target}
 
 
