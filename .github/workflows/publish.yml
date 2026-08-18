@@ -26,6 +26,42 @@ on:
     branches: [main]
   workflow_dispatch:
 
+# A release merge starts THREE runs of this workflow: the push to main (the
+# merge commit, still PRE-bump), the dispatch on the new tag, and the dispatch
+# on beta. Two of them write `:latest`, so they must serialise and the tag must
+# land last — otherwise `:latest` is an image whose footer and /api/status
+# report the previous version, permanently, while `:1.02` is correct and
+# nothing outside says the two disagree. docker-compose.yml and the release
+# notes both point people at `:latest`.
+#
+# The group is therefore keyed on what a run PUSHES, not on its ref, because a
+# queued run cancels the previously PENDING run in its group —
+# `cancel-in-progress: false` protects only the one already executing. Sharing
+# one group across all three meant the beta dispatch arrived third and killed
+# the tag build while it waited behind the main build: tag and release commit
+# public, no image, no GitHub Release, and both release jobs green, because
+# `gh workflow run` is fire-and-forget.
+#
+# The group split does NOT make the tag build safe on its own, and it is worth
+# knowing which half is left. A push to main resolves to the same `-latest`
+# group, and a newly queued run cancels the previously PENDING run in a group
+# (`cancel-in-progress: false` only protects the one already executing) — so an
+# ordinary push landing while the tag build waits behind the main build still
+# kills it. Sharing the group is deliberate and cannot be given up: it is what
+# orders the two `:latest` writers. The cover is on the other side instead —
+# release-on-merge.yml's `publish-tag` job watches the run it dispatched and
+# fails if it did not succeed, so this shows up as a red release rather than as
+# a tag with no image behind it.
+#
+# A pull_request run pushes NOTHING (see `push:` on the build step), so it does
+# not belong in that group either — any PR touched during a release could
+# otherwise cancel the pending tag build. PR runs get a per-ref group and DO
+# cancel in progress: superseding your own earlier build is the point, and
+# nothing is published either way.
+concurrency:
+  group: publish-${{ github.repository }}-${{ github.event_name == 'pull_request' && format('pr-{0}', github.ref) || github.ref_name == 'beta' && 'beta' || 'latest' }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}

@@ -81,7 +81,19 @@ python scripts/release.py --dry-run --minor
 
 The padding is why `scripts/release.py` orders tags itself rather than with `git --sort=v:refname`: git follows `strverscmp`, which reads a leading zero as a fraction and ranks `v1.01` *below* `v1.0`. It also refuses the unpadded spelling, since `1.1` and `1.01` are one version but two image tags.
 
-The script bumps `VERSION`, syncs the footer, commits, tags and pushes. Everything after that is CI: the image is built multi-arch and tagged `1.01`, `1` and `latest` in GHCR, then a GitHub Release is created with notes generated from the commits since the previous tag.
+The script bumps `VERSION`, syncs the footer, commits, tags and pushes. Everything after that is CI: the image is built multi-arch and tagged `1.01`, `1` and `latest` in GHCR, then a GitHub Release is created. **The release notes are the matching `## v<version>` section of `CHANGELOG.md`**, extracted verbatim — not generated from the commit log. A missing section does not fail the build; it publishes a release whose body says there is no entry yet, and the tag and image are immutable by the time anyone reads it.
+
+### Releasing by merging a pull request
+
+The usual path is not to run the script by hand. A pull request merged into `main` from a branch named `release/vMAJOR.MINOR` triggers `release-on-merge.yml`, which runs the same `scripts/release.py` on a runner and then carries the result onward. It is deliberately narrow — the PR has to be *merged* (not just closed) and the head branch has to start with `release/`, so an ordinary bugfix PR never mints a version.
+
+Three things about it are worth knowing before relying on it:
+
+- **The version comes from the branch name, never from bumping whatever `main` currently says.** The branch must parse as `release/vMAJOR.MINOR` against the same grammar `scripts/release.py` accepts, zero-padded minor included. That is what makes the job safe to re-run: a second attempt asks for the *same* version and stops on the script's own "already exists" guard, rather than cutting a phantom next version. The image build is a separate job for the same reason — re-running it retries the build without re-entering that guard.
+- **Two gates run before anything irreversible happens:** the branch name has to parse, and `CHANGELOG.md` has to contain a literal `## v<version>` heading. Both fail the job before a tag exists, which is the only moment either is still preventable.
+- **A tag pushed by `GITHUB_TOKEN` cannot trigger another workflow**, so the image build is dispatched explicitly and then *watched* — a build that was cancelled while queued fails the release rather than leaving a public tag with no image behind it.
+
+In parallel — deliberately not waiting for the image build — a separate job merges `main` into `beta` so device testers track releases without a second pull request. The consequence to know: if the tag build fails or is cancelled, beta is already merged, pushed and rebuilt as `:beta` while `:1.02` and `:1` do not exist and `:latest` still points at the pre-bump commit. Making the promotion wait would be worse — it would skip beta for a reason that has nothing to do with beta — so re-run the build instead. `docker-compose.yml` is beta's only divergence and the merge is expected to leave it alone; if a release ever touches that file the merge conflicts on purpose and nothing is pushed.
 
 Note `:latest` does **not** only track releases — `publish.yml` also emits it on every push to the default branch, so it follows the tip of `main`. Pin `:1.01` to move only when you choose to. The `beta` branch publishes `:beta`, built with `CHANNEL=beta SELF_TEST=1` as build args so the source stays identical on both branches.
 

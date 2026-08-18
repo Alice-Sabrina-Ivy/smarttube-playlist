@@ -1,0 +1,351 @@
+name: Cut a release when a release PR merges
+
+# Merging a `release/*` PR into main runs scripts/release.py, which bumps
+# VERSION, syncs the footer in index.html, commits, tags and pushes.
+# publish.yml then builds the image and opens the GitHub release.
+#
+# Deliberately narrow: it fires ONLY for a merged pull request whose head
+# branch starts with `release/`. An ordinary bugfix PR merging to main must
+# not mint a version — that is why this is not simply `on: push: main`.
+#
+# The version being released is READ FROM THE BRANCH NAME, so the branch has
+# to be `release/vMAJOR.MINOR` with a zero-padded two-digit minor. That is
+# what makes the job safe to re-run; see the note on the version step below.
+#
+# TWO THINGS WORTH KNOWING BEFORE YOU RELY ON IT
+#
+# 1. A tag pushed with GITHUB_TOKEN does NOT trigger other workflows. GitHub
+#    suppresses that to stop workflows retriggering each other forever, so
+#    publish.yml would never see the tag. Rather than require a personal
+#    access token, this dispatches publish.yml explicitly on the new tag —
+#    publish.yml already accepts workflow_dispatch, and its image tags and
+#    release job both key off `github.ref`, which is the tag ref when
+#    dispatched that way.
+#
+#    That dispatch is its OWN job (`publish-tag`), for two reasons that both
+#    come down to `gh workflow run` being fire-and-forget.
+#
+#    It WAITS for the run it started, because otherwise a tag build that never
+#    produced an image is indistinguishable from one that did. publish.yml
+#    keys `:latest` writers into a single concurrency group so the tag lands
+#    after the main build, and a newly queued run cancels the previously
+#    PENDING run in a group — `cancel-in-progress: false` only protects the
+#    one already executing. So an ordinary push to main while the tag build
+#    sits in that queue silently kills it, leaving the tag and the release
+#    commit public with no `:1.02`, no `:1`, no `:latest` and no GitHub
+#    Release, and every job green.
+#
+#    It is SEPARATE from `release` so that "Re-run failed jobs" can recover.
+#    Everything irreversible happens inside release.py in the `release` job;
+#    with the dispatch in that same job, a transient failure after the push
+#    left the only recovery control re-running a step that correctly dies on
+#    release.py's "already exists" guard, so the dispatch stayed unreachable
+#    and `promote-to-beta` stayed skipped for ever. Split out, a re-run
+#    re-dispatches and nothing re-cuts.
+#
+# 2. Nothing here needs to know about the Forgejo mirror. It is a PULL
+#    mirror that fetches from GitHub on its own schedule, so it follows
+#    whatever lands here without being pushed to. It is also read-only:
+#    never add a push step for it.
+#
+# To release without merging a PR, run scripts/release.py locally — it does
+# exactly the same thing.
+
+on:
+  pull_request:
+    types: [closed]
+    branches: [main]
+
+# One release at a time. Two merged release PRs a minute apart, or a re-run,
+# would otherwise cut versions simultaneously.
+#
+# That is survivable today, but only by an ordering accident worth not relying
+# on: release.py pushes the bump commit BEFORE the tag, so the job that checked
+# out first wins and the other has its push refused and dies with its tag still
+# only on the runner. Nothing half-finished escapes — but a failed run appears
+# in the Actions tab at the exact moment someone is shipping, and they have to
+# work out that it was harmless.
+#
+# `cancel-in-progress: false` is the load-bearing half. Cancelling a release
+# mid-push is the one way to produce the half-state the ordering above avoids:
+# a bump commit pushed with no tag behind it.
+concurrency:
+  group: release-on-merge
+  cancel-in-progress: false
+
+jobs:
+  release:
+    # `merged` is the load-bearing half: `closed` fires for abandoned PRs too,
+    # and cutting a version from a PR somebody rejected would be worse than
+    # not automating this at all.
+    if: >
+      github.event.pull_request.merged == true &&
+      startsWith(github.event.pull_request.head.ref, 'release/')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write      # commit the bump, push the tag
+    outputs:
+      tag: ${{ steps.cut.outputs.tag }}
+
+    steps:
+      - name: Check out main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          # Full history AND tags: release.py reads every existing tag to work
+          # out the newest version and to refuse a version already taken under
+          # the other spelling (1.1 vs 1.01). A shallow clone would make it
+          # believe the repo has never been released.
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Identify the committer
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      # The version comes from the PR's own branch name, never from bumping
+      # whatever main currently says. That is what makes this job safe to
+      # re-run.
+      #
+      # Every side effect of a release happens inside release.py — bump,
+      # commit, tag, push both — ahead of the steps below that build the
+      # image. So a failure anywhere after that push (a rejected tag push, a
+      # transient `gh workflow run` error) leaves the run red with THIS job as
+      # the failed one, and the obvious control, "Re-run failed jobs", re-runs
+      # it. With `--minor` the re-run read the version the first attempt had
+      # just written, bumped it AGAIN, and cut the next version: every guard
+      # passed because that tag was genuinely free, so it published an image
+      # and a GitHub Release whose body read "No changelog entry yet", took
+      # `:latest` and `:1` with it, and stranded the real notes one release
+      # back. `release.py --check` could not see it afterwards — VERSION, the
+      # footer and the newest tag all agreed.
+      #
+      # With an explicit `--set`, a re-run asks for the same version and dies
+      # on release.py's own "already exists" guard, which is the correct
+      # outcome for THIS job. Note the dispatch no longer lives here — it is
+      # the `publish-tag` job below — precisely so that "Re-run failed jobs"
+      # can retry the image build without re-entering this guard. Pinned by
+      # test_the_release_version_comes_from_the_pr_not_from_mains_version_file.
+      - name: Work out which version this PR releases
+        id: version
+        env:
+          HEAD_REF: ${{ github.event.pull_request.head.ref }}
+        run: |
+          set -euo pipefail
+          # release/v1.02 -> 1.02, and release/1.02 too. Anything else is a
+          # branch we cannot name a version from, so stop rather than guess.
+          VERSION="${HEAD_REF#release/}"
+          VERSION="${VERSION#v}"
+          # Same canonical form scripts/release.py accepts, so the two cannot
+          # disagree about what a version is. MINOR is zero-padded to two
+          # digits and carries no surplus zeros: 00, 01, 09, 10, 100 — but not
+          # 1 (under-padded, a different image tag) and not 001 or 010
+          # (over-padded, a third spelling of a release that already exists).
+          # MAJOR takes no leading zero. Validating it HERE rather than leaving
+          # it to release.py matters: otherwise the changelog gate below fails
+          # first and blames a missing heading, which is the wrong diagnosis
+          # and invites someone to commit a section for a version that can
+          # never exist. Pinned by tests/test_release.py.
+          if ! printf '%s' "$VERSION" | grep -Eq '^(0|[1-9][0-9]*)\.(0[0-9]|[1-9][0-9]+)$'; then
+            echo "::error::Cannot read a version from head branch '${HEAD_REF}'."\
+                 "Name the branch release/vMAJOR.MINOR with a zero-padded"\
+                 "two-digit minor, e.g. release/v1.02."
+            exit 1
+          fi
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "tag=v${VERSION}" >> "$GITHUB_OUTPUT"
+
+      # Before the tag exists, while there is still something to prevent.
+      # publish.yml pulls the release body from a literal `## v<version>`
+      # heading in CHANGELOG.md and falls back to "No changelog entry for ...
+      # yet." — silently, and the tag and image are immutable by the time
+      # anybody reads it.
+      - name: Require a changelog entry for it
+        env:
+          TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          set -euo pipefail
+          if ! grep -qxF "## ${TAG}" CHANGELOG.md; then
+            echo "::error::CHANGELOG.md has no '## ${TAG}' heading, so the"\
+                 "release would publish with an empty body. Add the section"\
+                 "to the release PR first."
+            exit 1
+          fi
+          echo "CHANGELOG.md has notes for ${TAG}" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Cut the release
+        id: cut
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          python scripts/release.py --set "$VERSION"
+          echo "tag=v${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "Released v${VERSION}" >> "$GITHUB_STEP_SUMMARY"
+
+
+
+  # See note 1 above. Separate job so a re-run can reach it, and it waits so a
+  # build that was cancelled while queued cannot pass for one that shipped.
+  publish-tag:
+    needs: release
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write       # dispatch publish.yml, and read the run it starts
+
+    steps:
+      - name: Build the image for the new tag, and wait for it
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.release.outputs.tag }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          # An empty tag would dispatch on the default branch and then happily
+          # watch a main build succeed, reporting a release that never built.
+          if [ -z "${TAG:-}" ]; then
+            echo "::error::No tag came through from the release job."
+            exit 1
+          fi
+
+          # What is already there for this tag. Normally nothing — the tag was
+          # created moments ago — but on a RE-RUN the previous attempt's run
+          # exists, and polling for "the newest run" would latch onto it
+          # instantly and watch a build that already finished.
+          BEFORE="$(gh run list --repo "$REPO" --workflow publish.yml --branch "$TAG" --limit 1 --json databaseId --jq '.[0].databaseId // empty' || true)"
+
+          # Without this the tag just sits there and no image is built for it.
+          gh workflow run publish.yml --ref "$TAG" --repo "$REPO"
+
+          # `gh workflow run` returns before the run exists, so poll for it
+          # rather than assume. Filtering on the tag ref is what makes this
+          # unambiguous: a tag-triggered run reports the tag as its headBranch,
+          # and nothing else ever dispatches publish.yml on a tag.
+          #
+          # `|| true` matters under `set -e`: a single transient API error in a
+          # command substitution would otherwise abort the whole step, and the
+          # build it was watching would carry on unwatched.
+          RUN_ID=""
+          for _ in $(seq 1 30); do
+            sleep 5
+            CANDIDATE="$(gh run list --repo "$REPO" --workflow publish.yml --branch "$TAG" --limit 1 --json databaseId --jq '.[0].databaseId // empty' || true)"
+            if [ -n "$CANDIDATE" ] && [ "$CANDIDATE" != "$BEFORE" ]; then
+              RUN_ID="$CANDIDATE"
+              break
+            fi
+          done
+          if [ -z "$RUN_ID" ]; then
+            echo "::error::Dispatched publish.yml for ${TAG} but could not find"\
+                 "the run within 150s. The dispatch itself SUCCEEDED, so a build"\
+                 "is probably running: check the Actions tab BEFORE re-running"\
+                 "this job, or you will start a second build of the same tag."
+            exit 1
+          fi
+
+          echo "Watching publish.yml run ${RUN_ID} for ${TAG}" >> "$GITHUB_STEP_SUMMARY"
+          # --exit-status is the point of the wait: it fails this job on
+          # anything but success, so "cancelled while still queued" can no
+          # longer read as shipped.
+          if ! gh run watch "$RUN_ID" --repo "$REPO" --exit-status; then
+            echo "::error::The image build for ${TAG} did not succeed (run"\
+                 "${RUN_ID}). The tag and the release commit are already public,"\
+                 "so nothing is behind them until this is fixed. Most likely a"\
+                 "push to main queued behind it cancelled it — see note 1."\
+                 "Re-run this job to dispatch again."
+            exit 1
+          fi
+          echo "Published the image for ${TAG}" >> "$GITHUB_STEP_SUMMARY"
+
+  # Carries the release onto `beta` so device testers run the same app, without
+  # anyone maintaining a second pull request in parallel with the first.
+  #
+  # `needs: release`, NOT `needs: publish-tag`, and that is deliberate: a tag
+  # image build that fails or gets cancelled has nothing to do with beta, and
+  # gating the promotion on it would skip beta for an unrelated reason. The
+  # consequence to know when reading a half-red release: beta can be merged,
+  # pushed and rebuilt as `:beta` while `:1.02` and `:1` do not exist yet and
+  # `:latest` is still the pre-bump image. Re-run publish-tag.
+  #
+  # This is a MERGE, never a fast-forward: beta legitimately carries one commit
+  # main does not, and always will. `docker-compose.yml` is the entire
+  # divergence — it pins `:beta` instead of `:latest` and sets SELF_TEST="1" —
+  # and git preserves beta's copy by itself, because a release that does not
+  # touch that file gives the merge nothing to argue about.
+  #
+  # So the interesting case is the one where a release DOES touch it. Then the
+  # merge conflicts, this job fails, and beta is left exactly as it was. That
+  # is the correct outcome and the reason there is no `-X ours` here: choosing
+  # a side automatically is how beta's `:beta` pin would eventually get
+  # replaced by `:latest` and point every tester at the wrong image. Resolve it
+  # by hand, keeping beta's tag and SELF_TEST value.
+  promote-to-beta:
+    needs: release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      actions: write
+
+    steps:
+      - name: Check out beta
+        uses: actions/checkout@v4
+        with:
+          ref: beta
+          fetch-depth: 0
+
+      - name: Identify the committer
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Merge main into beta
+        id: merge
+        run: |
+          set -euo pipefail
+          git fetch origin main --tags
+          VERSION="$(git show origin/main:VERSION)"
+          if git merge --no-ff origin/main -m "Merge v${VERSION} into beta
+
+          Automated by release-on-merge.yml so beta tracks releases without a
+          second pull request. docker-compose.yml is beta's own and is left
+          alone; if a release ever changes it this merge conflicts on purpose."
+          then
+            echo "merged=true" >> "$GITHUB_OUTPUT"
+          else
+            git merge --abort || true
+            echo "::error::main does not merge cleanly into beta. Almost"\
+                 "certainly docker-compose.yml, which is beta's only"\
+                 "divergence. Resolve by hand, KEEPING beta's :beta image tag"\
+                 "and SELF_TEST=1, then push beta. Nothing was pushed."
+            exit 1
+          fi
+
+      - name: Confirm beta kept its own compose
+        run: |
+          set -euo pipefail
+          # Cheap insurance against the merge silently taking main's side. The
+          # cost of getting this wrong is every tester's fresh install pulling
+          # :latest and quietly leaving beta behind.
+          if ! grep -q "smarttube-playlist:beta" docker-compose.yml; then
+            echo "::error::docker-compose.yml no longer pins :beta after the"\
+                 "merge. Refusing to push."
+            exit 1
+          fi
+          echo "docker-compose.yml still pins :beta" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Push beta
+        run: git push origin beta
+
+      - name: Build the :beta image
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          # Same GITHUB_TOKEN suppression as the tag push above — without an
+          # explicit dispatch, beta would sit on new code with a stale image.
+          gh workflow run publish.yml --ref beta
+          echo "Dispatched publish.yml for beta" >> "$GITHUB_STEP_SUMMARY"

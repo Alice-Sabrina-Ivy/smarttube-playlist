@@ -834,9 +834,12 @@
     <h2 id="seek-title" class="card-title">▌ Seek</h2>
     <div id="seek-current" class="seek-current">— / —</div>
     <div class="controls seek-quick">
-      <button data-seek-by="-30" type="button" class="muted">⏪ 30s</button>
+      <!-- Order is the layout: these wrap into a 2x2, so the small jumps sit
+           on the top row and the big ones underneath, each row reading
+           back/forward left to right. -->
       <button data-seek-by="-10" type="button" class="muted">⏪ 10s</button>
       <button data-seek-by="10"  type="button" class="muted">10s ⏩</button>
+      <button data-seek-by="-30" type="button" class="muted">⏪ 30s</button>
       <button data-seek-by="30"  type="button" class="muted">30s ⏩</button>
     </div>
     <label for="seek-input">Jump to:</label>
@@ -1038,7 +1041,22 @@
 
   function syncLoungePosition(state) {
     const lng = state.lounge || {};
-    if (lng.available && lng.current_time != null) {
+    // Is this Lounge frame even ABOUT the video we're drawing?
+    //
+    // Nothing in the position path used to ask. The Lounge observation is a
+    // cache that keeps reporting the PREVIOUS video after we've moved on —
+    // after a deep-link launch it can sit frozen on the old video for the
+    // whole stuck-ct window — so the card showed the new title and thumbnail
+    // above the old video's elapsed time, duration and bar position. A
+    // 19-second clip's numbers under a 10-minute video reads as "100%, 0:00
+    // left" ten seconds in.
+    //
+    // Only reject when we can actually tell they differ. `current` is
+    // legitimately null for externally-started playback, which the UI renders
+    // from this observation alone and must keep doing.
+    const cur = state.current;
+    const foreignFrame = !!(cur && lng.video_id && lng.video_id !== cur.video_id);
+    if (lng.available && lng.current_time != null && !foreignFrame) {
       // Decide whether to re-anchor `stampedAt` to "now" or preserve
       // the prior anchor.
       //
@@ -1075,7 +1093,10 @@
         // can detect a transition next sync.
         _wasPaused: !!state.paused,
       };
-    } else if (!lng.available) {
+    } else if (!lng.available || foreignFrame) {
+      // Drop the anchor rather than leaving a stale one to drift. With no
+      // anchor, tickProgress falls back to the wall-clock estimate from
+      // current_started_at, which is at least about the right video.
       lastCastSync = null;
     }
 
