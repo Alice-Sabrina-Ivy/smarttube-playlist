@@ -1677,12 +1677,21 @@ class QueueController:
         started = self.state.current_started_at
         if cur is None or started is None or self._playback_confirmed:
             return False
-        # Somebody pressed Pause. A dud parks itself Paused with nobody
-        # touching anything, and only the Lounge mirror sets `pause_source` —
-        # so this is what separates them. It matters because pausing while the
-        # video is still buffering produces the dud signature exactly: ct is
-        # 0.0, so the `> 0` clause below never latches `_playback_confirmed`.
-        if self.state.pause_source is not None:
+        # An explicit pause on OUR page, and only that. `pause_source` is not
+        # the human/dud discriminator it looks like: the Lounge mirror sets it
+        # to "lounge" for any Paused frame about our video, and the measured
+        # dud parks Paused at ct 0.0 — so `is not None` here disabled this
+        # detector for the exact case it exists to catch. Confirmed on
+        # hardware: pause_source went "lounge" at t+36s and the queue was
+        # still parked at t+78s where it had previously been rescued at t+42s.
+        #
+        # "ui" is unambiguous — somebody pressed Pause on the page — and it is
+        # the same reading the near-end check trusts. A pause made with the
+        # TV's own remote during buffering is mirrored as "lounge" and can
+        # still be skipped; that is rare, and the alternative is a bad link
+        # parking the queue for ten minutes, which is neither rare nor
+        # recoverable without knowing to press Skip.
+        if self.state.pause_source == "ui":
             return False
         if not observation.get("available"):
             return False

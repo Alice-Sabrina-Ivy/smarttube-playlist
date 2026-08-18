@@ -521,8 +521,17 @@ class LoungeMonitor:
         # a blocked task is not done. Measured on hardware: Lounge died 15s
         # into a session and was still dead seven minutes later with the video
         # playing throughout.
+        # ...but never the task we are RUNNING ON. pyytlounge awaits event
+        # listeners inline inside subscribe(), and an onDisconnected event
+        # routes here through `_on_disconnected_event` — so on that path this
+        # IS the subscribe task. Cancelling it makes the next await raise
+        # CancelledError, which `suppress(Exception)` cannot catch, and the
+        # disconnect, the `__aexit__` that closes the aiohttp session, and the
+        # DISCONNECTED emit are all skipped. Returning from the listener
+        # unwinds subscribe() by itself, so there is nothing to cancel there.
         sub = self._subscribe_call
-        if sub is not None and not sub.done():
+        if (sub is not None and not sub.done()
+                and sub is not asyncio.current_task()):
             self._teardown_interrupt = True
             sub.cancel()
         with contextlib.suppress(Exception):
