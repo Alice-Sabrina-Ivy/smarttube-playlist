@@ -1859,6 +1859,29 @@ class QueueController:
             cur = self.state.current
             if cur is None or not self.state.queue:
                 return
+            if self.has_pending_sends() or self.state.waking:
+                # OUR OWN launch is still in flight, so this item cannot have
+                # ended — it has not started. The fifth site to need this, and
+                # the one the other four did not cover, because this function
+                # reads its ARGUMENT rather than `state.lounge`: blanking that
+                # field in `_begin_locked` protects the other finish checks and
+                # does nothing for this one.
+                #
+                # Its own defence, FINISH_CONSUMED_WINDOW, lasts 3s, and that is
+                # not enough for a REPEAT. Two consecutive entries sharing a
+                # video_id is ordinary and is exactly what the id guard cannot
+                # separate, so on a cold start — ~15s in the WAKE_DELAY floor
+                # before the Intent is even sent — the previous instance's end
+                # frame arrives with every gate open: the consumed window has
+                # expired, OBSERVATION_TRUST_AFTER has expired so the position
+                # is believed, and Paused-at-duration is how a lone video ends
+                # here. The repeat was advanced off before its deep link landed.
+                #
+                # A bare return is right here, unlike the kill-switch's
+                # re-arming: this path is event-driven, so a genuine ending
+                # arrives as a later frame, and the duration timer sits
+                # underneath it as the backstop.
+                return
             if cur.duration_s is None:
                 # Livestream: no end for us to detect. This path reads only
                 # the observation's own ct and duration, so a DVR window
