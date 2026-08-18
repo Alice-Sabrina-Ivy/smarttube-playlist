@@ -504,7 +504,16 @@ class LoungeMonitor:
         except Exception:
             log.warning("Lounge get_now_playing on connect failed", exc_info=True)
 
-    async def _teardown(self) -> None:
+    async def _teardown(self, *, notify: bool = True) -> None:
+        """Drop the session. `notify=False` for a SELF-HEAL.
+
+        The DISCONNECTED emit means "the player went away" to the queue
+        controller, which schedules a player-close verify and can clear
+        `current`. That is right when subscribe() genuinely ended; it is
+        wrong when WE tore the session down to rebuild it, because the
+        video is still playing. A ~17s network blip between the container
+        and YouTube would otherwise clear the card and strand the queue.
+        """
         if self._api is None:
             return
         api, self._api = self._api, None
@@ -538,7 +547,7 @@ class LoungeMonitor:
             await api.disconnect()
         with contextlib.suppress(Exception):
             await api.__aexit__(None, None, None)
-        if was_available:
+        if was_available and notify:
             await self._safe_emit(EVENT_DISCONNECTED, self._observation)
 
     async def _periodic_refresh_loop(self) -> None:
@@ -624,7 +633,7 @@ class LoungeMonitor:
                     consecutive_failures = 0
                     last_ct = _NO_READING
                     stuck_polls = 0
-                    await self._teardown()
+                    await self._teardown(notify=False)
                 continue
             # Detect stuck ct. The get_now_playing response is processed
             # asynchronously via _on_now_playing; by the time we check
@@ -646,7 +655,7 @@ class LoungeMonitor:
                     # will create a fresh one on its next iteration,
                     # which triggers SmartTube to push current state on
                     # connect (see _connect's get_now_playing call).
-                    await self._teardown()
+                    await self._teardown(notify=False)
                     continue
             else:
                 stuck_polls = 0

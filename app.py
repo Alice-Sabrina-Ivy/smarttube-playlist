@@ -4803,6 +4803,19 @@ async def skip():
             except Exception:
                 log.warning("retry %s send failed", keycodes[-1], exc_info=True)
                 break
+
+    # Forget what Lounge last said, the way the kill-switch does. We have just
+    # sent the TV to its screensaver, but the cloud cache keeps reporting the
+    # video as Playing — and `_lounge_shows_external_playback()` reads exactly
+    # that to decide the 3s poll should run. Polling a backgrounded SmartTube
+    # auto-foregrounds it, so Skip would visibly undo itself.
+    #
+    # `suppress_lounge` is meant to be the thing that stops this, and on the
+    # hardware we own it does. It cannot be relied on: it is only ever written
+    # from a current_app callback, and on a device that never negotiates IME
+    # `current_app` stays "" and the flag can never become True at all — which
+    # is documented, and would make this permanent rather than a 0-3s race.
+    queue_controller.forget_lounge_observation()
     return {"ok": True}
 
 
@@ -4871,6 +4884,12 @@ async def seek(req: SeekReq):
     else:
         raise HTTPException(400, "supply either `to` or `by`")
 
+    # Capture WHICH video this seek is for, before the round trip. A handoff
+    # can land while seek_to is in flight, and re-anchoring the new item to
+    # the old one's position discards it about a second in.
+    seeking_vid = (queue_controller.state.current.video_id
+                   if queue_controller.state.current else None)
+
     ok = await state.lounge_monitor.seek_to(target)
     if not ok:
         raise HTTPException(502, "Lounge seek_to call failed")
@@ -4879,7 +4898,7 @@ async def seek(req: SeekReq):
     # telling it. Seeking FORWARD therefore left it firing late by the size
     # of the jump, and "late" is precisely the window in which the video ends
     # first and the kill-switch strands everything still queued.
-    await queue_controller.reschedule_timer_for_position(target)
+    await queue_controller.reschedule_timer_for_position(target, seeking_vid)
     return {"ok": True, "target": target}
 
 

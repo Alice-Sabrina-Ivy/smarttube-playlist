@@ -523,8 +523,7 @@ class QueueController:
             self.state.queue.clear()
             if self.state.paused:
                 # Hold the new item at the head; unpause will start it.
-                self.state.current = None
-                self.state.current_started_at = None
+                self._forget_current_locked()
                 self.state.queue.append(item)
                 started = None
             else:
@@ -580,7 +579,7 @@ class QueueController:
                 or bool(self.state.queue)
                 or self.state.paused
             )
-            self.state.current = None
+            self._forget_current_locked()
             self.state.current_started_at = None
             self.state.queue.clear()
             self.state.paused = False
@@ -922,7 +921,7 @@ class QueueController:
             # Re-check under lock — state could've changed in the gap.
             if self.state.current is None or self.state.current.video_id != expected_our_vid:
                 return
-            self.state.current = None
+            self._forget_current_locked()
             self.state.current_started_at = None
             # Also clear paused. Without this, a leftover paused=True
             # from a prior UI pause on the now-ceded video means
@@ -1043,6 +1042,16 @@ class QueueController:
             snap = self.state.snapshot()
         await self._broadcaster.publish("paused_toggled", snap)
 
+    def forget_lounge_observation(self) -> None:
+        """Drop the cached Lounge frame without waiting for a new one.
+
+        For callers that have just told the TV to stop showing this video —
+        /api/skip's idle sequence — because the cloud cache keeps reporting it
+        as Playing and anything reading that will act on a video nobody is
+        watching.
+        """
+        self.state.lounge = _blank_lounge()
+
     async def _kill_switch(self) -> None:
         # SmartTube leaves the foreground for two very different reasons and
         # they need opposite handling. The user opening Netflix is what this
@@ -1074,7 +1083,7 @@ class QueueController:
             )
             if not had_state:
                 return
-            self.state.current = None
+            self._forget_current_locked()
             self.state.current_started_at = None
             # Also clear paused — kill-switch is a fresh-start signal. Without
             # this, a user who paused via the web UI right before SmartTube
@@ -1094,6 +1103,22 @@ class QueueController:
         await self._broadcaster.publish("item_ended", snapshot)
 
     # ── internals ────────────────────────────────────────────────────────────
+
+    def _forget_current_locked(self) -> None:
+        """Drop the current item AND everything scoped to it.
+
+        Caller MUST hold self._lock. Six paths clear `current`, and each new
+        one has historically forgotten a different flag — `paused` wedging
+        every later add, then `_duration_elapsed` letting a later kill-switch
+        answer "yes it finished" about an item that no longer exists. `paused`
+        stays with the callers because it is genuinely site-specific; these
+        are not.
+        """
+        self.state.current = None
+        self.state.current_started_at = None
+        self._playhead_origin_at = None
+        self._duration_elapsed = False
+        self._playback_confirmed = False
 
     def _begin_locked(self, item: QueueItem) -> None:
         """Mutate state to mark `item` as playing and schedule its timer.
@@ -1306,6 +1331,12 @@ class QueueController:
         half-watched video as finished and launched the next queue item at a
         TV the viewer had just walked away from.
         """
+        if self.state.current is None:
+            # Nothing of ours is playing, so nothing of ours has finished.
+            # `_lounge_contradicts_finish` cannot veto here — it returns False
+            # when `cur` is None — so without this the flag answers for an
+            # item that no longer exists.
+            return False
         if self._lounge_contradicts_finish():
             return False
         if self._duration_elapsed:
@@ -1433,8 +1464,7 @@ class QueueController:
                 self._begin_locked(next_item)
                 event = "item_started"
             else:
-                self.state.current = None
-                self.state.current_started_at = None
+                self._forget_current_locked()
                 # Nothing is playing and nothing is queued, so a leftover
                 # `paused` describes a player we no longer own — and it is
                 # not inert. add() gates should_start on `not paused`, and
@@ -1471,9 +1501,7 @@ class QueueController:
         async with self._lock:
             if self.state.current is None:
                 return
-            self.state.current = None
-            self.state.current_started_at = None
-            self._playhead_origin_at = None
+            self._forget_current_locked()
             # Same reasoning as _advance's empty-queue branch: a `paused`
             # that outlives the item it described wedges every later add. So
             # does `_duration_elapsed` — a later kill-switch asks "did the
@@ -1536,7 +1564,6 @@ class QueueController:
 
     def _send_to_tv(self, item: QueueItem) -> None:
         """Fire-and-forget TV send. Failures are logged; state has already moved on."""
-        self._cancel_in_flight_sends()
 
         async def _runner() -> None:
             try:
@@ -1565,9 +1592,9 @@ class QueueController:
                 else None,
             )
 
-        task = asyncio.create_task(_runner())
-        self._send_tasks.add(task)
-        task.add_done_callback(self._send_tasks.discard)
+        # Through track_send: it cancels whatever was in flight and registers
+        # the new task, which is exactly the four lines this used to repeat.
+        self.track_send(_runner())
 
     async def _maybe_advance_at_end_of_video(self, observation: dict) -> None:
         """Start the next video the moment Lounge shows this one finished.
@@ -1742,6 +1769,10 @@ class QueueController:
                 return
             if elapsed >= LAUNCH_CONFIRM_TIMEOUT:
                 break
+            # Re-arm for the shortfall. The anchor can move the clock more than
+            # once (a launch that retries), so this loops rather than looking
+            # exactly twice — bounded, because "the window silently becomes
+            # never" is the failure mode this whole check exists to avoid.
             wait = max(0.5, LAUNCH_CONFIRM_TIMEOUT - elapsed)
         await self._maybe_skip_a_launch_that_never_started(
             dict(self.state.lounge or {})
@@ -1817,15 +1848,34 @@ class QueueController:
                   "" if position_s is None
                   else f" (adopted playback at {float(position_s):.1f}s)")
 
-    async def reschedule_timer_for_position(self, position_s: float) -> None:
+    async def reschedule_timer_for_position(
+        self, position_s: float, video_id: Optional[str] = None,
+    ) -> None:
         """Re-anchor the duration timer after the playhead moved externally.
 
         No-op for livestreams (no duration) and when nothing is playing.
+
+        `video_id` is what the seek was ISSUED against. A seek is a round trip,
+        and one sent moments before a handoff lands after it — computed from
+        the previous video's position, which every other position check in this
+        file is gated on video_id to reject. Anchoring a fresh item to the old
+        one's near-end position gives `remaining` 0, and the timer's
+        Lounge-defer branch cannot rescue it because `_begin_locked` has just
+        blanked `state.lounge`, so the new item is discarded a second in.
         """
         async with self._lock:
             cur = self.state.current
             if cur is None or cur.duration_s is None:
                 return
+            if video_id is not None and cur.video_id != video_id:
+                log.info(
+                    "Ignoring a seek to %.1fs meant for %s; %s is playing now",
+                    float(position_s), video_id, cur.video_id,
+                )
+                return
+            # Clamp: a typed target past the end, or a relative seek that
+            # overshoots, must not arm a zero-length timer.
+            position_s = min(max(0.0, float(position_s)), float(cur.duration_s))
             remaining = max(0.0, float(cur.duration_s) - float(position_s))
             # Move the PLAYHEAD ORIGIN with the playhead, not just the timer.
             # `_observation_predates_current` calls a position stale when it
