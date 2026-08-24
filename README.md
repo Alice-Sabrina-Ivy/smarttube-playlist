@@ -179,6 +179,8 @@ This uses the same YouTube Lounge protocol the phone app's "play on TV" button u
 
 Skipping it still works, but you lose real playback position and precise end-of-video detection — see [Things it won't do](#things-it-wont-do).
 
+If this link dies later — Pause doing nothing, a video vanishing from the page while it keeps playing, the header saying **SMARTTUBE NOT LISTENING** — the fix is on the TV, not in the app, and restarting the container won't help: see [Troubleshooting](docs/TROUBLESHOOTING.md).
+
 **3. Done.** Paste a YouTube URL, hit **Add to queue**.
 
 Your pairing persists to the container's storage, so this is a one-time job — it survives restarts, updates and re-creating the container.
@@ -265,7 +267,7 @@ Every setting, with what it's for: **[docs/CONFIGURATION.md](docs/CONFIGURATION.
 
 ## Something not working?
 
-**[docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md)** covers the common ones — the image not downloading, pairing failing, the page not opening on phones, volume buttons doing nothing, and wrong video lengths.
+**[docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md)** covers the common ones — the image not downloading, pairing failing, the page not opening on phones, volume buttons doing nothing, wrong video lengths, and Pause doing nothing because SmartTube has stopped listening.
 
 ---
 
