@@ -16,7 +16,9 @@ closed it, and took the now-playing card away with anything queued behind it lef
 there; seeks did nothing; and a video started on the TV itself couldn't be shown at all. The
 app now checks whether SmartTube is actually on the other end of that link. When it isn't, the
 header says **SMARTTUBE NOT LISTENING** and the SmartTube link line reads **PAIRED · NOT
-LISTENING**, with a note underneath saying what to do; Pause goes over the TV-remote connection
+LISTENING**, with a note underneath saying what to do — and only once the link has genuinely
+stayed gone for a few minutes, because the TV's own connection also takes brief dips that fix
+themselves and those aren't worth an alarm; Pause goes over the TV-remote connection
 instead, which does reach the TV, and Play after such a pause resumes where you paused rather
 than starting the video over. Pause doesn't just take YouTube's word for it any more, either:
 if the TV itself doesn't confirm within a few seconds, the TV-remote pause goes out as well —

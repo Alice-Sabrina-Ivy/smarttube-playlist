@@ -29,6 +29,7 @@ import asyncio
 import contextlib
 import json
 import logging
+import time
 from dataclasses import dataclass, field
 from typing import Awaitable, Callable, Optional
 
@@ -129,6 +130,18 @@ STUCK_CT_POLL_THRESHOLD = 5  # 5 polls × 3s = 15s
 # constant is only reachable as a local, no test can exercise the behaviour
 # it governs, which is how the wedge below survived the whole suite.
 REFRESH_INTERVAL = 3.0
+
+# How long the TV must have been absent from the lounge before the absence is
+# REPORTED (status, UI, the remedy warning). The raw reading is not debounced —
+# a pause during a dip genuinely reaches nobody, so the functional fallbacks
+# key off it immediately. But a healthy screen drops out of the device list
+# for 32-85 seconds roughly every 4-5 minutes as routine churn (measured on a
+# freshly rebooted device, once mid-playback, position streaming throughout),
+# and surfacing every dip flashed "SMARTTUBE NOT LISTENING" plus TV-settings
+# remedy text at users several times an hour for a state that fixes itself.
+# Arrivals are still believed instantly. A real death (the original incident
+# ran for hours) is reported within one bind-plus-grace, ~8 minutes worst case.
+SCREEN_OFFLINE_GRACE = 180.0
 
 # Consecutive get_now_playing() failures before we stop believing the
 # session and force a reconnect. The loop used to swallow these forever on
@@ -271,6 +284,13 @@ class LoungeMonitor:
         # LOUNGE_CONNECT_TIMEOUT — redefining it would turn a 3s pre-deep-link
         # wait into 15s on every add.
         self._screen_online: Optional[bool] = None
+        # When the current absence began (monotonic), whether its remedy
+        # warning has fired, and whether the screen has ever been seen online
+        # this session — together these produce `screen_online_settled`, the
+        # debounced view the status surface reports. See SCREEN_OFFLINE_GRACE.
+        self._screen_missing_since: Optional[float] = None
+        self._screen_offline_warned = False
+        self._screen_seen_online = False
         # Set by request_reconnect_now() to interrupt the subscribe loop's
         # backoff sleep — used by tv_play before it waits on Lounge, so we
         # don't sit out a 5-60s exponential backoff. That backoff is easy to
@@ -293,18 +313,65 @@ class LoungeMonitor:
         """
         return self._screen_online
 
+    @property
+    def screen_online_settled(self) -> Optional[bool]:
+        """The debounced presence view — what status pages should show.
+
+        True the moment the TV is seen (arrivals are pushed and believed
+        instantly). False only once an absence has PERSISTED past
+        SCREEN_OFFLINE_GRACE — a healthy screen takes 32-85s dips every few
+        minutes, and every one of them used to flash the remedy banner. While
+        an absence is inside the grace, the last settled truth stands: True
+        if the screen has been seen this session, None if it never has.
+        """
+        if self._screen_online is None:
+            return None
+        if self._screen_online:
+            return True
+        since = self._screen_missing_since
+        if since is not None and time.monotonic() - since >= SCREEN_OFFLINE_GRACE:
+            return False
+        return True if self._screen_seen_online else None
+
     def _note_screen_presence(self, present: bool) -> None:
         previous = self._screen_online
         self._screen_online = bool(present)
-        if previous is None or previous == self._screen_online:
-            return
         if self._screen_online:
-            log.info("SmartTube is back in the lounge; playback sync restored")
-        else:
+            self._screen_seen_online = True
+            if self._screen_missing_since is not None:
+                gone = time.monotonic() - self._screen_missing_since
+                if self._screen_offline_warned:
+                    log.info(
+                        "SmartTube is back in the lounge; playback sync restored"
+                    )
+                else:
+                    log.info(
+                        "SmartTube is back in the lounge (was out %.0fs — "
+                        "routine churn)", gone,
+                    )
+            self._screen_missing_since = None
+            self._screen_offline_warned = False
+            return
+        now = time.monotonic()
+        if self._screen_missing_since is None:
+            self._screen_missing_since = now
+            if previous is True:
+                log.info(
+                    "SmartTube dropped out of the lounge — routine churn "
+                    "unless it persists; the page is not told yet"
+                )
+        if (not self._screen_offline_warned
+                and now - self._screen_missing_since >= SCREEN_OFFLINE_GRACE):
+            # Persisted past anything a dip has ever measured: now it is the
+            # real state, worth the alarm and the remedy — once per absence.
+            self._screen_offline_warned = True
             log.warning(
-                "SmartTube has left the lounge: the session is still bound and "
-                "YouTube still answers, but nothing reaches the TV. On the TV: "
-                "SmartTube -> Settings -> Remote control, off and on again."
+                "SmartTube has been out of the lounge for over %.0fs: the "
+                "session is still bound and YouTube still answers, but nothing "
+                "reaches the TV. Pause falls back to the remote keycode and "
+                "playback position is unavailable until it returns. On the "
+                "TV: SmartTube -> Settings -> Remote control, off and on "
+                "again.", now - self._screen_missing_since,
             )
 
     async def request_now_playing(self) -> bool:
@@ -413,6 +480,9 @@ class LoungeMonitor:
                     await task
         await self._teardown()
         self._screen_online = None
+        self._screen_missing_since = None
+        self._screen_offline_warned = False
+        self._screen_seen_online = False
 
     def request_reconnect_now(self) -> None:
         """Wake the subscribe loop out of any current backoff sleep so it
@@ -605,24 +675,13 @@ class LoungeMonitor:
         self._api = api
         self._observation = LoungeObservation(available=True)
         log.info("Lounge connected: %s", api.screen_device_name or api.screen_name)
-        if self._screen_online is False and screen_was is False:
-            # Still absent, and already explained below on the bind that
-            # first found it so. YouTube rebinds us every ~5 minutes; one
-            # short line per bind keeps the state visible without repeating
-            # the remedy every time.
-            log.info("SmartTube is still not in the lounge")
-        elif self._screen_online is False:
-            # The line above reads "Lounge connected: None" in this state,
-            # which is the fingerprint but not an explanation. Say what it
-            # means and what fixes it — the fix is on the TV, not here, and
-            # restarting the container rebinds to the same empty lounge.
-            log.warning(
-                "Lounge connected, but SmartTube is not in the lounge: YouTube "
-                "will answer every command and none will reach the TV. Pause "
-                "falls back to the remote keycode and playback position is "
-                "unavailable until it returns. On the TV: SmartTube -> "
-                "Settings -> Remote control, off and on again."
-            )
+        if self._screen_online is False:
+            # The line above reads "Lounge connected: None" here — the
+            # fingerprint. One INFO line per bind; the loud remedy WARNING is
+            # `_note_screen_presence`'s, and only once the absence persists
+            # past SCREEN_OFFLINE_GRACE — a single absent bind is routinely a
+            # dip in the TV's own connection, not a dead registration.
+            log.info("SmartTube is not in the lounge at this bind")
         await self._safe_emit(EVENT_CONNECTED, self._observation)
         # Ask SmartTube to push current state. Without this we only get events
         # when state CHANGES — if a video has been playing since before we

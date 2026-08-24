@@ -2226,8 +2226,15 @@ async def status():
     # with YouTube is up; this says whether SmartTube is actually in it. The
     # two came apart in production (2026-08-23) and the page had no word for
     # it. None = not observed (no session, or no loungeStatus seen yet).
+    # The SETTLED view, not the raw one: a healthy screen dips out of the
+    # lounge for 32-85s every few minutes (its own connection recycling), and
+    # surfacing every dip flashed the NOT LISTENING banner and its TV-settings
+    # remedy at users for a state that fixes itself. Only an absence that has
+    # persisted past SCREEN_OFFLINE_GRACE is reported; the functional
+    # fallbacks (keycode pause, straight-to-deep-link) key off the raw flag
+    # and cover the dips silently.
     lounge_screen_online = (
-        getattr(state.lounge_monitor, "screen_online", None)
+        getattr(state.lounge_monitor, "screen_online_settled", None)
         if state.lounge_monitor is not None else None
     )
     return {
