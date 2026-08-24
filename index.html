@@ -894,6 +894,10 @@
     el.textContent = msg;
     if (kind === "ok") setTimeout(() => el.classList.remove("show"), 4000);
   }
+  function clearToast(el) {
+    el.className = "toast";
+    el.textContent = "";
+  }
 
   async function api(path, opts = {}) {
     const res = await fetch(path, {
@@ -1603,6 +1607,12 @@
   const seekModal = $("modal-seek");
   let seekTickInterval = null;
   function openSeekModal() {
+    // A stale error must not outlive the problem it described. Error toasts
+    // are only ever REPLACED, never timed out — right for the always-visible
+    // cards, wrong in a modal: a seek refused while SmartTube wasn't
+    // listening stayed on screen after the link recovered, telling the user
+    // to go toggle a setting that was already fine.
+    clearToast($("toast-seek"));
     refreshSeekCurrent();
     seekModal.hidden = false;
     // Tick the displayed current-time once per second while the modal
@@ -1700,6 +1710,9 @@
         // next Lounge push (which can lag a few seconds).
         if (typeof r.target === "number") nudgeLocalPosition(r.target);
         refreshSeekCurrent();
+        // A seek that worked also retires any earlier error on the spot —
+        // the modal can stay open across the link recovering.
+        clearToast($("toast-seek"));
       } catch (e) {
         toast($("toast-seek"), e.message, "err");
       }
@@ -1713,6 +1726,7 @@
       if (typeof r.target === "number") nudgeLocalPosition(r.target);
       refreshSeekCurrent();
       $("seek-input").value = "";
+      clearToast($("toast-seek"));
     } catch (e) {
       toast($("toast-seek"), e.message, "err");
     }
