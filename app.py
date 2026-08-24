@@ -113,6 +113,19 @@ RESET_PAIRING = os.environ.get("RESET_PAIRING", "").strip().lower() in (
 # the reset one-shot; clearing the flag deletes it and re-arms the mechanism.
 RESET_MARKER = DATA_DIR / ".reset_done"
 
+# The Lounge-only variant. SmartTube can come back under a NEW screen id —
+# a reinstall, cleared app data, the package rename after the signing-key
+# compromise — and our token then names a lounge it will never join: every
+# bind succeeds, every command is answered, nothing reaches the TV, and the
+# Remote-control toggle cannot help. `/api/lounge/pair` 409s while the file
+# exists (deliberately: any LAN client could otherwise overwrite a working
+# token), and RESET_PAIRING wipes the TV certificate along with it. This
+# clears only lounge.json, with the same one-shot marker for the same reason.
+RESET_LOUNGE = os.environ.get("RESET_LOUNGE", "").strip().lower() in (
+    "1", "true", "yes", "on",
+)
+RESET_LOUNGE_MARKER = DATA_DIR / ".reset_lounge_done"
+
 # Extra Host values to trust, comma-separated — for reverse-proxy setups that
 # terminate on a real domain name. See _host_header_is_trusted.
 ALLOWED_HOSTS = frozenset(
@@ -574,6 +587,55 @@ def _apply_reset_if_requested() -> None:
     )
 
 
+def _apply_lounge_reset_if_requested() -> None:
+    """Honour RESET_LOUNGE at startup, exactly once per time it's set.
+
+    Lounge-only: the TV pairing survives. Runs before the Lounge monitor
+    starts, so the service comes up with the Pair-with-SmartTube card showing
+    and nothing bound to the stale screen.
+    """
+    if not RESET_LOUNGE:
+        with contextlib.suppress(OSError):
+            RESET_LOUNGE_MARKER.unlink(missing_ok=True)
+        return
+
+    if RESET_LOUNGE_MARKER.exists():
+        log.info(
+            "RESET_LOUNGE is set but the reset has already run; ignoring so "
+            "your SmartTube pairing survives. Clear the flag only if you want "
+            "to arm another reset later."
+        )
+        return
+
+    removed = False
+    try:
+        if LOUNGE_AUTH_FILE.exists():
+            LOUNGE_AUTH_FILE.unlink()
+            removed = True
+    except OSError:
+        log.exception("RESET_LOUNGE: could not remove %s", LOUNGE_AUTH_FILE.name)
+
+    try:
+        RESET_LOUNGE_MARKER.write_text(
+            "RESET_LOUNGE already ran. Clear RESET_LOUNGE (or delete this "
+            "file) to arm it again.\n"
+        )
+        _secure_data_file(RESET_LOUNGE_MARKER)
+    except OSError:
+        log.exception("RESET_LOUNGE: could not write the one-shot marker")
+
+    log.warning(
+        "RESET_LOUNGE set — cleared %s. Pair with SmartTube again from the "
+        "web UI (on the TV: SmartTube -> Settings -> Remote control). The TV "
+        "pairing itself was left alone.",
+        # Not "was not paired": RESET_PAIRING runs first and may have removed
+        # the same file this boot, and telling the operator they were never
+        # paired would be false.
+        LOUNGE_AUTH_FILE.name if removed
+        else "nothing to remove (lounge.json was not present)",
+    )
+
+
 def _secure_data_file(path: Path) -> None:
     """Set restrictive perms (0600) on a data file. Best-effort — silently
     skips on platforms (e.g. Windows host filesystems) where chmod is a no-op
@@ -928,9 +990,24 @@ async def _wait_for_lounge_connected(timeout: float, poll: float) -> bool:
     """
     if state.lounge_monitor is None:
         return False
+    # Let a rebind that `request_reconnect_now()` has just scheduled take its
+    # first step, so a session being replaced is not read as the one to use.
+    await asyncio.sleep(0)
     deadline = asyncio.get_running_loop().time() + timeout
     while asyncio.get_running_loop().time() < deadline:
-        if state.lounge_monitor and state.lounge_monitor.is_connected:
+        mon = state.lounge_monitor
+        if mon and mon.is_connected:
+            if getattr(mon, "screen_online", None) is False:
+                # Bound, and nobody on the other end. Nothing can arrive on
+                # this session however long we wait, and a setPlaylist into
+                # it would be accepted by the cloud and reach no device. The
+                # deep link is the signal that works; take it now rather than
+                # after LOUNGE_OBSERVATION_TIMEOUT.
+                log.info(
+                    "Lounge session is bound but SmartTube is not in the "
+                    "lounge; not waiting on it"
+                )
+                return False
             return True
         await asyncio.sleep(poll)
     return False
@@ -960,18 +1037,78 @@ def _wire_callbacks(remote: AndroidTVRemote) -> None:
 
 
 async def _lounge_pause() -> bool:
-    """Pause via Lounge if connected, fallback to MEDIA_PAUSE key otherwise."""
-    if state.lounge_monitor and state.lounge_monitor.is_connected:
-        if await state.lounge_monitor.pause():
-            return True
+    """Pause via Lounge if the TV can hear it; otherwise the MEDIA_PAUSE key.
+
+    "Can hear it" is the load-bearing part. A Lounge session is a session with
+    YouTube's cloud, and the cloud answers `pause` with HTTP 200 whether or not
+    SmartTube is in the lounge to receive it — so `pause()` returning True
+    proved nothing, and when SmartTube's remote-control registration died in
+    production (2026-08-23) the TV played on under a page that said paused,
+    because the only fallback there is was never reached.
+
+    The keycode is a verified path: measured over the remote protocol against
+    exactly that deaf screen, KEYCODE_MEDIA_PAUSE (127, pause-only — never
+    MEDIA_PLAY_PAUSE, which toggles) paused SmartTube within a second and was
+    inert on an already-paused player. Media keys reach whatever holds the
+    media session, though, so it is sent only when SmartTube is foreground or
+    the foreground is unreadable — a /api/pause from a webhook while someone
+    is in Netflix must not pause Netflix.
+    """
+    mon = state.lounge_monitor
+    if mon is None:
+        reason = "Lounge is not paired"
+    elif not mon.is_connected:
+        reason = "no Lounge session"
+    elif getattr(mon, "screen_online", None) is False:
+        reason = "SmartTube is not in the lounge"
+    elif await mon.pause():
+        return True
+    else:
+        reason = "the Lounge pause was refused"
     if state.remote is None:
+        return False
+    blocking = await _foreground_blocks_media_key()
+    if blocking:
+        log.info(
+            "Not sending MEDIA_PAUSE: %s is foreground, not SmartTube (%s)",
+            blocking, reason,
+        )
         return False
     try:
         state.remote.send_key_command("MEDIA_PAUSE")
+        log.info("Paused with the MEDIA_PAUSE keycode (%s)", reason)
         return True
     except Exception:
         log.warning("MEDIA_PAUSE send failed", exc_info=True)
         return False
+
+
+# How long to wait before RE-READING the foreground app when the first read
+# says a media keycode would land on something other than SmartTube. The
+# current_app callback fires spurious ~1s transients (SmartTube -> launcher
+# and back, documented in playlist.py's kill-switch debounce), and the
+# property is that same cached value — so a single read can withhold the one
+# pause that works in the deaf-screen state on evidence that was stale before
+# the key would have gone out. "Never decide on a single read."
+MEDIA_KEY_FOREGROUND_RECHECK = 0.5
+
+
+async def _foreground_blocks_media_key() -> Optional[str]:
+    """The non-SmartTube package a media key would land on, or None to send.
+
+    Unreadable (""/None) counts as "send" — the same truthiness rule as the
+    kill-switch: no reading is not evidence of some other app. A non-SmartTube
+    first read is re-checked once after MEDIA_KEY_FOREGROUND_RECHECK so a
+    library flicker cannot withhold the key.
+    """
+    foreground = _get_current_app()
+    if not foreground or foreground == SMARTTUBE_PACKAGE:
+        return None
+    await asyncio.sleep(MEDIA_KEY_FOREGROUND_RECHECK)
+    foreground = _get_current_app()
+    if not foreground or foreground == SMARTTUBE_PACKAGE:
+        return None
+    return foreground
 
 
 RESUME_VERIFY_TIMEOUT = 3.0
@@ -981,9 +1118,19 @@ RESUME_VERIFY_POLL = 0.2
 async def _lounge_play() -> bool:
     """Resume / start playback. Paths in order of preference:
 
-    1. SmartTube foreground + Lounge connected → Lounge.play() AND
-       verify state actually transitions to Playing within
+    0. Nothing current, something queued → send NOTHING; resume() launches
+       the queued item with its own single play signal.
+    1. SmartTube foreground + Lounge connected AND SmartTube in the lounge →
+       Lounge.play() AND verify state actually transitions to Playing within
        RESUME_VERIFY_TIMEOUT. If verified, in-place unpause is done.
+    1b. SmartTube foreground, current set and paused from OUR page, but
+       SmartTube is NOT in the lounge → the MEDIA_PLAY keycode, which is
+       measured (against exactly that deaf screen) to resume in place. A
+       deep link here restarts the clip from the beginning, which is far
+       worse for a 40-minute video than the residual risk that a player
+       torn down between our own keycode pause and this press swallows the
+       key. Deliberate: changing this back to a deep link, or widening it
+       past pause_source == "ui", is a decision, not a cleanup.
     2. Lounge.play() succeeded HTTPS-wise but state stayed Paused
        (signal: SmartTube's PlaybackActivity was torn down, e.g. user
        paused then hit BACK on the remote) → fall through to tv_play()
@@ -991,7 +1138,8 @@ async def _lounge_play() -> bool:
        sends the deep link Intent and relaunches the player cleanly.
     3. SmartTube NOT foreground → tv_play() sends the deep-link Intent,
        which foregrounds SmartTube and starts playback in one step.
-    4. Last resort → MEDIA_PLAY keycode.
+    4. Last resort → MEDIA_PLAY keycode — gated, like the pause keycode, on
+       SmartTube being foreground or the foreground being unreadable.
 
     Note: we can't tell "player torn down" from Lounge observation
     alone — after BACK, current_time and state stay sticky at their
@@ -999,10 +1147,31 @@ async def _lounge_play() -> bool:
     take effect" — so we always verify post-play. Cheap (<1s when it
     works, 3s when we need to fall through).
     """
+    if (queue_controller.state.current is None
+            and queue_controller.state.queue):
+        # Play with nothing current and something queued: `resume()` calls
+        # this FIRST and only then starts the queued item with its own launch.
+        # Resuming whatever SmartTube has parked here — Lounge.play() or
+        # KEYCODE_MEDIA_PLAY — is a second play signal for one press,
+        # measured landing in the same millisecond as the queued item's deep
+        # link. The queued item is what was asked for; send nothing for the
+        # parked one.
+        log.info(
+            "Play with nothing current and %d queued: the queued item's own "
+            "launch is the play signal; sending nothing here",
+            len(queue_controller.state.queue),
+        )
+        return True
     smarttube_fg = (_get_current_app() == SMARTTUBE_PACKAGE)
+    mon = state.lounge_monitor
     lounge_ready = (
-        state.lounge_monitor is not None
-        and state.lounge_monitor.is_connected
+        mon is not None
+        and mon.is_connected
+        # A session bound to a lounge SmartTube is not in answers play() with
+        # True and reaches nothing; the verify below would then time out and
+        # fall through to tv_play anyway — but only after RESUME_VERIFY_TIMEOUT
+        # of nothing, and having sent a play to nobody first.
+        and getattr(mon, "screen_online", None) is not False
     )
     if smarttube_fg and lounge_ready:
         if await state.lounge_monitor.play():
@@ -1026,6 +1195,25 @@ async def _lounge_play() -> bool:
                 state.lounge_monitor.observation.current_time,
             )
     cur = queue_controller.state.current
+    if (cur is not None and state.remote is not None and smarttube_fg
+            and mon is not None
+            and getattr(mon, "screen_online", None) is False
+            and queue_controller.state.paused
+            and queue_controller.state.pause_source == "ui"):
+        # Path 1b — see the docstring. The pause that got us here went out as
+        # a keycode moments ago (Lounge cannot pause a screenless lounge), so
+        # the player is live and MEDIA_PLAY resumes it IN PLACE where a deep
+        # link would restart from zero.
+        try:
+            state.remote.send_key_command("MEDIA_PLAY")
+            log.info(
+                "Resumed with the MEDIA_PLAY keycode (SmartTube is not in "
+                "the lounge)"
+            )
+            return True
+        except Exception:
+            log.warning("MEDIA_PLAY send failed; falling through to tv_play",
+                        exc_info=True)
     if cur and state.remote is not None:
         try:
             # Through track_send, not inline. `_cancel_in_flight_sends` can
@@ -1043,8 +1231,17 @@ async def _lounge_play() -> bool:
             log.warning("tv_play during resume failed", exc_info=True)
     if state.remote is None:
         return False
+    blocking = await _foreground_blocks_media_key()
+    if blocking:
+        # Same reasoning as the pause keycode: media keys land on whatever
+        # holds the media session, and a /api/resume from a webhook while
+        # someone is in Netflix must not resume Netflix.
+        log.info("Not sending MEDIA_PLAY: %s is foreground, not SmartTube",
+                 blocking)
+        return False
     try:
         state.remote.send_key_command("MEDIA_PLAY")
+        log.info("Resumed with the MEDIA_PLAY keycode")
         return True
     except Exception:
         log.warning("MEDIA_PLAY send failed", exc_info=True)
@@ -1784,6 +1981,7 @@ async def lifespan(_app: FastAPI):
     # Before anything reads the data dir, so a requested reset lands the user
     # on the setup screen rather than half-connecting with stale credentials.
     _apply_reset_if_requested()
+    _apply_lounge_reset_if_requested()
 
     # One-time cleanup for users upgrading from a version that didn't
     # restrict perms on persisted secrets.
@@ -1981,6 +2179,14 @@ async def status():
     credentials_present = _is_tv_paired()
     lounge_paired = LOUNGE_AUTH_FILE.exists()
     lounge_connected = bool(state.lounge_monitor and state.lounge_monitor.is_connected)
+    # Separate from `lounge_connected` on purpose. Connected means our session
+    # with YouTube is up; this says whether SmartTube is actually in it. The
+    # two came apart in production (2026-08-23) and the page had no word for
+    # it. None = not observed (no session, or no loungeStatus seen yet).
+    lounge_screen_online = (
+        getattr(state.lounge_monitor, "screen_online", None)
+        if state.lounge_monitor is not None else None
+    )
     return {
         "version": VERSION,
         "configured": paired,
@@ -1994,6 +2200,7 @@ async def status():
         "current_app": current_app,
         "lounge_paired": lounge_paired,
         "lounge_connected": lounge_connected,
+        "lounge_screen_online": lounge_screen_online,
         # True whenever a TV is paired; the frontend uses it to decide
         # whether to render the volume buttons. The four per-brand AVR
         # backends this once described were deleted when CEC was proven —
@@ -2400,6 +2607,9 @@ def _diagnostic_lounge() -> dict:
         out["connected"] = bool(mon.is_connected)
     except Exception:
         pass
+    # Whether SmartTube is in the lounge the session is bound to. `connected`
+    # alone cannot say — the cloud binds and answers regardless.
+    out["screen_online"] = getattr(mon, "screen_online", None)
     try:
         obs = mon.observation
         out["observation"] = {
@@ -3431,6 +3641,12 @@ async def _probe_lounge_swap(ctx: dict) -> dict:
     mon = state.lounge_monitor
     if mon is None or not mon.is_connected:
         raise _ProbeSkip("Lounge not connected")
+    if getattr(mon, "screen_online", None) is False:
+        raise _ProbeSkip(
+            "SmartTube is not in the lounge, so no Lounge command can reach "
+            "it. On the TV: SmartTube -> Settings -> Remote control, off and "
+            "on, then run again."
+        )
     if not ctx.get("played"):
         raise _ProbeSkip("nothing was playing to swap from")
 
@@ -3467,6 +3683,12 @@ async def _probe_transport(ctx: dict) -> dict:
     mon = state.lounge_monitor
     if mon is None or not mon.is_connected:
         raise _ProbeSkip("Lounge not connected")
+    if getattr(mon, "screen_online", None) is False:
+        raise _ProbeSkip(
+            "SmartTube is not in the lounge, so no Lounge command can reach "
+            "it. On the TV: SmartTube -> Settings -> Remote control, off and "
+            "on, then run again."
+        )
     if not (ctx.get("played") or ctx.get("swapped")):
         raise _ProbeSkip("nothing was playing to pause")
 
@@ -3523,6 +3745,15 @@ async def _probe_end_of_video(ctx: dict) -> dict:
             "Lounge not connected, so we cannot see a video end. Pair with "
             "SmartTube and run again — this is the only check that covers "
             "whether the next video starts by itself."
+        )
+    if getattr(mon, "screen_online", None) is False:
+        # Without this, the exact production failure this state describes
+        # produced three red probes and a verdict pointing at us, while the
+        # report's own diagnostics named the real cause one level down.
+        raise _ProbeSkip(
+            "SmartTube is not in the lounge, so we cannot see a video end. "
+            "On the TV: SmartTube -> Settings -> Remote control, off and on, "
+            "then run again."
         )
 
     vid = SELF_TEST_VIDEO_SHORT
@@ -4923,6 +5154,14 @@ async def seek(req: SeekReq):
     _reject_during_self_test()
     if state.lounge_monitor is None or not state.lounge_monitor.is_connected:
         raise HTTPException(503, "Lounge not connected; can't seek")
+    if getattr(state.lounge_monitor, "screen_online", None) is False:
+        # The cloud would accept the seek and nothing would receive it, and
+        # a 200 here re-anchors the duration timer to a position playback
+        # never reached.
+        raise HTTPException(
+            503, "SmartTube is not in the lounge; a seek would reach nothing. "
+                 "On the TV: SmartTube -> Settings -> Remote control, off and on.",
+        )
 
     if req.to is not None:
         target = parse_time_input(req.to)

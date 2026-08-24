@@ -96,6 +96,21 @@ On the next start the TV-remote certificate and the Lounge token are deleted and
 
 You can also just delete `cert.pem`, `key.pem`, `config.json` (TV remote) and `lounge.json` (Lounge) from the `data` folder by hand.
 
+## Resetting only the SmartTube pairing
+
+`RESET_LOUNGE` is the Lounge-only variant:
+
+```yaml
+environment:
+  RESET_LOUNGE: "1"
+```
+
+On the next start only `lounge.json` is deleted. The TV-remote certificate stays, so you land on the *Pair with SmartTube* card rather than the setup screen. It exists for the case where SmartTube has come back under a new identity — a reinstall, cleared app data, the package rename after its signing-key compromise — and shows a fresh 12-digit code: the stored token then names a session SmartTube will never join again, and toggling *Remote control* on the TV can't fix that.
+
+Same one-shot design as `RESET_PAIRING`: a marker file (`.reset_lounge_done`) records that it ran, later starts skip it and log a reminder, and clearing the flag re-arms it.
+
+There is deliberately still no HTTP endpoint for this. `POST /api/lounge/pair` returning **409** is what stops anyone on the LAN from replacing your token with theirs; an endpoint that cleared the token would hand them the same takeover in two requests instead of one. Clearing it needs access to the container's configuration — the line this whole document draws.
+
 ## Reporting a problem
 
 This is a hobby project with no security guarantees and no SLA. If you find something, open an issue — or, for anything you'd rather not post publicly, use GitHub's **Report a vulnerability** button on the Security tab.

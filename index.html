@@ -759,6 +759,9 @@
       <dt>TV power</dt><dd id="meta-power">—</dd>
       <dt>SmartTube link</dt><dd id="meta-lounge">—</dd>
     </dl>
+    <p class="card-sub" id="lounge-remedy" hidden>
+      <strong>SmartTube has lost its link to YouTube</strong>, so this page can no longer see or pause what is playing — even though the TV is fine, and restarting this app will not help. On the TV: <strong>SmartTube → Settings → Remote control</strong> — switch it off and on again. This page catches up by itself within a few minutes, or the next time someone adds a video while SmartTube is already on screen. If that screen now shows a 12-digit code and this message stays, SmartTube needs pairing again: set <code>RESET_LOUNGE=1</code>, restart, and use the Pair with SmartTube card.
+    </p>
     <div class="beta-diag" id="beta-diag" hidden>
       <p class="card-sub">
         <strong>Device report.</strong> If something doesn&#39;t work on your
@@ -936,6 +939,13 @@
         suffix = " · SMARTTUBE NOT PAIRED";
       } else if (s.lounge_paired && !s.lounge_connected) {
         suffix = " · SMARTTUBE OFFLINE";
+      } else if (s.lounge_paired && s.lounge_screen_online === false) {
+        // Our session with YouTube is up; SmartTube is not in it. Not a
+        // network problem on our side — restarting rebinds to the same
+        // empty lounge — so it gets its own word and the warn pulse: Pause,
+        // Seek and the now-playing card are all silently wrong in this state.
+        suffix = " · SMARTTUBE NOT LISTENING";
+        pulse.className = "pulse warn";
       }
       line.textContent = `LINKED · ${s.host}${suffix}`;
     } else if (s.credentials_present) {
@@ -955,9 +965,13 @@
       s.tv_on === true  ? "ON"  :
       s.tv_on === false ? "OFF (will wake)" :
       "UNKNOWN";
+    const notListening = !!s.lounge_paired && !!s.lounge_connected
+      && s.lounge_screen_online === false;
     $("meta-lounge").textContent =
       !s.lounge_paired ? "NOT PAIRED" :
-      s.lounge_connected ? "PAIRED · CONNECTED" : "PAIRED · OFFLINE";
+      !s.lounge_connected ? "PAIRED · OFFLINE" :
+      notListening ? "PAIRED · NOT LISTENING" : "PAIRED · CONNECTED";
+    $("lounge-remedy").hidden = !notListening;
     // Volume rides HDMI-CEC through the paired remote, so the buttons are
     // available whenever the TV is. Whether the device actually honours them
     // depends on its CEC volume setting, which cannot be read over this
@@ -1254,7 +1268,11 @@
     const loungeConfirmsCurrent = !!(cur && lng.available
         && lng.video_id === cur.video_id
         && lng.current_time != null);
-    const loungeIsExpected = !!(lastStatus && lastStatus.lounge_paired);
+    // Not when SmartTube is known to be out of the lounge: nothing can
+    // confirm the video then, and a fresh add would sit in STARTING for the
+    // whole grace with the deep link long since landed.
+    const loungeIsExpected = !!(lastStatus && lastStatus.lounge_paired
+      && lastStatus.lounge_screen_online !== false);
     const startedAt = state.current_started_at
         ? new Date(state.current_started_at).getTime() : 0;
     const elapsedSinceStart = startedAt
