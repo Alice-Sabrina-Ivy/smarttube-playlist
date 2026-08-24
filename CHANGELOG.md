@@ -5,6 +5,51 @@ here matches a version on the [releases page](https://github.com/Alice-Sabrina-I
 
 ---
 
+## v1.03
+
+**Pause did nothing, or a video vanished from the page while it kept playing.** SmartTube's
+link to YouTube — the *Remote control* setting this app relies on for playback position, pause
+and seek — can quietly die on the TV while the video plays on, and YouTube keeps accepting the
+app's commands as if nothing were wrong. So the app believed them: Pause reported success while
+the TV played on; every few minutes the app lost sight of the video, read that as you having
+closed it, and took the now-playing card away with anything queued behind it left sitting
+there; seeks did nothing; and a video started on the TV itself couldn't be shown at all. The
+app now checks whether SmartTube is actually on the other end of that link. When it isn't, the
+header says **SMARTTUBE NOT LISTENING** and the SmartTube link line reads **PAIRED · NOT
+LISTENING**, with a note underneath saying what to do — and only once the link has genuinely
+stayed gone for a few minutes, because the TV's own connection also takes brief dips that fix
+themselves and those aren't worth an alarm; Pause goes over the TV-remote connection
+instead, which does reach the TV, and Play after such a pause resumes where you paused rather
+than starting the video over. Pause doesn't just take YouTube's word for it any more, either:
+if the TV itself doesn't confirm within a few seconds, the TV-remote pause goes out as well —
+so a pause works even in the minutes before the app can notice the link has died. The paused
+position also now freezes where you paused it, instead of showing 0:00, when the exact position
+isn't available. Adding a video no longer waits on a link that cannot answer;
+and seeking says plainly why it can't. The video keeps playing and stays on the page.
+
+**How to fix it — on the TV, not here.** Open **SmartTube → Settings → Remote control** and
+switch it off and on again. If that doesn't clear it, force-stop SmartTube and reopen it; then
+reboot the streaming device. The page catches up by itself within a few minutes, or the moment
+anyone adds a video while SmartTube is still up on the TV. Restarting this app will *not* help —
+it reconnects to the same dead link — and empties the queue. If Remote control now shows a fresh
+12-digit code, SmartTube has a new identity and needs pairing again: set `RESET_LOUNGE=1` and
+restart (below), then use the *Pair with SmartTube* card.
+
+**Pressing Play with videos queued but nothing playing started two things at once.** It resumed
+whatever SmartTube had left parked and launched the queued video in the same instant. Now only
+the queued video starts.
+
+**A pause pressed on the page could be recorded as one made with the TV remote**, if SmartTube's
+own "paused" notice reached the app first. That mattered: a TV-remote pause near the end of a
+video lets the queue move on, and lets another guest's add replace the paused video — neither of
+which should happen to a video you paused yourself.
+
+**`RESET_LOUNGE` re-pairs SmartTube without touching the TV pairing.** Set it to `1` and restart
+to clear just the SmartTube link; the TV-remote pairing stays. Like `RESET_PAIRING`, it fires once
+and then ignores itself, so it's safe to leave set. See [CONFIGURATION.md](docs/CONFIGURATION.md).
+
+---
+
 ## v1.02
 
 **Queueing videos actually works now.** This is the big one. If you queued two videos,

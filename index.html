@@ -759,6 +759,9 @@
       <dt>TV power</dt><dd id="meta-power">—</dd>
       <dt>SmartTube link</dt><dd id="meta-lounge">—</dd>
     </dl>
+    <p class="card-sub" id="lounge-remedy" hidden>
+      <strong>SmartTube has lost its link to YouTube</strong>, so this page can no longer see or pause what is playing — even though the TV is fine, and restarting this app will not help. On the TV: <strong>SmartTube → Settings → Remote control</strong> — switch it off and on again. This page catches up by itself within a few minutes, or the next time someone adds a video while SmartTube is already on screen. If that screen now shows a 12-digit code and this message stays, SmartTube needs pairing again: set <code>RESET_LOUNGE=1</code>, restart, and use the Pair with SmartTube card.
+    </p>
     <div class="beta-diag" id="beta-diag" hidden>
       <p class="card-sub">
         <strong>Device report.</strong> If something doesn&#39;t work on your
@@ -825,7 +828,7 @@
     </div>
   </section>
 
-  <footer>SmartTube Playlist · <span id="app-version">v1.02</span> · <a href="https://opensource.org/licenses/MIT" target="_blank" rel="noopener noreferrer">MIT</a> · <a href="https://github.com/Alice-Sabrina-Ivy" target="_blank" rel="noopener noreferrer">Alice Sabrina Ivy</a></footer>
+  <footer>SmartTube Playlist · <span id="app-version">v1.03</span> · <a href="https://opensource.org/licenses/MIT" target="_blank" rel="noopener noreferrer">MIT</a> · <a href="https://github.com/Alice-Sabrina-Ivy" target="_blank" rel="noopener noreferrer">Alice Sabrina Ivy</a></footer>
 </div>
 
 <!-- ── Seek modal (opens via the "Seek" button on the now-playing card) ── -->
@@ -891,6 +894,10 @@
     el.textContent = msg;
     if (kind === "ok") setTimeout(() => el.classList.remove("show"), 4000);
   }
+  function clearToast(el) {
+    el.className = "toast";
+    el.textContent = "";
+  }
 
   async function api(path, opts = {}) {
     const res = await fetch(path, {
@@ -936,6 +943,13 @@
         suffix = " · SMARTTUBE NOT PAIRED";
       } else if (s.lounge_paired && !s.lounge_connected) {
         suffix = " · SMARTTUBE OFFLINE";
+      } else if (s.lounge_paired && s.lounge_screen_online === false) {
+        // Our session with YouTube is up; SmartTube is not in it. Not a
+        // network problem on our side — restarting rebinds to the same
+        // empty lounge — so it gets its own word and the warn pulse: Pause,
+        // Seek and the now-playing card are all silently wrong in this state.
+        suffix = " · SMARTTUBE NOT LISTENING";
+        pulse.className = "pulse warn";
       }
       line.textContent = `LINKED · ${s.host}${suffix}`;
     } else if (s.credentials_present) {
@@ -955,9 +969,13 @@
       s.tv_on === true  ? "ON"  :
       s.tv_on === false ? "OFF (will wake)" :
       "UNKNOWN";
+    const notListening = !!s.lounge_paired && !!s.lounge_connected
+      && s.lounge_screen_online === false;
     $("meta-lounge").textContent =
       !s.lounge_paired ? "NOT PAIRED" :
-      s.lounge_connected ? "PAIRED · CONNECTED" : "PAIRED · OFFLINE";
+      !s.lounge_connected ? "PAIRED · OFFLINE" :
+      notListening ? "PAIRED · NOT LISTENING" : "PAIRED · CONNECTED";
+    $("lounge-remedy").hidden = !notListening;
     // Volume rides HDMI-CEC through the paired remote, so the buttons are
     // available whenever the TV is. Whether the device actually honours them
     // depends on its CEC volume setting, which cannot be read over this
@@ -1017,7 +1035,34 @@
   let pausedExternallyCt = null;     // current_time we saw at that moment
   let pausedFadeTimer = null;        // setTimeout id for fade-boundary re-render
 
+  // Where the wall-clock estimate stood when the pause arrived. Without a
+  // Lounge anchor the paused branches below used to show the START offset —
+  // a video paused a minute in read 0:00 (seen live from a phone) — because
+  // the exact pause moment was "not tracked". It is trackable: freeze the
+  // estimate at the paused transition and hold that.
+  let pausedFreezeElapsed = null;
+
+  function updatePausedFreeze(prev, state) {
+    if (!state.paused || !state.current) {
+      pausedFreezeElapsed = null;
+      return;
+    }
+    const itemChanged = !prev || !prev.current
+      || prev.current.id !== state.current.id;
+    if ((prev && prev.paused) && !itemChanged) return;   // already frozen
+    const cur = state.current;
+    const startOffset = cur.start_s || 0;
+    if (state.current_started_at && cur.duration_s != null) {
+      const startedMs = Date.parse(state.current_started_at);
+      const wallElapsed = Math.max(0, (Date.now() - startedMs) / 1000);
+      pausedFreezeElapsed = Math.min(cur.duration_s, wallElapsed + startOffset);
+    } else {
+      pausedFreezeElapsed = startOffset;
+    }
+  }
+
   function renderState(state) {
+    updatePausedFreeze(currentSnapshot, state);
     currentSnapshot = state;
     syncLoungePosition(state);
     renderNowPlaying(state);
@@ -1254,7 +1299,11 @@
     const loungeConfirmsCurrent = !!(cur && lng.available
         && lng.video_id === cur.video_id
         && lng.current_time != null);
-    const loungeIsExpected = !!(lastStatus && lastStatus.lounge_paired);
+    // Not when SmartTube is known to be out of the lounge: nothing can
+    // confirm the video then, and a fresh add would sit in STARTING for the
+    // whole grace with the deep link long since landed.
+    const loungeIsExpected = !!(lastStatus && lastStatus.lounge_paired
+      && lastStatus.lounge_screen_online !== false);
     const startedAt = state.current_started_at
         ? new Date(state.current_started_at).getTime() : 0;
     const elapsedSinceStart = startedAt
@@ -1339,10 +1388,12 @@
       total = cur.duration_s;
       const startOffset = cur.start_s || 0;
       if (currentSnapshot.paused) {
-        // Don't drift the estimate forward while paused. We don't track the
-        // exact pause moment, so just hold the start offset — better to show
-        // a stable value than a fictional growing time.
-        elapsed = Math.min(total, startOffset);
+        // Don't drift the estimate forward while paused — hold it where it
+        // stood when the pause arrived (frozen in updatePausedFreeze). The
+        // start offset is only the last resort, for a pause that predates
+        // this page load.
+        elapsed = Math.min(total,
+          pausedFreezeElapsed != null ? pausedFreezeElapsed : startOffset);
       } else {
         const startedMs = Date.parse(currentSnapshot.current_started_at);
         const wallElapsed = Math.max(0, (Date.now() - startedMs) / 1000);
@@ -1585,6 +1636,12 @@
   const seekModal = $("modal-seek");
   let seekTickInterval = null;
   function openSeekModal() {
+    // A stale error must not outlive the problem it described. Error toasts
+    // are only ever REPLACED, never timed out — right for the always-visible
+    // cards, wrong in a modal: a seek refused while SmartTube wasn't
+    // listening stayed on screen after the link recovered, telling the user
+    // to go toggle a setting that was already fine.
+    clearToast($("toast-seek"));
     refreshSeekCurrent();
     seekModal.hidden = false;
     // Tick the displayed current-time once per second while the modal
@@ -1628,7 +1685,10 @@
       total = cur.duration_s;
       const startOffset = cur.start_s || 0;
       if (currentSnapshot.paused) {
-        elapsed = Math.min(total, startOffset);
+        // Same freeze as tickProgress — the seek modal must not claim a
+        // paused video is at its start offset either.
+        elapsed = Math.min(total,
+          pausedFreezeElapsed != null ? pausedFreezeElapsed : startOffset);
       } else {
         const startedMs = Date.parse(currentSnapshot.current_started_at);
         const wallElapsed = Math.max(0, (Date.now() - startedMs) / 1000);
@@ -1682,6 +1742,9 @@
         // next Lounge push (which can lag a few seconds).
         if (typeof r.target === "number") nudgeLocalPosition(r.target);
         refreshSeekCurrent();
+        // A seek that worked also retires any earlier error on the spot —
+        // the modal can stay open across the link recovering.
+        clearToast($("toast-seek"));
       } catch (e) {
         toast($("toast-seek"), e.message, "err");
       }
@@ -1695,6 +1758,7 @@
       if (typeof r.target === "number") nudgeLocalPosition(r.target);
       refreshSeekCurrent();
       $("seek-input").value = "";
+      clearToast($("toast-seek"));
     } catch (e) {
       toast($("toast-seek"), e.message, "err");
     }

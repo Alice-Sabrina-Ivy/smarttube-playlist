@@ -147,6 +147,19 @@ KILL_SWITCH_RECHECK_LIMIT = 5
 # without needing an activity-level foreground signal.
 PLAYER_CLOSE_VERIFY_DELAY = 8.0
 
+# How many times the player-close verify may find NO Lounge reading after a
+# reconnect before it stops looking and leaves the item alone.
+#
+# A blank reconnect is not evidence the player closed. It is what a lounge the
+# TV has dropped out of looks like — measured in production 2026-08-23, where
+# YouTube closed the stream on its ~5-minute clock, every reconnect came back
+# empty, and reading that as "player closed" kill-switched the card from a
+# video that was still playing. It is also what a reconnect slower than the
+# verify delay looks like (7.5s has been measured). Neither is a reason to
+# disown anything; the duration timer and the foreground kill-switch remain
+# underneath as the backstops.
+PLAYER_CLOSE_RECHECK_LIMIT = 3
+
 # Time to wait after Lounge reports a different video_id than ours
 # before assuming the user externally switched to a video we didn't
 # queue (via the physical TV remote / SmartTube UI). Needs to be long
@@ -509,7 +522,15 @@ class QueueController:
         if self._cast_pause is not None:
             await self._cast_pause()
         async with self._lock:
-            if self.state.paused:
+            # Idempotent on a UI pause only. SmartTube's Paused push can land
+            # on the subscribe stream while the pause command above is still
+            # in flight, and `_sync_paused_from_lounge` then records it as a
+            # TV-remote pause first — so returning on a bare `paused` here
+            # left the person who pressed Pause on our page recorded as
+            # "lounge", which unlocks the end-of-video advance, the timer's
+            # paused branch and add-while-paused replacing their video. They
+            # told us who paused; claim it.
+            if self.state.paused and self.state.pause_source == "ui":
                 return
             self.state.paused = True
             self.state.pause_source = "ui"
@@ -858,18 +879,26 @@ class QueueController:
         # videos" from the propagation window of our own setPlaylist.
 
     async def _on_lounge_disconnected(self) -> None:
-        """Lounge subscribe ended. Could be a transient network blip
-        (reconnects within 1-2s, observation comes back) OR the user
-        backed out of SmartTube's player (SmartTube tears down the
-        media session; reconnect happens but server reports no video).
+        """Lounge subscribe ended. Usually a transient network blip or
+        YouTube's routine ~5-minute stream close (reconnects within 1-2s,
+        observation comes back); a reconnect that reports NOTHING is a lounge
+        SmartTube has dropped out of, or a reconnect still in flight — not a
+        closed player, see below.
 
         Distinguishing them without an activity-level foreground
         signal: schedule a delayed check. After PLAYER_CLOSE_VERIFY_DELAY
         seconds, if Lounge has reconnected with the SAME video_id as
-        our current, it was a blip and we do nothing. If it has
-        reconnected with a different (or null) video_id, the player
-        closed and we should clear state.current — same effect as the
-        kill-switch firing from a current_app transition."""
+        our current, it was a blip and we do nothing. A DIFFERENT video_id
+        is the external-switch check's case and is handed to it. A reconnect
+        that reports NOTHING is not evidence of anything — it is what a lounge
+        SmartTube has dropped out of looks like — so the check re-arms a
+        bounded number of times and then leaves the item alone. See
+        `_verify_player_closed_after_delay` for why the v1.0 "null means the
+        player closed" reading was retired.
+
+        Note YouTube ends the bind stream every ~5 minutes as a matter of
+        routine, so this runs on every owned video longer than that; whatever
+        it does wrong, it does often."""
         async with self._lock:
             had_current = self.state.current is not None
             current_vid = self.state.current.video_id if self.state.current else None
@@ -888,22 +917,43 @@ class QueueController:
         )
 
     async def _verify_player_closed_after_delay(self, expected_vid: str,
-                                                attempt: int = 0) -> None:
+                                                attempt: int = 0,
+                                                blank_rechecks: int = 0) -> None:
+        """What did the Lounge reconnect say about the item we own?
+
+        Three answers, none of which is a direct kill-switch any more:
+
+        * the same video_id — a transient blip, nothing to do;
+        * a DIFFERENT video_id — the external-switch check's case, with its
+          debounce and its in-flight stand-off, so it is handed there rather
+          than short-cutting past both. The one time this verify ever fired
+          on hardware it was exactly that shortcut misfiring on a stale
+          cloud frame during a cold launch;
+        * NOTHING — we do not know. The v1.0 reading was "the player closed
+          and the server has no video for us", and no hardware run has ever
+          produced that shape: BACK-out leaves Lounge reporting Paused with
+          video_id and position intact, and the Stopped variant is the
+          persistent-Stopped detector's. What DOES produce it is a lounge
+          SmartTube has dropped out of (production, 2026-08-23), where
+          clearing here took the card away from a playing video on every
+          ~5-minute stream end. Re-check a bounded number of times, then
+          leave the item alone; `None` means unknown here exactly as it
+          does in `_on_lounge_finished`.
+        """
         try:
             await asyncio.sleep(PLAYER_CLOSE_VERIFY_DELAY)
         except asyncio.CancelledError:
             return
-        # Same stale-cache problem as the cede, and the same answer. This path
-        # decides "the player closed" from the Lounge video_id differing from
-        # ours, and while a launch of OUR OWN is in flight that difference
-        # means only that the cloud cache still names the last-played video
-        # (invariant 4) — the player we are about to open has not opened yet.
-        #
-        # It matters more here than anywhere else, because this calls
-        # `_kill_switch()` DIRECTLY rather than `_kill_switch_after_debounce()`,
-        # so none of the guards the kill-switch grew apply. Found on hardware:
-        # the cede stood off four times and this fired straight through it,
-        # clearing `current` while the clip went on to play unowned.
+        # Same stale-cache problem as the cede, and the same answer: while a
+        # launch of OUR OWN is in flight, a foreign Lounge video_id means only
+        # that the cloud cache still names the last-played video (invariant 4)
+        # — the player we are about to open has not opened yet. This function
+        # used to call `_kill_switch()` DIRECTLY on that evidence, bypassing
+        # every guard the kill-switch grew, and fired straight through the
+        # cede's stand-off on the very run that confirmed the cede fix. It no
+        # longer kill-switches at all (see the docstring), but the stand-off
+        # stays: even handing a mid-launch stale frame to the cede would start
+        # a verdict clock on evidence that means nothing yet.
         if self.has_pending_sends() or self.state.waking:
             if attempt >= EXTERNAL_SWITCH_RECHECK_LIMIT:
                 log.info(
@@ -918,7 +968,8 @@ class QueueController:
                 expected_vid, self.has_pending_sends(), self.state.waking,
             )
             self._player_close_task = asyncio.create_task(
-                self._verify_player_closed_after_delay(expected_vid, attempt + 1)
+                self._verify_player_closed_after_delay(
+                    expected_vid, attempt + 1, blank_rechecks)
             )
             return
         async with self._lock:
@@ -929,20 +980,43 @@ class QueueController:
                     or self.state.current.video_id != expected_vid):
                 return
             observed_vid = self.state.lounge.get("video_id")
+            frame = dict(self.state.lounge)
         if observed_vid == expected_vid:
             # Lounge reconnected with the same video — was a blip.
             log.info(
-                "Player-close verify: Lounge reconnected with %s, was a "
-                "transient blip, not firing kill-switch",
+                "Player-close verify: Lounge reconnected with %s — was a "
+                "transient blip; nothing to do",
                 expected_vid,
             )
             return
+        if observed_vid is None:
+            if blank_rechecks >= PLAYER_CLOSE_RECHECK_LIMIT:
+                log.info(
+                    "Player-close verify for %s: Lounge has reported nothing "
+                    "since the reconnect after %d re-checks — that is not "
+                    "evidence the player closed; leaving the item alone",
+                    expected_vid, blank_rechecks,
+                )
+                return
+            # DEBUG: with the screen out of the lounge this fires on every
+            # ~5-minute stream end while an item is owned, and the exhaustion
+            # line below plus the connect-time warning already tell the story.
+            log.debug(
+                "Player-close verify for %s: Lounge has reported nothing since "
+                "the reconnect; re-checking in %.1fs",
+                expected_vid, PLAYER_CLOSE_VERIFY_DELAY,
+            )
+            self._player_close_task = asyncio.create_task(
+                self._verify_player_closed_after_delay(
+                    expected_vid, attempt, blank_rechecks + 1)
+            )
+            return
         log.info(
-            "Player-close verify: Lounge reports video_id=%r (expected %r) — "
-            "player closed, firing kill-switch",
+            "Player-close verify: Lounge reports video_id=%r after the reconnect "
+            "(ours is %r) — handing to the external-switch check",
             observed_vid, expected_vid,
         )
-        await self._kill_switch()
+        await self._on_lounge_now_playing(frame)
 
     async def _on_lounge_now_playing(self, observation: dict) -> None:
         """Lounge reports the playing video changed. Two cases:
