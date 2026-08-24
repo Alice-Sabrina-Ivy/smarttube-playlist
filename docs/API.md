@@ -65,7 +65,7 @@ POST   /api/lounge/pair    {code}         12-digit code from SmartTube; 409 if a
 
 ### Pause is not confirmed
 
-`POST /api/pause` freezes auto-advance and returns `ok: true` regardless of what happened on the TV. The pause itself is **sent** — over Lounge when SmartTube is in the session, otherwise as the `MEDIA_PAUSE` keycode over the paired remote — but neither route reports back whether the TV actually paused, the Lounge one in particular returns success from YouTube's cloud regardless, and a withheld keycode (next paragraph) still returns `ok`. Read the playback state from `/api/events` if you need to know.
+`POST /api/pause` freezes auto-advance and returns `ok: true` regardless of what happened on the TV. The pause itself is **sent** — over Lounge when SmartTube is in the session, otherwise as the `MEDIA_PAUSE` keycode over the paired remote. A Lounge pause is only trusted once the TV itself confirms it within a few seconds (YouTube answers success regardless of whether anything received the command); an unconfirmed one falls back to the keycode as well. The endpoint still returns `ok` either way — including when the keycode was withheld because another app was in front (next paragraph). Read the playback state from `/api/events` if you need to know.
 
 The keycode fallback is only sent when SmartTube is the foreground app, or the foreground can't be read — media keys reach whatever holds the media session, and a pause from a webhook must not pause Netflix.
 

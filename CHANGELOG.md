@@ -18,7 +18,11 @@ app now checks whether SmartTube is actually on the other end of that link. When
 header says **SMARTTUBE NOT LISTENING** and the SmartTube link line reads **PAIRED · NOT
 LISTENING**, with a note underneath saying what to do; Pause goes over the TV-remote connection
 instead, which does reach the TV, and Play after such a pause resumes where you paused rather
-than starting the video over; adding a video no longer waits on a link that cannot answer;
+than starting the video over. Pause doesn't just take YouTube's word for it any more, either:
+if the TV itself doesn't confirm within a few seconds, the TV-remote pause goes out as well —
+so a pause works even in the minutes before the app can notice the link has died. The paused
+position also now freezes where you paused it, instead of showing 0:00, when the exact position
+isn't available. Adding a video no longer waits on a link that cannot answer;
 and seeking says plainly why it can't. The video keeps playing and stays on the page.
 
 **How to fix it — on the TV, not here.** Open **SmartTube → Settings → Remote control** and

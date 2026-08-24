@@ -1035,7 +1035,34 @@
   let pausedExternallyCt = null;     // current_time we saw at that moment
   let pausedFadeTimer = null;        // setTimeout id for fade-boundary re-render
 
+  // Where the wall-clock estimate stood when the pause arrived. Without a
+  // Lounge anchor the paused branches below used to show the START offset —
+  // a video paused a minute in read 0:00 (seen live from a phone) — because
+  // the exact pause moment was "not tracked". It is trackable: freeze the
+  // estimate at the paused transition and hold that.
+  let pausedFreezeElapsed = null;
+
+  function updatePausedFreeze(prev, state) {
+    if (!state.paused || !state.current) {
+      pausedFreezeElapsed = null;
+      return;
+    }
+    const itemChanged = !prev || !prev.current
+      || prev.current.id !== state.current.id;
+    if ((prev && prev.paused) && !itemChanged) return;   // already frozen
+    const cur = state.current;
+    const startOffset = cur.start_s || 0;
+    if (state.current_started_at && cur.duration_s != null) {
+      const startedMs = Date.parse(state.current_started_at);
+      const wallElapsed = Math.max(0, (Date.now() - startedMs) / 1000);
+      pausedFreezeElapsed = Math.min(cur.duration_s, wallElapsed + startOffset);
+    } else {
+      pausedFreezeElapsed = startOffset;
+    }
+  }
+
   function renderState(state) {
+    updatePausedFreeze(currentSnapshot, state);
     currentSnapshot = state;
     syncLoungePosition(state);
     renderNowPlaying(state);
@@ -1361,10 +1388,12 @@
       total = cur.duration_s;
       const startOffset = cur.start_s || 0;
       if (currentSnapshot.paused) {
-        // Don't drift the estimate forward while paused. We don't track the
-        // exact pause moment, so just hold the start offset — better to show
-        // a stable value than a fictional growing time.
-        elapsed = Math.min(total, startOffset);
+        // Don't drift the estimate forward while paused — hold it where it
+        // stood when the pause arrived (frozen in updatePausedFreeze). The
+        // start offset is only the last resort, for a pause that predates
+        // this page load.
+        elapsed = Math.min(total,
+          pausedFreezeElapsed != null ? pausedFreezeElapsed : startOffset);
       } else {
         const startedMs = Date.parse(currentSnapshot.current_started_at);
         const wallElapsed = Math.max(0, (Date.now() - startedMs) / 1000);
@@ -1656,7 +1685,10 @@
       total = cur.duration_s;
       const startOffset = cur.start_s || 0;
       if (currentSnapshot.paused) {
-        elapsed = Math.min(total, startOffset);
+        // Same freeze as tickProgress — the seek modal must not claim a
+        // paused video is at its start offset either.
+        elapsed = Math.min(total,
+          pausedFreezeElapsed != null ? pausedFreezeElapsed : startOffset);
       } else {
         const startedMs = Date.parse(currentSnapshot.current_started_at);
         const wallElapsed = Math.max(0, (Date.now() - startedMs) / 1000);

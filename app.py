@@ -1062,7 +1062,42 @@ async def _lounge_pause() -> bool:
     elif getattr(mon, "screen_online", None) is False:
         reason = "SmartTube is not in the lounge"
     elif await mon.pause():
-        return True
+        # The cloud said 200; only the device's own Paused push proves anyone
+        # heard. `screen_online` cannot carry this alone: departures are only
+        # DISCOVERED at the next bind (~5 min apart), arrivals push instantly
+        # — so for up to five minutes after SmartTube silently drops out the
+        # flag still reads True, and a pause taken at the cloud's word in that
+        # window is the original production failure again (hit live from a
+        # phone, 2026-08-24 09:00, departure discovered at the 09:00:41 bind).
+        # A healthy SmartTube pushes the Paused transition in ~0.3s
+        # (measured); waiting for it costs one sub-second beat, and the
+        # keycode fallback is idempotent on an already-paused player, so a
+        # false negative here is a harmless duplicate rather than a wrong
+        # signal. Passive observation only — polling a possibly-backgrounded
+        # SmartTube auto-foregrounds it.
+        cur_at_entry = queue_controller.state.current
+        cur_vid = cur_at_entry.video_id if cur_at_entry else None
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + PAUSE_VERIFY_TIMEOUT
+        while loop.time() < deadline:
+            obs = mon.observation
+            # Invariant 4: Paused with a real position, about OUR video when
+            # we own one — a Paused ghost without current_time is the dormant
+            # cloud cache, not the device answering.
+            if (obs.state == "Paused" and obs.current_time is not None
+                    and (cur_vid is None or obs.video_id == cur_vid)):
+                return True
+            await asyncio.sleep(PAUSE_VERIFY_POLL)
+        if (queue_controller.has_pending_sends()
+                or queue_controller.state.current is not cur_at_entry):
+            # An add or advance landed inside the verify window; a late
+            # keycode would pause the video that launch is about to start.
+            log.info(
+                "Lounge pause was never confirmed, but a new launch is in "
+                "flight — standing down rather than pausing it"
+            )
+            return True
+        reason = "the Lounge pause was not confirmed"
     else:
         reason = "the Lounge pause was refused"
     if state.remote is None:
@@ -1113,6 +1148,14 @@ async def _foreground_blocks_media_key() -> Optional[str]:
 
 RESUME_VERIFY_TIMEOUT = 3.0
 RESUME_VERIFY_POLL = 0.2
+
+# How long a Lounge pause has to be CONFIRMED by the device's own Paused push
+# before the MEDIA_PAUSE keycode goes out instead. The healthy push arrives in
+# ~0.3s (measured); the window it closes is the stale-presence gap, where
+# SmartTube has silently left the lounge but the next bind (~5 min away) has
+# not yet discovered it and the cloud goes on answering 200 to nobody.
+PAUSE_VERIFY_TIMEOUT = 3.0
+PAUSE_VERIFY_POLL = 0.2
 
 
 async def _lounge_play() -> bool:
