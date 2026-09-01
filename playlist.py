@@ -108,6 +108,11 @@ def _blank_lounge() -> dict:
         "title": None,
         "channel": None,
         "thumbnail_url": None,
+        # Whether SmartTube is actually IN the lounge, carried on the frame
+        # itself. /api/status reports the same thing, but the page polls that
+        # only every 30s — far too stale to decide, frame by frame, whether a
+        # Paused reading is a live paused player or the dormant cloud ghost.
+        "screen_online": None,
     }
 
 
@@ -301,6 +306,12 @@ TIMER_LAUNCH_REARM = 8.0
 # gets skipped.
 LAUNCH_FAILURE_LIMIT = 3
 
+# How stale "we saw it move" may be before an add stops trusting that a
+# Playing frame describes a live player. A few refresh intervals: long enough
+# to ride out SmartTube going quiet between pushes, short enough that a session
+# left running yesterday is not something we queue behind.
+ADOPT_MOVING_WINDOW = 12.0
+
 
 @dataclass
 class QueueState:
@@ -328,6 +339,19 @@ class QueueState:
     # actual wake window.
     waking: bool = False
     lounge: dict = field(default_factory=_blank_lounge)
+    # Set only by the launch rescue, which is the one place that knows a video
+    # never played. `{"kind": "skipped"|"stalled", "title": str}`.
+    #
+    # Without it the rescue is invisible: the card just changes to the next
+    # item 45s later, so the guest who pasted a dead link sees their video
+    # replaced by someone else's with nothing to suggest the URL was the
+    # problem — and after LAUNCH_FAILURE_LIMIT in a row the page shows a full
+    # "Up next" list beside an empty card and no reason for the silence.
+    #
+    # Deliberately NOT a `reason=` threaded through `_advance`/`_end_current`:
+    # those are reached from ten call sites, and a future eleventh would
+    # default into whichever branch the frontend happened to have.
+    launch_notice: Optional[dict] = None
 
     def snapshot(self) -> dict:
         return {
@@ -341,6 +365,7 @@ class QueueState:
             "tv_on": self.tv_on,
             "waking": self.waking,
             "lounge": dict(self.lounge),
+            "launch_notice": dict(self.launch_notice) if self.launch_notice else None,
         }
 
 
@@ -378,6 +403,24 @@ class QueueController:
         # but kept generic so tests can stub them.
         self._cast_pause = pause_callable
         self._cast_play = play_button_callable
+        # Monotonic stamps of the last resume() and pause() presses. Read by
+        # the transport delivery in app.py to decide which press is NEWEST —
+        # the flags alone cannot say, because the lounge mirror also moves
+        # them and a mirror correction is not a change of mind. The mirror
+        # moves no stamp.
+        self.last_resume_at: float = 0.0
+        self.last_pause_at: float = 0.0
+        # The last Lounge frame that carried a video AND a position. The live
+        # `state.lounge` is overwritten by every event, including the empty
+        # frame a rebind's `lounge.connected` carries — and with the poll now
+        # running while paused, rebinds happen while paused. The paused timer
+        # branch judges "did it end?" from this when the live frame is blank.
+        self._last_populated_lounge: Optional[dict] = None
+        # When the armed duration timer is due (self._clock() units), stamped
+        # by _timer_body on entry. The kill-switch reads it: SmartTube leaving
+        # the foreground within KILL_SWITCH_END_GRACE of the timer coming due
+        # is the video ending on a stale anchor, not the user walking away.
+        self._timer_due_at: Optional[datetime] = None
         # Track in-flight TV-send tasks so callers (e.g. shutdown) can await them.
         self._send_tasks: set[asyncio.Task] = set()
         # Serializes /api/resume. Distinct from _lock because the resume path
@@ -388,6 +431,15 @@ class QueueController:
         # once. See _timer_body for why this, and not the Lounge position,
         # is what the kill-switch must trust about "did it finish".
         self._duration_elapsed = False
+        # The video whose position we have SEEN advance, and when. This is the
+        # only thing separating a live player from the cloud cache reporting a
+        # dormant one as Playing at a frozen position (invariant 4) — a
+        # distinction `add()` needs before it dares queue behind something
+        # rather than launch over it. A cache left by a previous session has
+        # never moved under us; a video genuinely playing has.
+        self._lounge_moving_vid: Optional[str] = None
+        self._lounge_moved_at: Optional[datetime] = None
+        self._lounge_last_ct: Optional[float] = None
         # Where the PLAYHEAD started, which is not the same question as when
         # the item became current — and `current_started_at` is the answer to
         # the second one. It is read by the kill-switch's start grace ("did we
@@ -422,6 +474,74 @@ class QueueController:
 
     # ── public API ───────────────────────────────────────────────────────────
 
+    def _adoptable_playback(self) -> Optional[QueueItem]:
+        """The video already playing on the TV, as an item we could own.
+
+        `add()` used to launch straight over it whenever the queue owned
+        nothing. That was deliberate — the cloud cache reports dormant players
+        as active for ever (invariant 4), and gating the add on it parked
+        fresh adds silently, which is worse — but from the sofa it means a
+        guest who can SEE a video playing adds one and watches theirs cut the
+        first one off. Reported as unacceptable, and it is.
+
+        Adopting needs POSITIVE evidence that a player is live, because
+        queueing behind a ghost is the parked-queue wedge:
+
+        * a real position, not just a video_id (invariant 4's rule);
+        * `Playing`, or `Paused` with SmartTube genuinely in the lounge — the
+          same discriminator the card and `/api/skip` use to tell a live
+          paused player from the cache's ghost;
+        * the TV on;
+        * and a usable DURATION. Without one there is no timer, so nothing
+          would ever hand off to the queued item — a livestream, which never
+          ends, correctly falls through to taking over.
+
+        Returns None when any of that is missing, and the old take-over
+        behaviour stands.
+        """
+        lng = self.state.lounge or {}
+        if self.state.tv_on is False:
+            return None
+        vid = lng.get("video_id")
+        ct = lng.get("current_time")
+        dur = lng.get("duration")
+        if not vid or ct is None or not lng.get("available"):
+            return None
+        if not dur or float(dur) <= 0:
+            return None
+        # We must have WATCHED this video's position advance. A stale cache
+        # reporting Playing at a frozen position is measured, not theoretical
+        # — `test_add_to_idle_starts_even_when_lounge_cache_reports_playing`
+        # exists because every "swap A->B" scenario in an early sweep failed
+        # that way — and queueing behind one parks the add for the rest of a
+        # video that is not running.
+        if self._lounge_moving_vid != vid or self._lounge_moved_at is None:
+            return None
+        state_ = lng.get("state")
+        if state_ == "Playing":
+            # ...and moved RECENTLY. A player gone quiet for longer than a few
+            # poll intervals is not one to queue behind.
+            try:
+                age = (self._clock() - self._lounge_moved_at).total_seconds()
+            except Exception:
+                return None
+            if age > ADOPT_MOVING_WINDOW:
+                return None
+        elif not (state_ == "Paused" and lng.get("screen_online") is True):
+            return None
+        # A Paused frame gets no recency test: a pause lasts as long as it
+        # lasts, and having watched it play before it stopped is the evidence
+        # that matters. `screen_online` is what rules out the ghost.
+        return make_item(
+            video_id=vid,
+            title=lng.get("title") or vid,
+            channel=lng.get("channel") or "",
+            duration_s=int(float(dur)),
+            is_live=False,
+            thumbnail_url=lng.get("thumbnail_url")
+            or f"https://i.ytimg.com/vi/{vid}/mqdefault.jpg",
+        )
+
     async def add(self, item: QueueItem) -> None:
         async with self._lock:
             # When our queue is idle (no current, not paused), an add
@@ -439,6 +559,12 @@ class QueueController:
                 self.state.current is None
                 and not self.state.paused
             )
+            # ...unless something is demonstrably playing that we simply do
+            # not own. Adopt it rather than launching over it, and let the
+            # ordinary duration timer hand off to this item when it ends.
+            adopted = self._adoptable_playback() if should_start else None
+            if adopted is not None:
+                should_start = False
             # Externally-paused replace: SmartTube is paused because
             # the user either backed out of the player (frontend has
             # faded the now-playing card) or paused via TV remote and
@@ -455,7 +581,44 @@ class QueueController:
                 and self.state.paused
                 and self.state.pause_source == "lounge"
             )
-            if should_start or replace_current:
+            # Whatever failed before, the viewer has moved on and asked for
+            # something else. Cleared for a queued add too, not just a starting
+            # one: if this video fails as well the rescue will say so again,
+            # and leaving the old message up puts it over a healthy card.
+            self.state.launch_notice = None
+            if adopted is not None:
+                lng = self.state.lounge or {}
+                position = float(lng.get("current_time") or 0.0)
+                self._begin_locked(adopted)
+                # It is already on screen, so the launch-failure rescue must
+                # not go looking for a launch that never happened.
+                self._playback_confirmed = True
+                # `_begin_locked` armed the timer for the whole length; this
+                # video is already part-way through it. Same arithmetic as the
+                # post-seek re-anchor.
+                remaining = max(0.0, float(adopted.duration_s) - position)
+                self._playhead_origin_at = self._clock() - timedelta(
+                    seconds=position
+                )
+                self._timer_gen += 1
+                _gen = self._timer_gen
+                self._timer_task = asyncio.create_task(
+                    self._timer_body(_gen, remaining)
+                )
+                # Mirror a pause we adopted, so the page and the transport
+                # buttons describe it honestly from the first frame.
+                if lng.get("state") == "Paused":
+                    self.state.paused = True
+                    self.state.pause_source = "lounge"
+                self.state.queue.append(item)
+                log.info(
+                    "Adopted %s (already playing at %.1fs of %s) and queued %s "
+                    "behind it rather than launching over it",
+                    adopted.video_id, position, adopted.duration_s,
+                    item.video_id,
+                )
+                event = "item_added"
+            elif should_start or replace_current:
                 self._begin_locked(item)
                 if replace_current:
                     self.state.paused = False
@@ -514,28 +677,46 @@ class QueueController:
     async def skip(self) -> None:
         """Advance to the next item, or idle if queue empty. Works even when paused."""
         await self._cancel_timer()
+        # Whatever the notice was about, the viewer has moved on from it.
+        self.state.launch_notice = None
         await self._advance(reason="skip")
 
     async def pause(self) -> None:
         """Pause the playlist (and the TV if Cast is available). Idempotent."""
-        # Send the Cast pause first, off the lock — it's network I/O.
-        if self._cast_pause is not None:
-            await self._cast_pause()
+        # Claim the pause and TELL THE PAGE first, then talk to the TV.
+        #
+        # The network call is not quick: `_lounge_pause` waits up to
+        # PAUSE_VERIFY_TIMEOUT for the device's own Paused push before falling
+        # back to the keycode, and when the TV does not volunteer one it spends
+        # the whole window — measured 3.04s against 0.23s on the trial before,
+        # which is why it feels random. Doing it first meant the page was told
+        # nothing for those seconds, so the progress bar carried on advancing
+        # over a frozen picture and resuming carried the error forward.
+        #
+        # Safe in the direction that matters: the viewer pressed Pause on OUR
+        # page, so the intent is not in doubt — the same reasoning that claims
+        # `pause_source = "ui"` below — and if the pause somehow never lands,
+        # `_sync_paused_from_lounge` clears the flag again on the next Playing
+        # frame.
+        self.last_pause_at = asyncio.get_running_loop().time()
         async with self._lock:
             # Idempotent on a UI pause only. SmartTube's Paused push can land
-            # on the subscribe stream while the pause command above is still
-            # in flight, and `_sync_paused_from_lounge` then records it as a
-            # TV-remote pause first — so returning on a bare `paused` here
-            # left the person who pressed Pause on our page recorded as
-            # "lounge", which unlocks the end-of-video advance, the timer's
-            # paused branch and add-while-paused replacing their video. They
-            # told us who paused; claim it.
+            # on the subscribe stream while the pause command is in flight, and
+            # `_sync_paused_from_lounge` then records it as a TV-remote pause
+            # first — so returning on a bare `paused` here left the person who
+            # pressed Pause on our page recorded as "lounge", which unlocks the
+            # end-of-video advance, the timer's paused branch and
+            # add-while-paused replacing their video. They told us who paused;
+            # claim it.
             if self.state.paused and self.state.pause_source == "ui":
                 return
             self.state.paused = True
             self.state.pause_source = "ui"
             snapshot = self.state.snapshot()
         await self._broadcaster.publish("paused_toggled", snapshot)
+        # Now the TV. Off the lock — it is network I/O.
+        if self._cast_pause is not None:
+            await self._cast_pause()
 
     async def resume(self) -> None:
         """Resume the playlist (and the TV if Cast is available). Idempotent.
@@ -548,10 +729,37 @@ class QueueController:
         # and then a further tv_play verify before deep-linking, a ~6s window
         # in which the UI leaves the Play button enabled. Two impatient
         # clicks meant two play signals for one video (invariant 1).
+        self.last_resume_at = asyncio.get_running_loop().time()
         async with self._resume_lock:
             async with self._lock:
+                # They did what the notice asked. Acknowledged before the
+                # idempotence check, so a second impatient press cannot leave
+                # the message standing.
+                self.state.launch_notice = None
                 if not self.state.paused and self.state.current is not None:
                     return
+                # Clear it and TELL THE PAGE first, for the in-place case —
+                # the mirror of the same fix in `pause()`. `_cast_play` spends
+                # up to RESUME_VERIFY_TIMEOUT confirming the device resumed
+                # and can then try tv_play, and for all of that the page still
+                # believed it was paused and held the bar still: measured six
+                # seconds after the press with the counter one second along,
+                # leaving it ~7s behind the picture and staying there.
+                #
+                # Only when we already own a paused item. Starting a QUEUED
+                # item stays after `_cast_play` below, because that ordering
+                # is what stops Play sending two play signals for one press.
+                # Self-correcting if the resume never lands:
+                # `_sync_paused_from_lounge` sets the flag again on the next
+                # Paused frame.
+                resuming_in_place = (self.state.paused
+                                     and self.state.current is not None)
+                if resuming_in_place:
+                    self.state.paused = False
+                    self.state.pause_source = None
+                    early_snapshot = self.state.snapshot()
+            if resuming_in_place:
+                await self._broadcaster.publish("paused_toggled", early_snapshot)
             if self._cast_play is not None:
                 await self._cast_play()
             await self._resume_locked()
@@ -580,6 +788,7 @@ class QueueController:
             if not self.state.queue:
                 return
             self.state.queue.clear()
+            self.state.launch_notice = None
             snapshot = self.state.snapshot()
         await self._broadcaster.publish("queue_cleared", snapshot)
 
@@ -834,7 +1043,25 @@ class QueueController:
         events also drive state-machine transitions (advance on FINISHED,
         mirror pause-state from Lounge play_state changes)."""
         async with self._lock:
+            # Has the playhead actually MOVED? Recorded before anything reads
+            # the frame; see `_lounge_moving_vid`.
+            _vid = observation.get("video_id")
+            _ct = observation.get("current_time")
+            if _vid != (self.state.lounge or {}).get("video_id"):
+                self._lounge_moving_vid = None
+                self._lounge_moved_at = None
+                self._lounge_last_ct = None
+            if _vid and _ct is not None:
+                if (self._lounge_last_ct is not None
+                        and float(_ct) != float(self._lounge_last_ct)):
+                    self._lounge_moving_vid = _vid
+                    self._lounge_moved_at = self._clock()
+                self._lounge_last_ct = float(_ct)
             self.state.lounge = dict(observation)
+            if _vid and _ct is not None:
+                # Kept apart from the live frame, which the next event —
+                # including a rebind's empty `lounge.connected` — overwrites.
+                self._last_populated_lounge = dict(observation)
             # Once we have seen our own item playing, it is not a failed
             # launch however it behaves afterwards.
             cur = self.state.current
@@ -850,6 +1077,18 @@ class QueueController:
                     # Something played, so the device is fine and whatever
                     # failed before it was about those videos, not the TV.
                     self._consecutive_launch_failures = 0
+            # ANY playback clears the notice, not just our own. It described
+            # the last thing that failed, and something is demonstrably
+            # playing now — so leaving it up prints "<title> didn't start"
+            # above a healthy card for a video the viewer started on the TV
+            # themselves. Outside the `cur` guard above on purpose: that guard
+            # is about whether OUR launch succeeded, which is a different
+            # question from whether the device is playing anything.
+            if (observation.get("available")
+                    and observation.get("video_id")
+                    and (observation.get("state") == "Playing"
+                         or (observation.get("current_time") or 0) > 0)):
+                self.state.launch_notice = None
             snapshot = self.state.snapshot()
 
         # Routine position updates — emit a lightweight snapshot, no state-machine action.
@@ -1314,6 +1553,24 @@ class QueueController:
             )
             await self._advance(reason="finished_at_killswitch")
             return
+        if self.state.queue and self._ending_on_a_stale_anchor():
+            # Neither finish signal is in yet — the timer is not due and the
+            # frame is blank — but the timer is about to come due, and a video
+            # ending a few seconds before a timer anchored to a lagging Lounge
+            # position is exactly what an ADOPTED item does on a deaf layer.
+            # Clearing here strands everything queued (measured, with the next
+            # video sitting in Up next). Leave the item to the timer: its
+            # foreground branch advances on `_duration_elapsed` moments from
+            # now, by the end-of-video path that already exists.
+            log.info(
+                "SmartTube left foreground %.1fs before the duration timer for "
+                "%s comes due — treating it as the video ending, not a "
+                "departure; leaving the timer to advance",
+                (self._timer_due_at - self._clock()).total_seconds()
+                if self._timer_due_at else 0.0,
+                self.state.current.video_id if self.state.current else None,
+            )
+            return
         await self._cancel_timer()
         async with self._lock:
             had_state = (
@@ -1344,6 +1601,36 @@ class QueueController:
         await self._broadcaster.publish("item_ended", snapshot)
 
     # ── internals ────────────────────────────────────────────────────────────
+
+    def _timer_about_to_fire(self) -> bool:
+        """Is the armed duration timer within KILL_SWITCH_END_GRACE of due?"""
+        t = self._timer_task
+        if t is None or t.done() or self._timer_due_at is None:
+            return False
+        remaining = (self._timer_due_at - self._clock()).total_seconds()
+        return -1.0 <= remaining <= self.KILL_SWITCH_END_GRACE
+
+    def _ending_on_a_stale_anchor(self) -> bool:
+        """SmartTube has left the foreground with neither finish signal in —
+        but the timer is about to come due and the live frame says NOTHING
+        about our video. That is a video ending a few seconds ahead of a
+        timer anchored to a lagging Lounge position (what an adopted item does
+        on a deaf layer), not a departure. Deliberately NOT when the frame
+        positively speaks: a populated frame with time remaining is a person
+        who was watching and left, and a deferring timer re-arms every few
+        seconds — without this clause it would look "about to fire" for ever
+        and the kill-switch could never clear for a real departure."""
+        if not self._timer_about_to_fire():
+            return False
+        cur = self.state.current
+        lng = self.state.lounge or {}
+        if cur is None:
+            return False
+        frame_speaks = bool(
+            lng.get("available") and lng.get("video_id") == cur.video_id
+            and lng.get("current_time") is not None
+        )
+        return not frame_speaks
 
     def _forget_current_locked(self) -> None:
         """Drop the current item AND everything scoped to it.
@@ -1412,8 +1699,48 @@ class QueueController:
     # exists precisely for "Lounge cannot be trusted here", never fires.
     MAX_LOUNGE_DEFERRALS = 12
 
+    # How stale a "time remaining" reading can be and still be explained by
+    # end-of-video lag rather than by a wrong scraped duration.
+    #
+    # Five refresh intervals — the same span STUCK_CT_POLL_THRESHOLD uses to
+    # call a position frozen — and comfortably over the ~9s lag measured at a
+    # real end of video (the frame said 10.0 of 19.0 for a clip whose media had
+    # already ended). Below this the remainder is probably an old frame; above
+    # it, Lounge is telling us about a video that genuinely has minutes left.
+    LOUNGE_STALENESS_BUDGET = 15.0
+
+    # How close to due the duration timer may be when SmartTube leaves the
+    # foreground for the kill-switch to read that as the video ENDING rather
+    # than the user leaving. Stranded on hardware 2026-08-31: an adopted
+    # video's timer was anchored to a Lounge frame that lags the real playhead
+    # by up to a rebind cadence on a deaf deep-link layer (~15s), so the video
+    # ended six seconds BEFORE its timer and the kill-switch cleared `current`
+    # with the next video still queued. A little over the staleness budget, to
+    # cover the anchor lag plus a poll interval. Accepted cost: someone who
+    # opens another app inside the last ~20s of a video with more queued gets
+    # the next video launched at them when the timer fires — the same trade
+    # the near-end position clause already makes over its last 5s.
+    KILL_SWITCH_END_GRACE = 20.0
+
+    # How soon to look again when the remainder is inside that budget. One
+    # refresh interval, so the next look sees a frame the poll has had a chance
+    # to replace. Sleeping `remaining + 5.0` there meant a frame that was
+    # ALREADY nine seconds stale bought another fourteen seconds of waiting —
+    # the measured dead air between two queued videos.
+    LOUNGE_SHORT_DEFER_RECHECK = 3.0
+
     async def _timer_body(self, gen: int, seconds: float,
-                          deferrals: int = 0) -> None:
+                          deferrals: int = 0, standoffs: int = 0) -> None:
+        # Two independent budgets, deliberately. `deferrals` bounds trusting a
+        # Lounge frame that keeps claiming time remains; `standoffs` bounds
+        # waiting for our OWN launch to finish. They were one counter, which
+        # was harmless while every deferral cost `remaining + 5.0` — but a
+        # short deferral now costs LOUNGE_SHORT_DEFER_RECHECK (3s), so a stale
+        # end-of-video frame could burn the whole budget in ~36s and leave the
+        # launch stand-off with nothing left to spend on the cold start it
+        # exists for. Sizing one budget by making the other cheaper is exactly
+        # the coupling TIMER_LAUNCH_REARM's own comment warns about.
+        self._timer_due_at = self._clock() + timedelta(seconds=seconds)
         try:
             await self._sleeper(seconds)
         except asyncio.CancelledError:
@@ -1482,9 +1809,18 @@ class QueueController:
                         return
                     self._timer_gen += 1
                     next_gen = self._timer_gen
+                    # Sleep the remainder when there genuinely is one; look
+                    # again promptly when the remainder is small enough to be
+                    # a stale end-of-video frame. Only the interval changes —
+                    # the decision to defer is exactly as it was.
+                    recheck = (
+                        self.LOUNGE_SHORT_DEFER_RECHECK
+                        if remaining <= self.LOUNGE_STALENESS_BUDGET
+                        else remaining + 5.0
+                    )
                     self._timer_task = asyncio.create_task(
-                        self._timer_body(next_gen, remaining + 5.0,
-                                         deferrals + 1)
+                        self._timer_body(next_gen, recheck,
+                                         deferrals + 1, standoffs)
                     )
                 return
             # Says what was OBSERVED, not what we are about to do. The
@@ -1515,11 +1851,11 @@ class QueueController:
         # stands off on these two exact conditions; the timer's identical
         # foreground decision had no equivalent.
         if self.has_pending_sends() or self.state.waking:
-            if deferrals >= self.MAX_LOUNGE_DEFERRALS:
+            if standoffs >= self.MAX_LOUNGE_DEFERRALS:
                 log.warning(
                     "Duration timer for %s has stood off %d times and a launch "
                     "is STILL in flight; proceeding rather than deferring for "
-                    "ever", current_video_id, deferrals,
+                    "ever", current_video_id, standoffs,
                 )
             else:
                 async with self._lock:
@@ -1539,7 +1875,7 @@ class QueueController:
                     next_gen = self._timer_gen
                     self._timer_task = asyncio.create_task(
                         self._timer_body(next_gen, TIMER_LAUNCH_REARM,
-                                         deferrals + 1)
+                                         deferrals, standoffs + 1)
                     )
                 return
 
@@ -1560,7 +1896,7 @@ class QueueController:
         # reports it identically to a video parked on its last frame), but the
         # person who pressed Pause in our own UI told us plainly.
         if self.state.paused and (self.state.pause_source == "ui"
-                                  or not self._lounge_says_finished()):
+                                  or not self._ended_even_on_a_stale_reading()):
             # Clear without advancing. NOTE what happens next, because it
             # surprises people and it is deliberate rather than a gap:
             # `current` goes None while the queue keeps its items, and
@@ -1706,6 +2042,70 @@ class QueueController:
             # lagging, not the video still running.
             return False
         return (float(dur) - float(ct)) > NEAR_END_SECONDS
+
+    def _ended_even_on_a_stale_reading(self) -> bool:
+        """Did the item reach its end, allowing for how stale the position is?
+
+        `_lounge_says_finished()` asks only where the playhead is, and that is
+        the one thing measurably unreliable at exactly this moment: SmartTube
+        stops pushing near the end and our poll is seconds apart. Reported from
+        real use — a 386s video played out and the last reading froze at 379.9,
+        six seconds short. NEAR_END_SECONDS is 5.0, so the position said "not
+        finished", the paused branch cleared `current` without advancing, and
+        the video the viewer had just queued sat in Up next with an empty Now
+        playing.
+
+        So a second piece of evidence, and the one that is NOT unreliable here:
+        the duration timer came due, meaning the item's whole nominal length
+        has passed. On its own that is too blunt — pausing does not cancel the
+        timer, so someone who paused half way through and walked away would
+        have the next video launched at them when it fired. Pairing it with
+        "and the playhead is at least NEAR the end" separates the two cases by
+        the thing that actually distinguishes them: six seconds short is a
+        stale reading, three minutes short is a person.
+
+        LOUNGE_STALENESS_BUDGET is the same allowance the duration timer uses
+        to decide whether a short remainder is end-of-video lag, and for the
+        same reason.
+        """
+        if self._lounge_says_finished():
+            return True
+        if not self._duration_elapsed:
+            return False
+        # The timer came due, so the nominal length has passed. Advance unless
+        # the position POSITIVELY contradicts that — note the burden is this
+        # way round on purpose. In the reported failure there was no position
+        # at all: the stuck-ct self-heal tore the session down two seconds
+        # earlier, which is the only reason the Lounge branch above stopped
+        # deferring and this branch ran at all. Requiring a near-end reading
+        # would have kept the queue stranded for exactly the same reason it
+        # was stranded before.
+        cur = self.state.current
+        lng = self.state.lounge or {}
+        if cur is None:
+            return False
+        if (not lng.get("available") or lng.get("video_id") != cur.video_id
+                or lng.get("current_time") is None):
+            # The LIVE frame has nothing to say about our video. Before
+            # accepting that as "nothing contradicts", ask the last frame that
+            # DID carry a position. `on_lounge_event` overwrites `state.lounge`
+            # with every event — including the empty frame a rebind's
+            # `lounge.connected` carries — and since the poll runs while
+            # paused (2026-08-31) a rebind lands every ~45s on a paused video.
+            # A timer firing inside that blank window read "no contradiction"
+            # and would have skipped a video someone paused half way through.
+            # The last populated frame said where they were; 30s from the end
+            # is a person, 6s from the end is a stale ending (the case this
+            # branch was written for, which still passes: that frame is near
+            # the end).
+            last = self._last_populated_lounge or {}
+            if last.get("video_id") != cur.video_id:
+                return True                  # genuinely nothing to contradict it
+            lng = last
+        ct, dur = lng.get("current_time"), lng.get("duration")
+        if ct is None or not dur or float(dur) <= 0:
+            return True
+        return (float(dur) - float(ct)) <= self.LOUNGE_STALENESS_BUDGET
 
     def _lounge_says_finished(self) -> bool:
         """Is the Lounge observation showing our item at its end?
@@ -2159,6 +2559,7 @@ class QueueController:
             if not self._launch_failed(observation):
                 return
             failed = self.state.current.video_id
+            failed_title = self.state.current.title
             has_next = bool(self.state.queue)
             self._consecutive_launch_failures += 1
         give_up = self._consecutive_launch_failures >= LAUNCH_FAILURE_LIMIT
@@ -2180,11 +2581,21 @@ class QueueController:
                 "rather than skipping through them; try again once it plays.",
                 self._consecutive_launch_failures, len(self.state.queue),
             )
+            # Set BEFORE the call: _advance and _end_current take their
+            # snapshot inside their own lock, so a notice written afterwards
+            # misses the published snapshot and surfaces on the next unrelated
+            # event instead.
+            self.state.launch_notice = {"kind": "stalled", "title": failed_title}
             await self._end_current(reason="device_plays_nothing")
             return
         if has_next:
+            self.state.launch_notice = {"kind": "skipped", "title": failed_title}
             await self._advance(reason="launch_never_started")
         else:
+            # Nothing to skip TO. The card is about to go empty and this is the
+            # only thing that will say why, so it must not claim a successor
+            # that does not exist.
+            self.state.launch_notice = {"kind": "dropped", "title": failed_title}
             await self._end_current(reason="launch_never_started")
 
     async def _anchor_timer_to_playback_start(

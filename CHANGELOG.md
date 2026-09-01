@@ -5,6 +5,208 @@ here matches a version on the [releases page](https://github.com/Alice-Sabrina-I
 
 ---
 
+## v1.04
+
+A reliability release. Every change below is something that used to go
+wrong while using the page — mostly around pause, play and seek, and around the hand-off from one
+queued video to the next — found over a day of hands-on testing and fixed. If you only read one
+line: pause, play and the skip buttons now do what you press, every time, and the next video in
+the queue starts when the current one ends.
+
+**The progress bar now stops the moment you press Pause, and picks up correctly when you resume.**
+It used to keep counting for a few seconds after you paused — the app was waiting for the TV to
+confirm, and said nothing until it did — and then came back several seconds out of step. It now
+stops immediately, holds the position you actually paused at rather than jumping back to the TV's
+last report, and carries on from there. Measured within about a second of the TV throughout.
+
+**Fast-forwarding to the end with the TV remote no longer strands the next video.** Skipping ahead
+with the physical remote to the last few seconds of a video left the queue stuck: the app was still
+waiting out the runtime the skip had removed, and the TV stopped reporting a position for it, so
+nothing told the app the video had finished. It now recognises a player that has gone away even when
+it never reports stopping, and moves on.
+
+**Pressing Play after a pause no longer makes the video stutter.** The app asked the TV to resume and
+then waited to be told it had — but it had stopped listening for that answer while paused, so when
+the TV was slow to volunteer it, the app assumed the resume had failed and relaunched the video,
+which restarted it. It now asks the TV directly instead of waiting, so Play resumes in place.
+
+**A video already playing when you open the page now shows up.** The app only heard about playback
+when it started, so anything already on the TV — because you opened the page late, or because the
+app restarted — stayed invisible until the TV happened to mention it. You could be looking at a
+paused video with the page insisting nothing was playing. It now asks the TV what is on screen as
+soon as it connects.
+
+**The page recovers if its live connection dies.** It reconnects a stream that has closed for good
+rather than sitting frozen on whatever it last drew, and re-syncs when you come back to a phone that
+had locked its screen.
+
+**Adding a video no longer cuts off one that is already playing.** If something was playing on the
+TV that you had not added through the page — you started it in SmartTube yourself, say — adding a
+video used to take over immediately and cut it off. It now takes the playing video as the current
+one and puts yours next, so the first one finishes and yours follows. If the app cannot actually
+tell that a video is playing (YouTube keeps reporting videos that stopped long ago), it still starts
+yours straight away rather than leaving it waiting behind something that is not running.
+
+**A video playing on the TV that you didn't add through the page now appears on it.** If someone
+started something from SmartTube directly, or paused it, the page said "Nothing playing" over a
+video that was plainly on screen — and greyed out Pause, Play, Skip and Seek, so there was no way to
+do anything about it from your phone. It now shows the video, keeps the controls live, and says
+"PAUSED ON TV" with the time held still when it is paused.
+
+**Seek buttons now do what you press.** Pressing the same skip button repeatedly did nothing after
+the first press, and pressing different ones quickly sent the video jumping back and forth between
+two points. Both had the same cause: each press worked out where to jump from YouTube's last report
+of the position, and that report does not update between quick presses — so every press started from
+the same stale place. Presses now build on each other until the TV actually reports back.
+
+**The next video no longer gets stranded when the current one ends a few seconds "early".** When
+the app had picked up a video already playing on the TV, its countdown was based on a position
+report that lags the real playhead — so the video could end a few seconds before the countdown, and
+the app read SmartTube dropping back to its home screen as you leaving, cleared the card, and left
+the next video sitting in Up next. SmartTube leaving within a few seconds of the countdown is now
+treated as the video ending, and the next one starts.
+
+**Resuming — from the page or the TV remote — no longer leaves the page stuck on "paused".** Two
+causes. Pressing Play on the page for a video the app did not start itself resumed the TV
+correctly but never updated the page, which kept showing PAUSED ON TV; the page now reflects the
+command it just sent. And a resume made with the TV remote could go unnoticed for up to five
+minutes, because the app stopped asking the TV for its state while paused; it now keeps asking,
+so a remote resume shows up within about a minute even when SmartTube is not volunteering it.
+
+**Pausing with the TV remote no longer makes the video vanish from the page.** After about
+fifteen seconds paused, the page used to hide the Now playing card — it could not tell a pause on
+the remote from you backing out of the player, and chose to hide. The card now stays, marked
+"PAUSED ON TV", for as long as the video is paused; if you really did back out, Play resumes where
+you were and Skip clears it.
+
+**Video titles, uploaders and lengths keep working when YouTube gets suspicious.** YouTube
+sometimes answers the page the app reads video details from with a "sign in to confirm you're not
+a bot" version that carries none — after that, every added video showed its raw ID instead of its
+name, "unknown" as the uploader, and a made-up 10:00 length in the queue (a length that also
+drives auto-advance). The app now falls back to YouTube's search results for the same video,
+which still serve the title, uploader and real length, and to a lighter title-only endpoint after
+that.
+
+**A video that had just started can no longer be mistaken for one that ended.** For its first
+seconds a freshly launched video may report no playback position at all, and the safety net that
+detects a vanished player could read that as the video being gone and skip ahead. It now only
+treats a missing position as a vanished player when the TV does not claim to be playing.
+
+**Pausing and then resuming no longer restarts the video.** When YouTube's channel could not
+confirm a pause, the app paused the TV with a remote-control keycode instead — but Play still asked
+YouTube to resume, waited seconds for an answer that channel could not give, and then relaunched
+the video from the beginning. Play now resumes the same way Pause paused: immediately, in place.
+
+**Rapid pause/play presses no longer leave the page and the TV disagreeing.** Pressing one while
+the other was still being delivered could land the two commands on the TV a millisecond apart — the
+video restarting while the page said paused. Whichever you pressed last now wins, and the older
+in-flight command stands down. Commands are also delivered one at a time now, and a report that
+predates your press no longer counts as the TV answering it — toggling pause and play faster than
+the TV reports back used to produce a pause that silently did nothing, and then a play that
+restarted the video from scratch.
+
+**Skipping around while paused now steps properly, and a skip press after resuming no longer
+rewinds the video.** Seeking with more than a few seconds between presses could jump to the same
+spot every time instead of moving further, and a skip pressed shortly after resuming from a pause
+could throw the video back more than a minute. Both came from trusting a position report that was
+out of date — one the TV had no way of updating while paused, or one it sent just after resuming
+that still described where it had been. Presses now keep building on each other until the TV
+reports something that can actually be true.
+
+**The skip buttons work right after a video starts.** For the first stretch of a freshly started
+video the TV may not have volunteered a playback position yet, and a skip press was refused with
+"no current playback position". The app now asks for the position instead of waiting to be told.
+
+**Seeking no longer occasionally answers "Lounge not connected."** The app's link to YouTube
+recycles routinely — YouTube itself closes it every few minutes, and the app rebuilds it far more
+often than that while a video is playing, because rebuilding is how it keeps the position fresh.
+Each rebuild leaves a gap of about a fifth of a second, and a seek that happened to arrive inside
+one was refused with an error toast for a link that was already back by the time you read it. Seeks
+now wait out the blip and go through.
+
+**A video could finish and leave the next one stuck in Up next.** If the last position report before
+a video ended was a few seconds short of the end — which it often is, because the TV stops sending
+updates near the end — the app decided the video had not finished, cleared the Now playing card and
+stopped, with the queue still full. It now also trusts the video's own length having run out, while
+still leaving alone a video you paused and walked away from.
+
+**Waking a sleeping device is about ten seconds faster.** The app waited a fixed sixteen seconds
+after sending the wake command before starting the video — a number that had never actually been
+tested against a failure. It has now: on the reference device, five out of five cold starts played
+just as reliably at six seconds as at sixteen, and the device reports itself awake in well under a
+second every time. Most of that wait was doing nothing. There is still a floor, and it is now
+measured from the moment the device reports itself awake rather than from when the command was sent,
+so a device that answers slowly still gets its full settling time. If you have hardware that needs
+longer, `WAKE_DELAY` is still yours to raise.
+
+**Pressing Play no longer restarts a long video from the beginning.** If you paused, backed out of
+the player, and came back, the app had to relaunch the video — and relaunched it from the start,
+because the only position it passed along was the one from the original link. It now resumes where
+you actually paused.
+
+**The link to YouTube recovers itself if it goes quiet.** There was a state it could not get out of:
+the connection stays open, YouTube stops sending anything, and nothing in the app was in a position
+to notice — playback position stayed blank and pause and seek stayed unavailable until the container
+was restarted. The app now stops believing in a connection that has delivered nothing for several
+minutes and rebuilds it. (The approach is borrowed from a Rust client for the same protocol.)
+
+**A video added while the device was asleep sometimes never played.** Found the cause, and it was
+not what it looked like. If you put the device to sleep part-way through a video, YouTube's servers
+carry on reporting that video as still playing — sometimes with the position still ticking up, on a
+device that is switched off. The app believed it, decided SmartTube must have a player running, and
+handed the new video straight to it. YouTube accepted that and it reached nothing: no video started,
+the page showed it playing anyway, and about forty seconds later it quietly disappeared. The app now
+takes the view that a device it has only just woken cannot have anything playing, whatever the
+servers claim, and starts the video the way it starts one on a cold TV — which works. As a
+side-effect this also made waking-and-playing about three seconds quicker, because the app no longer
+waits on the servers before giving up on them.
+
+**A queued video could fail to start when the one before it ended.** The same false "still playing"
+report, arriving at a different moment. When a video finishes, YouTube's report of where it was can
+be several seconds out of date, so the app would try to slide the next video into a player that had
+already closed — accepted, and silently did nothing. The app now asks where playback actually is
+before deciding, and when it cannot get a straight answer it starts the next video the way it starts
+one on a sleeping TV.
+
+**Up to nine seconds of dead air between queued videos.** Measured: a video's picture and sound
+genuinely ended, and the next one did not begin for another nine seconds, with SmartTube's home
+screen in between. The app was waiting on a stale report and then sleeping for as long as that
+report claimed was left — compounding an error rather than re-checking it. It now looks again after
+three seconds when the remaining time is short enough to be a stale reading. Videos whose length was
+genuinely mis-read are unaffected.
+
+**A video that never starts now says so.** A link that cannot play — deleted, private,
+region-blocked, or just mistyped — has always been skipped after about 45 seconds so it does not
+hold the queue. But it happened in silence: whoever pasted it watched their video get replaced by
+someone else's with nothing to suggest the URL was the problem. The now-playing card now says which
+video was dropped. If several in a row fail to start, it says that instead, and the queue is left
+alone rather than marched through — that is usually the device, not the videos.
+
+**A rejected paste no longer costs you ten seconds.** Paste a playlist link, a channel link, or a
+typo, and the app refuses it — but it also used to start your ten-second cooldown, so the corrected
+paste came straight back with "too many requests" from a service that had done nothing for you. The
+cooldown is now spent only by a video the app actually accepts.
+
+**Seek no longer tells you to go and fix your TV when nothing is wrong.** SmartTube's link to
+YouTube drops out for up to a minute or so at a time, several times an hour, entirely normally.
+Seeking genuinely cannot work during those gaps and is still refused — but it used to answer with
+instructions to go and toggle a setting on your TV, for a fault that fixes itself within the minute.
+It now says the link is recycling and to try again shortly, and keeps the TV instructions for a
+connection that has genuinely stayed down.
+
+**The progress bar no longer runs ahead of a video that hasn't started.** On a sleeping device the
+card would give up waiting part-way through the wake, and start showing a progress bar climbing from
+sixteen seconds for a video whose first frame was still several seconds away.
+
+**Not a change, but worth knowing: SmartTube itself sometimes returns to the Google TV home screen
+when a video ends.** Measured while investigating the above — the app sent nothing at all in the
+twenty seconds before it happened. SmartTube backgrounds itself and then reopens on its own browse
+screen; whatever was behind it shows through for about a quarter of a second in between. If a video
+is queued behind, the app brings SmartTube straight back and you will not notice. That is
+SmartTube's own behaviour and this app can neither cause nor prevent it.
+
+---
+
 ## v1.03
 
 **Pause did nothing, or a video vanished from the page while it kept playing.** SmartTube's
