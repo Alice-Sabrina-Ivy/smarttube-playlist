@@ -485,6 +485,18 @@
     border-color: rgba(184, 122, 0, 0.3);
   }
 
+  .now-notice {
+    color: var(--phos-bright);
+    font-size: 0.85rem;
+    text-align: center;
+    padding: 0.7rem 0.5rem 0.2rem;
+    letter-spacing: 0.03em;
+  }
+  /* One video skipped is a recovery and reads as information. Several in a
+     row means the queue has stopped and somebody has to act, so it gets the
+     alarm colour. */
+  .now-notice.stalled { color: var(--warn); }
+
   .empty {
     color: var(--phos-dim);
     font-size: 0.85rem;
@@ -692,6 +704,7 @@
   <!-- ── Now playing ──────────────────────────────────────────────────── -->
   <section id="card-now" class="card" hidden>
     <h2 class="card-title">▌ Now playing</h2>
+    <div id="now-notice" class="now-notice" hidden></div>
     <div id="now-empty" class="empty">— Nothing playing —</div>
     <div id="now-body" class="now-playing" hidden>
       <div class="thumb"><img id="np-thumb" alt=""></div>
@@ -828,7 +841,7 @@
     </div>
   </section>
 
-  <footer>SmartTube Playlist · <span id="app-version">v1.03</span> · <a href="https://opensource.org/licenses/MIT" target="_blank" rel="noopener noreferrer">MIT</a> · <a href="https://github.com/Alice-Sabrina-Ivy" target="_blank" rel="noopener noreferrer">Alice Sabrina Ivy</a></footer>
+  <footer>SmartTube Playlist · <span id="app-version">v1.04</span> · <a href="https://opensource.org/licenses/MIT" target="_blank" rel="noopener noreferrer">MIT</a> · <a href="https://github.com/Alice-Sabrina-Ivy" target="_blank" rel="noopener noreferrer">Alice Sabrina Ivy</a></footer>
 </div>
 
 <!-- ── Seek modal (opens via the "Seek" button on the now-playing card) ── -->
@@ -1020,20 +1033,12 @@
   let loadingFallbackTimer = null;  // setTimeout id for STARTING-grace re-render
 
   // Frozen-Paused tracking — used to hide the now-playing card when
-  // SmartTube's player has been torn down (user pressed BACK to exit
-  // the player view) but Lounge keeps reporting the last-played video
-  // as state=Paused indefinitely. Lounge protocol can't distinguish
-  // "user backed out of player" from "user pressed pause on remote",
-  // so we use a time-based heuristic: if Lounge reports Paused with
-  // a frozen current_time for PAUSED_HIDE_SECONDS, hide the card.
-  //
-  // FRONTEND-ONLY fade: backend state.current stays populated. If the
-  // user pauses via TV remote and walks away >15s, the card disappears
-  // but pressing the UI's Resume button still works to relaunch.
-  const PAUSED_HIDE_SECONDS = 15;
-  let pausedExternallySince = null;  // wall-clock ms when Lounge first reported the current frozen Paused frame
-  let pausedExternallyCt = null;     // current_time we saw at that moment
-  let pausedFadeTimer = null;        // setTimeout id for fade-boundary re-render
+  // A paused card is never hidden on a timer. Lounge cannot distinguish "the
+  // user backed out of the player" from "the user pressed pause on the
+  // remote" — both leave a frozen Paused frame — and a 15s fade that hid the
+  // card on that frame fired on every deliberate remote pause too. The card
+  // stays, badged PAUSED ON TV; a torn-down player is recovered by Play
+  // (verify fails, relaunch with position) or Skip.
 
   // Where the wall-clock estimate stood when the pause arrived. Without a
   // Lounge anchor the paused branches below used to show the START offset —
@@ -1041,16 +1046,63 @@
   // the exact pause moment was "not tracked". It is trackable: freeze the
   // estimate at the paused transition and hold that.
   let pausedFreezeElapsed = null;
+  // The elapsed value the ticker last drew. It is the best estimate we have:
+  // interpolated forward from the last real position, and measured within ~1s
+  // of the device. Freezing to THIS on pause, rather than snapping back to the
+  // raw Lounge anchor, is what keeps the bar where the picture is.
+  let lastShownElapsed = null;
+
+  // When the wake window ENDED, in wall-clock ms. The STARTING grace is
+  // measured from `current_started_at`, which is stamped when the item became
+  // current — before the wake key even goes out. So on a cold add the whole
+  // grace was spent waiting for the device to boot: the moment `waking`
+  // cleared, the grace had already expired, the wall-clock ticker took over,
+  // and the card showed a progress bar climbing from 0:16 for a video whose
+  // first frame was still seconds away. The launch has only just been sent at
+  // that point, so the grace should start there.
+  let wakeEndedAt = null;
+  let lastWakingFlag = false;
+  let wakeLatchItemId = null;
+
+  function updateWakeLatch(state) {
+    const curId = state.current ? state.current.id : null;
+    if (curId !== wakeLatchItemId) {
+      wakeLatchItemId = curId;
+      wakeEndedAt = null;          // a new item gets its own clock
+    }
+    const nowWaking = state.waking === true;
+    if (lastWakingFlag && !nowWaking && state.current) {
+      wakeEndedAt = Date.now();
+    }
+    lastWakingFlag = nowWaking;
+  }
 
   function updatePausedFreeze(prev, state) {
-    if (!state.paused || !state.current) {
+    // Reads `playbackIsPaused`, not `state.paused`: for playback we do not own
+    // that flag is structurally false, and the card renders those now.
+    if (!playbackIsPaused(state)) {
       pausedFreezeElapsed = null;
       return;
     }
-    const itemChanged = !prev || !prev.current
-      || prev.current.id !== state.current.id;
-    if ((prev && prev.paused) && !itemChanged) return;   // already frozen
+    const idOf = (sn) => sn && (sn.current ? sn.current.id
+                                           : (sn.lounge || {}).video_id);
+    const itemChanged = idOf(prev) !== idOf(state);
+    const wasPaused = !!(prev && playbackIsPaused(prev));
+    if (wasPaused && !itemChanged) return;               // already frozen
+    // The displayed estimate belonged to the PREVIOUS video; a handoff that
+    // lands paused (add-while-paused replace, adopted paused playback) must
+    // not freeze the new card at the old video's position.
+    if (itemChanged) lastShownElapsed = null;
+    // Hold the estimate we were DISPLAYING. The Lounge position is stale by
+    // however long it has been since the device last pushed — measured 8.5s
+    // at a pause — so freezing to it made the bar jump BACKWARDS and then sit
+    // that far behind the picture for the rest of the video.
+    if (lastShownElapsed != null) {
+      pausedFreezeElapsed = lastShownElapsed;
+      return;
+    }
     const cur = state.current;
+    if (!cur) { pausedFreezeElapsed = null; return; }
     const startOffset = cur.start_s || 0;
     if (state.current_started_at && cur.duration_s != null) {
       const startedMs = Date.parse(state.current_started_at);
@@ -1061,7 +1113,61 @@
     }
   }
 
+  // Is Lounge showing us a video on the screen that our queue does not own?
+  //
+  // "Playing" was the whole test until 2026-08-31, and it meant that pausing
+  // something started from the TV's own remote — or just opening this page
+  // while a paused video sat on screen — emptied the now-playing card AND
+  // disabled Pause, Play, Skip and Seek, since they all gate on hasPlayback.
+  // The page said "Nothing playing" and offered no way to deal with what the
+  // viewer was looking at. Reported from the sofa.
+  //
+  // The reason for demanding "Playing" was sound and is kept: the Lounge cloud
+  // cache reports DORMANT players as Paused indefinitely (invariant 4), so a
+  // paused frame alone is not evidence of anything, and rendering it would
+  // offer a Play button for a video that is not on screen. What is new is
+  // `screen_online` — added in v1.03, after this test was written — which says
+  // whether SmartTube is actually IN the lounge. A paused frame from a TV that
+  // is on, with a real position, and with SmartTube genuinely present, is a
+  // live paused player. The ghost case is an absent screen, and still shows
+  // nothing.
+  // Is what is on the screen paused right now?
+  //
+  // For an item WE own, the backend flag is authoritative and Lounge is only
+  // evidence — Lounge lags our own pause/resume by 1-3s and the bar must not
+  // tick or freeze during that gap. For playback we do NOT own, that flag is
+  // not about it at all: it stays false while the TV sits paused, so the bar
+  // drifted forward over a frozen picture. There is no UI round trip to lag
+  // behind there, so Lounge is the only evidence there is.
+  function playbackIsPaused(state) {
+    if (state.current) return state.paused === true;
+    return (state.lounge || {}).state === "Paused";
+  }
+
+  function loungeShowsPlayback(state) {
+    const lng = state.lounge || {};
+    const usable = state.tv_on !== false
+      && lng.available && !!lng.video_id && lng.current_time != null;
+    if (!usable) return false;
+    if (lng.state === "Playing") return true;
+    // From the FRAME, not from lastStatus: the status poll is 30s apart, so
+    // reading it here left the card hidden for up to half a minute after a
+    // pause. Caught by the walkthrough's unowned-playback scenario the first
+    // time it ran.
+    return lng.state === "Paused" && lng.screen_online === true;
+  }
+
   function renderState(state) {
+    updateWakeLatch(state);
+    // Coming OUT of a pause: carry on from the value we held, not from the
+    // Lounge anchor. That anchor is the position the device last pushed —
+    // stale by however long it had gone quiet — so resuming from it left the
+    // bar sitting that far behind the picture for the rest of the video.
+    // Re-anchoring locally is the same thing a seek does with its own target.
+    if (currentSnapshot && playbackIsPaused(currentSnapshot)
+        && !playbackIsPaused(state) && pausedFreezeElapsed != null) {
+      nudgeLocalPosition(pausedFreezeElapsed);
+    }
     updatePausedFreeze(currentSnapshot, state);
     currentSnapshot = state;
     syncLoungePosition(state);
@@ -1145,32 +1251,6 @@
       lastCastSync = null;
     }
 
-    // Track frozen-Paused state for the BACK-out-of-player heuristic.
-    // We count it as "externally paused" (eligible to fade) when:
-    //   - Backend agrees the queue is paused (state.paused === true)
-    //   - Lounge sees Paused with a video_id
-    //   - EITHER pause_source !== 'ui' (Lounge-mirrored: TV remote
-    //     pause OR BACK-out-of-player)
-    //   - OR lng.current_time === null (player torn down — Lounge has
-    //     dropped ct/duration even though state.pause_source was "ui"
-    //     from an earlier UI pause; the user must have BACK'd out
-    //     after pausing, so the card should still fade).
-    // The state.paused === true gate keeps the fade off freshly-
-    // resumed cards while Lounge is still sticky at Paused.
-    const externalPause = lng.available && !!lng.video_id
-      && lng.state === "Paused" && state.paused === true
-      && (state.pause_source !== "ui" || lng.current_time === null);
-    if (externalPause) {
-      // If ct changed (player still active, just slow to update) reset
-      // the timer. Frozen ct means the player is dormant.
-      if (pausedExternallySince === null || lng.current_time !== pausedExternallyCt) {
-        pausedExternallySince = Date.now();
-        pausedExternallyCt = lng.current_time;
-      }
-    } else {
-      pausedExternallySince = null;
-      pausedExternallyCt = null;
-    }
   }
 
   function renderNowPlaying(state) {
@@ -1196,45 +1276,60 @@
     // on a video that isn't actively running. (When state.current is
     // set, we trust ours and render the queue item regardless of
     // Lounge state — that's the queued-by-us path.)
-    const loungeActive = state.tv_on !== false
-      && lng.available && !!lng.video_id
-      && lng.current_time != null
-      && lng.state === "Playing";
+    const loungeActive = loungeShowsPlayback(state);
     const empty = $("now-empty");
     const body = $("now-body");
 
-    // BACK-out-of-player fade: SmartTube doesn't give us a clean signal
-    // when the user exits the player view but stays in the app, so if
-    // Lounge has been reporting frozen-Paused for long enough we assume
-    // the player closed and hide the card. Backend state.current stays
-    // set — Resume button still works to relaunch.
-    const pausedFrozenMs = pausedExternallySince !== null
-      ? Date.now() - pausedExternallySince : 0;
-    const fadedExternalPause = pausedExternallySince !== null
-      && pausedFrozenMs >= PAUSED_HIDE_SECONDS * 1000;
+    // A launch the backend gave up on. Without this the rescue is silent: the
+    // card just changes to the next item ~45s later, so whoever pasted a dead
+    // link watches their video get replaced by someone else's with nothing to
+    // suggest the URL was the problem. Backend-driven and backend-cleared —
+    // the frontend classifies nothing, so a future notice kind cannot land in
+    // whichever branch this happens to have.
+    const notice = $("now-notice");
+    const ln = state.launch_notice;
+    if (ln && ln.kind === "skipped") {
+      notice.textContent = `${ln.title || "That video"} didn't start — skipped to the next one.`;
+      notice.classList.remove("stalled");
+      notice.hidden = false;
+    } else if (ln && ln.kind === "dropped") {
+      notice.textContent = `${ln.title || "That video"} didn't start — nothing else was queued.`;
+      notice.classList.remove("stalled");
+      notice.hidden = false;
+    } else if (ln && ln.kind === "stalled") {
+      notice.textContent =
+        "Several videos in a row didn't start. The queue is still here — press Play to try again.";
+      notice.classList.add("stalled");
+      notice.hidden = false;
+    } else {
+      notice.hidden = true;
+    }
 
-    if ((!cur && !loungeActive) || fadedExternalPause) {
+    // No fade on a paused card any more. There used to be a 15s heuristic
+    // here hiding the card on a frozen Paused frame, to cover the user
+    // backing out of the player (indistinguishable over Lounge from a remote
+    // pause). It fired on every deliberate remote pause too — reported as the
+    // video disappearing from the page — and a lingering card for a
+    // torn-down player is the lesser harm: Play relaunches with the position,
+    // Skip clears it. The card shows PAUSED ON TV instead (see updateProgress).
+    if (!cur && !loungeActive) {
+      // Say WHY nothing is playing when the reason is that we are holding the
+      // queue. Pause with nothing current is a deliberate hold — add now, play
+      // when you are ready, pinned by test_add_while_paused_then_resume_starts
+      // — but the card said only "Nothing playing" while items sat in Up next,
+      // so it read as the app having silently swallowed them. That is the
+      // documented wedge symptom ("add another video, nothing happens; only
+      // resume recovers it, which no user would guess") arrived at from the
+      // one direction where the behaviour is correct and only the silence is
+      // wrong.
+      const held = state.paused && !cur && (state.queue || []).length > 0;
+      empty.textContent = held
+        ? "— Paused — press Play to start the queue —"
+        : "— Nothing playing —";
       empty.hidden = false;
       body.hidden = true;
       stopProgressTicker();
-      if (pausedFadeTimer) { clearTimeout(pausedFadeTimer); pausedFadeTimer = null; }
       return;
-    }
-
-    // While we're counting toward the fade, schedule a re-render at the
-    // boundary so the card disappears even if no new SSE event arrives.
-    if (pausedExternallySince !== null) {
-      const remainingMs = Math.max(
-        0, PAUSED_HIDE_SECONDS * 1000 - pausedFrozenMs + 100,
-      );
-      if (pausedFadeTimer) clearTimeout(pausedFadeTimer);
-      pausedFadeTimer = setTimeout(() => {
-        pausedFadeTimer = null;
-        if (currentSnapshot) renderState(currentSnapshot);
-      }, remainingMs);
-    } else if (pausedFadeTimer) {
-      clearTimeout(pausedFadeTimer);
-      pausedFadeTimer = null;
     }
 
     empty.hidden = true;
@@ -1306,8 +1401,11 @@
       && lastStatus.lounge_screen_online !== false);
     const startedAt = state.current_started_at
         ? new Date(state.current_started_at).getTime() : 0;
-    const elapsedSinceStart = startedAt
-        ? Math.max(0, (Date.now() - startedAt) / 1000) : Infinity;
+    // Measure the grace from whichever came later: the item becoming current,
+    // or the wake finishing. On a warm add they are the same moment.
+    const graceOrigin = Math.max(startedAt, wakeEndedAt || 0);
+    const elapsedSinceStart = graceOrigin
+        ? Math.max(0, (Date.now() - graceOrigin) / 1000) : Infinity;
     const isLoading = !isWaking && !!cur
         && loungeIsExpected && !loungeConfirmsCurrent
         && elapsedSinceStart < STARTING_GRACE_SECONDS;
@@ -1337,9 +1435,9 @@
       // STARTING badge clears even without a new state event. The
       // deep-link Intent path doesn't propagate to Lounge, so we
       // can't rely on a Lounge update to trigger re-rendering.
-      if (isLoading && currentSnapshot && startedAt > 0) {
+      if (isLoading && currentSnapshot && graceOrigin > 0) {
         const remainingMs = Math.max(
-          0, STARTING_GRACE_SECONDS * 1000 - (Date.now() - startedAt) + 100,
+          0, STARTING_GRACE_SECONDS * 1000 - (Date.now() - graceOrigin) + 100,
         );
         if (loadingFallbackTimer) clearTimeout(loadingFallbackTimer);
         loadingFallbackTimer = setTimeout(() => {
@@ -1377,10 +1475,12 @@
       // resume drifting even if Lounge's playerState is still showing
       // PAUSED for a tick.
       total = lastCastSync.duration;
-      const isPlaying = !currentSnapshot.paused
+      const isPlaying = !playbackIsPaused(currentSnapshot)
         && lastCastSync.playerState !== "OTHER";
       const drift = isPlaying ? (Date.now() - lastCastSync.stampedAt) / 1000 : 0;
-      elapsed = Math.min(total, lastCastSync.currentTime + drift);
+      elapsed = (!isPlaying && pausedFreezeElapsed != null)
+        ? Math.min(total, pausedFreezeElapsed)
+        : Math.min(total, lastCastSync.currentTime + drift);
     } else if (cur && cur.duration_s != null && currentSnapshot.current_started_at) {
       // Fallback: started_at + scraped duration (the v1 behavior, drifts on
       // pause/seek). Account for cur.start_s so videos added with a `&t=`
@@ -1406,7 +1506,21 @@
     const pct = Math.min(100, (elapsed / total) * 100);
     $("np-progress").querySelector(".bar").style.width = pct + "%";
     $("np-elapsed").textContent = fmtDuration(elapsed);
-    $("np-remaining").textContent = fmtDuration(Math.max(0, total - elapsed)) + " left";
+    lastShownElapsed = elapsed;
+    const remainingText = fmtDuration(Math.max(0, total - elapsed)) + " left";
+    // Paused on the TV — a video we do not own, or ours paused with the
+    // remote (any pause that did not come from our page). Without this the
+    // card is indistinguishable from one that is playing — the bar simply
+    // stops, which reads as the page having frozen rather than the video
+    // having paused. This badge replaced the 15s fade that used to hide the
+    // card instead.
+    if (playbackIsPaused(currentSnapshot)
+        && (!cur || currentSnapshot.pause_source !== "ui")) {
+      $("np-remaining").innerHTML =
+        '<span class="waking-badge">❚❚ PAUSED ON TV</span>';
+    } else {
+      $("np-remaining").textContent = remainingText;
+    }
   }
 
   function startProgressTicker() {
@@ -1507,13 +1621,22 @@
     // on a video that isn't actively running. (When state.current is
     // set, we trust ours and render the queue item regardless of
     // Lounge state — that's the queued-by-us path.)
-    const loungeActive = state.tv_on !== false
-      && lng.available && !!lng.video_id
-      && lng.current_time != null
-      && lng.state === "Playing";
+    const loungeActive = loungeShowsPlayback(state);
     const hasPlayback = hasCurrent || loungeActive;
-    $("btn-pause").disabled = !hasPlayback || isPaused;
-    $("btn-play").disabled = !(isPaused || (!hasCurrent && hasQueue));
+    // Play has to carry the unowned case too, and `isPaused` cannot: that
+    // reads the BACKEND flag, which is structurally false for playback we do
+    // not own — `_sync_paused_from_lounge` returns when `current` is None, so
+    // nothing ever sets it. Enabling Pause and Skip for that card without
+    // this left the exact controls inverted: a live Pause on an
+    // already-paused video, and the one button that would resume it greyed
+    // out. Safe on the backend — `resume()` does not short-circuit with
+    // `current` None, and `_lounge_play` resumes in place; the tv_play branch
+    // that could be a second play signal needs `cur`, so invariant 1 holds.
+    const loungePausedUnowned = !hasCurrent && loungeActive
+      && playbackIsPaused(state);
+    $("btn-pause").disabled = !hasPlayback || isPaused || loungePausedUnowned;
+    $("btn-play").disabled =
+      !(isPaused || (!hasCurrent && hasQueue) || loungePausedUnowned);
     // hasPlayback, not hasCurrent: the now-playing card renders from the
     // Lounge observation too (a video started on the TV, or one we ceded via
     // the external-switch logic), and Skip must be live whenever that card is
@@ -1543,12 +1666,34 @@
       } catch {}
     };
     sse.onerror = () => {
-      // EventSource auto-reconnects; just dim the indicator briefly.
+      // EventSource retries ordinary network blips by itself, but once it
+      // reaches CLOSED it stops for good — and `if (sse) return` above means
+      // nothing would ever build another one. The page then sits frozen on
+      // whatever it last drew, which reads as the app being wrong about the
+      // TV rather than as a dead connection: a video paused on screen while
+      // the page still says "Nothing playing" from minutes ago.
       const pulse = $("status-pulse");
       pulse.classList.add("warn");
+      if (sse && sse.readyState === EventSource.CLOSED) {
+        sse = null;
+        setTimeout(ensureSSE, 2000);
+      }
       setTimeout(() => refreshStatus(), 2000);
     };
   }
+
+  // Coming back to a phone that locked its screen. Browsers suspend a
+  // backgrounded tab and may drop the stream without a usable error, so the
+  // first thing the viewer sees can be a snapshot from before they put the
+  // phone down. Re-fetch the truth and make sure the stream is alive.
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState !== "visible") return;
+    ensureSSE();
+    refreshStatus();
+    api("/api/queue").then((snap) => {
+      if (snap) renderState(snap);
+    }).catch(() => {});
+  });
 
   // ── pairing actions ─────────────────────────────────────────────────────
 
@@ -1677,7 +1822,7 @@
       total = lastCastSync.duration;
       // Trust the backend's `state.paused` as the source of truth — see
       // the matching comment in tickProgress for why.
-      const isPlaying = !currentSnapshot.paused
+      const isPlaying = !playbackIsPaused(currentSnapshot)
         && lastCastSync.playerState !== "OTHER";
       const drift = isPlaying ? (Date.now() - lastCastSync.stampedAt) / 1000 : 0;
       elapsed = Math.min(total, lastCastSync.currentTime + drift);

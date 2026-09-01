@@ -1,6 +1,6 @@
 # SmartTube Playlist
 
-A small, LAN-only web page that lets anyone on your home network paste a YouTube link and have it play on **SmartTube** on your **Google TV**. Several people can add videos at once; the queue plays through them in order.
+A small, LAN-only web page that lets anyone on your home network paste a YouTube link and have it play on **SmartTube** on your **Google TV**, **Chromecast**, and more (coming soon). Several people can add videos at once; the queue plays through them in order.
 
 No accounts to create and no third-party service to sign up for.
 

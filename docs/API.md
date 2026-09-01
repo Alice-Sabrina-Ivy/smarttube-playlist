@@ -20,6 +20,8 @@ POST   /api/clear                         empty the queue, leave current playing
 POST   /api/seek           {to|by}        `to`: "1:23" / "90s" / "1h30m"; `by`: ±seconds. 503 without a
                                           Lounge session, and 503 when SmartTube is not in that session
                                           (`lounge_screen_online: false`) — the message names the fix.
+                                          A sub-second session rebuild (they are routine) is waited
+                                          out rather than refused.
                                           Also re-anchors auto-advance to the new position (see below)
 POST   /api/volume/{up|down|mute}         sends a volume keycode over the paired remote; 503 if
                                           no TV is paired
@@ -63,11 +65,35 @@ POST   /api/lounge/pair    {code}         12-digit code from SmartTube; 409 if a
 - `lounge_screen_online` — whether SmartTube is actually **in** that session, read from the device list YouTube sends with every bind. `true`, `false`, or `null` when nothing has been observed yet (no session, or no device list seen). Brief absences — the TV's own connection to YouTube recycling, measured at well under two minutes — are not reported; `false` means the TV has stayed gone for several minutes. `lounge_connected: true` with `lounge_screen_online: false` is the state the page calls **SMARTTUBE NOT LISTENING**: pause, seek and setPlaylist would all return success and reach nothing, so the service routes around the session — pause goes out as a keycode over the paired remote, adds stop waiting for a position report that cannot come (an add that finds SmartTube in front rebinds the session once, and goes to the launch Intent if the TV is still absent), and `/api/seek` refuses with 503. Only an observed `false` changes behaviour; `null` leaves everything as it was.
 - `volume_available` — a TV is paired, so the volume keycodes have somewhere to go. Whether the device honours them depends on its CEC volume setting, which can't be read over this protocol.
 
+### A video that never started says so
+
+`/api/queue` and the SSE snapshots carry `launch_notice`: `null` most of the
+time, or `{"kind": "skipped"|"dropped"|"stalled", "title": "..."}`.
+
+The service gives a video about 45 seconds to actually start. A link that
+cannot play — deleted, private, region-blocked, mistyped — is skipped so it
+does not hold the queue for its whole scraped duration. That has always
+happened; it just happened silently, so whoever pasted the link saw their
+video replaced by the next one with no reason to suspect the URL. `skipped`
+names the video that was dropped.
+
+`dropped` is the same thing with nothing queued behind it — there was no next
+video to move on to, so the card simply goes empty. It is a separate kind
+precisely because "skipped to the next one" would be untrue in the one state
+where the notice is the only explanation the viewer gets.
+
+`stalled` means several launches in a row never started. That is usually the
+device rather than the videos, so the queue is deliberately left intact rather
+than marched through at 45 seconds an item. The field clears itself as soon as
+anything plays, and on skip or clear.
+
 ### Pause is not confirmed
 
 `POST /api/pause` freezes auto-advance and returns `ok: true` regardless of what happened on the TV. The pause itself is **sent** — over Lounge when SmartTube is in the session, otherwise as the `MEDIA_PAUSE` keycode over the paired remote. A Lounge pause is only trusted once the TV itself confirms it within a few seconds (YouTube answers success regardless of whether anything received the command); an unconfirmed one falls back to the keycode as well. The endpoint still returns `ok` either way — including when the keycode was withheld because another app was in front (next paragraph). Read the playback state from `/api/events` if you need to know.
 
 The keycode fallback is only sent when SmartTube is the foreground app, or the foreground can't be read — media keys reach whatever holds the media session, and a pause from a webhook must not pause Netflix.
+
+`POST /api/resume` mirrors the route the pause took: a pause that went out as the keycode is resumed with the `MEDIA_PLAY` keycode, in place — not by relaunching the video, which would restart it. When pause and resume are pressed in quick succession, the later press wins and the earlier in-flight command stands down, so the TV ends up doing what was asked last.
 
 ### Seeking moves the auto-advance countdown too
 

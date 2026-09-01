@@ -124,6 +124,11 @@ STOPPED_PERSISTED_DELAY = 5.0
 # the reconnect, vs the alternative of remote pause / navigation
 # being undetectable for ages.
 STUCK_CT_POLL_THRESHOLD = 5  # 5 polls × 3s = 15s
+# While the frame says Paused a frozen position is expected, so the detector
+# waits ~3x longer before forcing a rebind. Not disabled: on a deep-link
+# session the layer is deaf and the rebind is the only thing that will ever
+# show a resume made with the TV remote.
+STUCK_CT_PAUSED_POLL_THRESHOLD = 15  # 15 polls × 3s = 45s
 
 # How often the periodic refresh asks SmartTube for its current state.
 # Module-level rather than a local so tests can patch it — when a timing
@@ -245,6 +250,13 @@ class LoungeMonitor:
         self._api: Optional[YtLoungeApi] = None
         self._listener = _LoungeListener(self)
         self._subscribe_task: Optional[asyncio.Task] = None
+        # How many connect attempts the subscribe loop has COMPLETED, whether
+        # they succeeded or failed. Monotonic. Read by
+        # `_wait_for_lounge_connected` so an add does not spend the whole
+        # LOUNGE_CONNECT_TIMEOUT waiting for an answer that has already come
+        # back no. Deliberately not folded into `is_connected`, which means
+        # "session bound" and is polled for that meaning.
+        self._connect_attempts = 0
         # The in-flight `subscribe()` call, as its own task so `_teardown`
         # can end it. pyytlounge blocks there on an untimed streaming GET and
         # only re-checks `connected()` after an event arrives, and
@@ -374,6 +386,32 @@ class LoungeMonitor:
                 "again.", now - self._screen_missing_since,
             )
 
+    async def note_local_transport(self, new_state: str) -> None:
+        """Record the effect of a transport command WE just delivered.
+
+        The observation is a cache of what the device has TOLD us, and on a
+        deep-link session SmartTube's Lounge layer tells us nothing: a
+        MEDIA_PLAY/MEDIA_PAUSE keycode moves the picture and the frame goes
+        on saying whatever it said. For a video we own that is harmless — the
+        queue's own `paused` flag is authoritative and is published first.
+        For playback we do NOT own the frame is the only state there is, and
+        the page kept showing PAUSED ON TV over a video our own Play had just
+        resumed (2026-08-31, three presses in a row, TV playing throughout).
+
+        Same reasoning as publish-first: the viewer pressed the button and the
+        keycode went out, so the expected effect is the best evidence we have
+        until the device speaks — and any real push overrides it. Writing
+        "Playing" also lets the external-playback refresh (which requires a
+        Playing frame) and the stuck-ct self-heal take over, so a deaf layer
+        gets rebound and re-read within seconds instead of at the next
+        five-minute stream close.
+        """
+        obs = self._observation
+        if not obs.available or not obs.video_id or obs.state == new_state:
+            return
+        obs.state = new_state
+        await self._safe_emit(EVENT_STATE, obs)
+
     async def request_now_playing(self) -> bool:
         """Force ONE get_now_playing(), bypassing the should_refresh gate.
 
@@ -390,8 +428,12 @@ class LoungeMonitor:
         polling against a BACKGROUNDED SmartTube auto-foregrounds it (a
         YouTube protocol behaviour), which on a Shield can even wake the
         device. This method deliberately cannot check that for itself, so it
-        is not a general-purpose refresh — `_probe_end_of_video` is its only
-        caller, and it waits for `state == "Playing"` first.
+        is not a general-purpose refresh. EVERY caller must establish that
+        condition its own way before calling — waiting for a Playing state,
+        or reading `current_app` and finding SmartTube foreground — and a
+        caller that reads the foreground must read it FRESH, not before an
+        arbitrary wait (a lock, a verify window): a single stale read is the
+        shape `_foreground_blocks_media_key` exists to avoid.
         """
         api = self._api
         if api is None or not self._observation.available:
@@ -404,6 +446,11 @@ class LoungeMonitor:
         except Exception:
             log.debug("Explicit get_now_playing failed", exc_info=True)
             return False
+
+    @property
+    def connect_attempts(self) -> int:
+        """Completed connect attempts by the subscribe loop. Monotonic."""
+        return self._connect_attempts
 
     @property
     def is_paired(self) -> bool:
@@ -846,12 +893,22 @@ class LoungeMonitor:
             current_ct = self._observation.current_time
             if last_ct is not _NO_READING and current_ct == last_ct:
                 stuck_polls += 1
-                if stuck_polls >= STUCK_CT_POLL_THRESHOLD:
+                # A frozen position is EXPECTED while the frame says Paused,
+                # so the paused threshold is longer: the rebind it eventually
+                # forces is still wanted — it is the only thing that re-reads
+                # a deaf layer after a resume made with the TV remote — but
+                # once every ~45s, not every 15s, on a video someone paused.
+                threshold = (STUCK_CT_PAUSED_POLL_THRESHOLD
+                             if self._observation.state == "Paused"
+                             else STUCK_CT_POLL_THRESHOLD)
+                if stuck_polls >= threshold:
                     log.info(
-                        "Lounge ct stuck at %s for %d polls (~%ds) — forcing "
-                        "reconnect to refresh SmartTube's Lounge-layer state",
+                        "Lounge ct stuck at %s for %d polls (~%ds, frame %s) — "
+                        "forcing reconnect to refresh SmartTube's Lounge-layer "
+                        "state",
                         current_ct, stuck_polls,
                         int(stuck_polls * REFRESH_INTERVAL),
+                        self._observation.state,
                     )
                     stuck_polls = 0
                     last_ct = _NO_READING
@@ -864,6 +921,12 @@ class LoungeMonitor:
             else:
                 stuck_polls = 0
                 last_ct = current_ct
+
+    # How long a bound stream may deliver NOTHING before we stop believing in
+    # it. Must stay comfortably above YouTube's own bind period — measured at
+    # ~4.5-5 minutes, so a healthy stream ends and restarts well inside this —
+    # or a healthy session would be recycled on a timer for no reason.
+    SUBSCRIBE_INACTIVITY_TIMEOUT = 360.0
 
     async def _subscribe_loop(self) -> None:
         """Bulletproof outer wrapper around the actual subscribe loop.
@@ -912,6 +975,9 @@ class LoungeMonitor:
                     await self._connect()
                 except Exception:
                     log.debug("Lounge reconnect attempt failed", exc_info=True)
+                # Counted whether it returned or raised: what a waiting caller
+                # needs to know is that an attempt COMPLETED, not how it ended.
+                self._connect_attempts += 1
                 if self._api is None:
                     try:
                         await asyncio.wait_for(
@@ -932,12 +998,45 @@ class LoungeMonitor:
                 # path a no-op that killed Lounge for the process lifetime.
                 sub = asyncio.create_task(self._api.subscribe())
                 self._subscribe_call = sub
+                went_silent = False
                 try:
-                    await sub
+                    # Bounded, because pyytlounge's subscribe() is an untimed
+                    # streaming GET: on a SID YouTube has already invalidated
+                    # it neither delivers nor ends, and the loop parks for the
+                    # process lifetime. `_teardown` can end that, but every
+                    # caller of it needs a trigger — and the stuck-ct self-heal
+                    # only runs while the queue owns an item, so an IDLE
+                    # session in this state has no trigger at all.
+                    #
+                    # Borrowed from youtube_lounge_rs, a Rust client for the
+                    # same protocol, which wraps its stream read in an
+                    # inactivity timeout and re-polls when it expires.
+                    # pyytlounge exposes no SID-invalidation signal to use
+                    # instead.
+                    #
+                    # Safe because the recovery is the routine path, not a new
+                    # one: YouTube ends the bind stream every ~4.5-5 minutes
+                    # anyway, so tear-down-and-reconnect already runs on every
+                    # video longer than five minutes. Worst case we do slightly
+                    # more often what we already do. Hence the generous
+                    # threshold — silence past it is not a slow session, it is
+                    # a session that is never coming back.
+                    await asyncio.wait_for(
+                        sub, timeout=self.SUBSCRIBE_INACTIVITY_TIMEOUT,
+                    )
+                except asyncio.TimeoutError:
+                    went_silent = True
                 finally:
                     self._subscribe_call = None
-                # subscribe() returning normally means the session ended.
-                log.info("Lounge subscribe ended; tearing down for reconnect")
+                if went_silent:
+                    log.warning(
+                        "Lounge stream delivered nothing for %.0fs and did not "
+                        "end — treating it as a dead session and reconnecting",
+                        self.SUBSCRIBE_INACTIVITY_TIMEOUT,
+                    )
+                else:
+                    # subscribe() returning normally means the session ended.
+                    log.info("Lounge subscribe ended; tearing down for reconnect")
                 await self._teardown()
             except asyncio.CancelledError:
                 if self._teardown_interrupt:
@@ -997,6 +1096,7 @@ class LoungeMonitor:
             # then did to the next Stopped.
             self._cancel_stopped_timer()
         await self._safe_emit(EVENT_POSITION, self._observation)
+        self._maybe_schedule_gone_player_timer()
         if new_video and new_video != old_video:
             await self._safe_emit(EVENT_NOW_PLAYING, self._observation)
         # Also emit EVENT_STATE when a nowPlaying event carries a state
@@ -1021,11 +1121,12 @@ class LoungeMonitor:
             self._observation.duration = dur
         self._observation.state = new_state
         await self._safe_emit(EVENT_POSITION, self._observation)
+        self._maybe_schedule_gone_player_timer()
 
         # State changed away from Stopped — cancel any pending
         # "persistent Stopped" timer (this was an ad-insertion blip or
         # similar brief transition, not a real end).
-        if new_state != "Stopped":
+        if new_state != "Stopped" and self._observation.current_time is not None:
             self._cancel_stopped_timer()
 
         if new_state != old_state:
@@ -1076,6 +1177,55 @@ class LoungeMonitor:
                     self._stopped_persisted_task = asyncio.create_task(
                         self._fire_finished_if_stopped_persists()
                     )
+        self._maybe_schedule_gone_player_timer()
+
+    def _maybe_schedule_gone_player_timer(self) -> None:
+        """A player can go away WITHOUT ever passing through Stopped.
+
+        What it leaves behind is a frame that still carries the video and a
+        state, but no position at all. Measured on hardware 2026-08-31: play a
+        635s video with another queued, fast-forward into its last seconds
+        with the TV's own remote, and the queue stalls for minutes. Nothing
+        could advance it — the duration timer is still far out because the
+        skip removed that much runtime, and every other finish check reads the
+        position that just vanished.
+
+        Neither state handler nulls the position itself; it goes blank when a
+        teardown blanks the observation and the push that follows carries an
+        id and a state but no time. So this is checked wherever a frame lands,
+        not inside one handler's transition logic.
+
+        Same evidence as a persistent Stopped — a player that is no longer
+        there — so it gets the same treatment and the same debounce. A
+        position that comes back cancels it, because Lounge drops one across
+        reconnects routinely and a momentary gap must not end anybody's video.
+        """
+        # `.done()`, not `is not None`: the fire body never clears the attr,
+        # so a completed timer otherwise blocks every LATER gone-player
+        # detection until some position-carrying frame happens to run the
+        # cancel path — the second video to vanish the same way stalled.
+        task = self._stopped_persisted_task
+        if task is not None and not task.done():
+            return
+        if self._observation.current_time is not None:
+            return
+        if not self._observation.video_id or self._observation.state is None:
+            return
+        if self._observation.state == "Playing":
+            # A PLAYING state is positive evidence of a live player, not a
+            # gone one — and blank positions are routine while alive
+            # (measured: 18s of no position early in a deep-link launch,
+            # against this timer's 5s debounce). The hardware evidence this
+            # detector was built on was a PAUSED frame with no position.
+            return
+        log.info(
+            "Playback state %s arrived with no position — scheduling FINISHED "
+            "after %.0fs if it stays that way",
+            self._observation.state, STOPPED_PERSISTED_DELAY,
+        )
+        self._stopped_persisted_task = asyncio.create_task(
+            self._fire_finished_if_stopped_persists()
+        )
 
     def _cancel_stopped_timer(self) -> None:
         """Cancel and forget any pending persistent-Stopped FINISHED timer."""
@@ -1096,12 +1246,21 @@ class LoungeMonitor:
             await asyncio.sleep(STOPPED_PERSISTED_DELAY)
         except asyncio.CancelledError:
             return
-        if self._observation.state != "Stopped":
+        # Either shape of "the player is gone": still Stopped, or still
+        # without a position. Anything that came back cancelled this.
+        if self._observation.state == "Stopped":
+            reason = "Stopped state persisted"
+        elif (self._observation.current_time is None
+                and self._observation.state != "Playing"):
+            # Re-checked at fire time too: a state that turned Playing during
+            # the debounce is the player answering, even if its position has
+            # not arrived yet.
+            reason = "no position returned"
+        else:
             return
         log.info(
-            "Stopped state persisted for %.0fs — firing FINISHED "
-            "(player likely exited)",
-            STOPPED_PERSISTED_DELAY,
+            "%s for %.0fs — firing FINISHED (player likely exited)",
+            reason, STOPPED_PERSISTED_DELAY,
         )
         await self._safe_emit(EVENT_FINISHED, self._observation)
 

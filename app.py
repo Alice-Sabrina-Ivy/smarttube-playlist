@@ -155,9 +155,46 @@ SCREENSAVER_PACKAGES = frozenset(
 # (and therefore our app) uses — verified empirically with 0/3 dismiss
 # success rate for both, so they are NOT supported here.
 _RAW_SCREENSAVER_DISMISS_KEY = os.environ.get("SCREENSAVER_DISMISS_KEY")
-WAKE_DELAY = float(os.environ.get("WAKE_DELAY", "15.0"))         # minimum total wake time after POWER
+# Minimum total wake time after the wake key, measured from the KEYPRESS.
+#
+# 15.0 until 2026-08-30, then 16.0, now 6.0 — and this is the first value that
+# was ever measured rather than guessed. It is the single biggest delay in the
+# product: on the reference Google TV Streamer it was sixteen seconds of black
+# screen on every add to a sleeping device, and 5/5 cold boots at 6.0 played
+# exactly as reliably as 5/5 at 16.0 with the same harness (POWER->Intent 6.01s
+# mean, against 16.0s). `is_on` flipped in 0.31-0.64s across every wake measured
+# over two days, so nearly all of the old floor was pure waiting.
+#
+# It is still a floor rather than nothing, because a dropped Intent on this path
+# is close to undetectable: SmartTube restores itself to the foreground on wake,
+# so `current_app` reads org.smarttube.stable whether our Intent landed or not.
+#
+# MEASURED ON ONE DEVICE. The Chromecast with Google TV is unconfirmed at this
+# value, and a device that reports on more slowly is covered by POST_ON_SETTLE
+# below rather than by this. Raise it per-install if a device needs it — that is
+# what the env var is for, and BETA-TESTING.md tells testers so.
+WAKE_DELAY = float(os.environ.get("WAKE_DELAY", "6.0"))
 WAKE_TIMEOUT = float(os.environ.get("WAKE_TIMEOUT", "30.0"))     # max time to wait for is_on=True
 WAKE_POLL = float(os.environ.get("WAKE_POLL", "0.5"))
+# Settle time measured from the moment the device REPORTED ON, as opposed to
+# WAKE_DELAY's floor which runs from the keypress. Both exist, and the launch
+# waits for whichever still has time on it.
+#
+# The keypress floor alone protects only fast hardware. It was sized for Quick
+# Resume, where `is_on` flips ~1s after POWER (1.03s measured on the reference
+# Google TV Streamer) and the remaining ~15s is all settle. A device that takes
+# longer than the whole floor to answer got its Intent the instant `is_on`
+# flipped — nothing left of the floor at all — so the slowest device, the one
+# least ready to service a launch, was the one handed the least time. That is
+# backwards from the floor's purpose.
+#
+# Now the LONGER of the two on a fast-reporting device, which is deliberate: it
+# is the floor that means the right thing. The keypress floor cannot distinguish
+# "the device answered instantly and has had 6s to settle" from "the device took
+# 6s to answer and has had none"; this can, because it starts when the device
+# actually reported on. A slow-reporting device therefore still gets its full
+# settle even though WAKE_DELAY came down.
+POST_ON_SETTLE = float(os.environ.get("POST_ON_SETTLE", "5.0"))
 # Which keycode wakes a sleeping device. POWER is a TOGGLE, and that is the
 # crux: hardware that ignores a toggle while asleep can never be woken, and
 # raises no error to say so. NVIDIA Shield is the known case — its "Simplified
@@ -266,6 +303,29 @@ LOUNGE_CONNECT_TIMEOUT = 15.0
 LOUNGE_CONNECT_POLL = 0.3
 LOUNGE_OBSERVATION_TIMEOUT = 3.0 # Lounge reports SmartTube's actual playback state
 LOUNGE_OBSERVATION_POLL = 0.2
+# How long to wait for a REFRESHED frame after asking SmartTube for one, before
+# deciding on whatever we have. See `_lounge_frame_is_current` for why a stale
+# frame is not usable at the point tv_play reads it.
+# Only reached for an AMBIGUOUS mid-video frame: an ending frame short-circuits
+# before the poll, and a device we just woke never reaches this branch at all.
+# So the window can afford to be generous, and it has to be — SmartTube pushes
+# on its own schedule and this device routinely goes quiet for tens of seconds,
+# so a tight window asks "did it answer fast?" when the question is "is it
+# alive?". Measured: a genuinely playing video failed to answer inside 1.5s and
+# had its player restarted for nothing.
+LOUNGE_REFRESH_TIMEOUT = 3.0
+LOUNGE_REFRESH_POLL = 0.1
+# How long branch A waits for SmartTube to actually come to the foreground
+# after a wake-path deep link, before concluding the Intent was dropped and
+# sending it once more.
+#
+# Generous on purpose. The cost of being early is the double-play regression
+# (invariant 1) — a second Intent while the first is still resolving restarts
+# the clip a second in — and a foreground transition takes well under a second
+# on hardware. The cost of being late is only that a lost video starts later
+# than it might have.
+LAUNCH_FOREGROUND_TIMEOUT = 8.0
+LAUNCH_FOREGROUND_POLL = 0.5
 SCREENSAVER_DISMISS_DELAY = 0.3  # after the dismiss key, time for the OS to
                                  # settle (measured: ~100ms typical for HOME
                                  # to take dreamx off screen; we poll with
@@ -518,6 +578,20 @@ class State:
     # overlays, ad insertion brief switches, etc.) would trip the check
     # and blank the snapshot for a tick, causing UI flicker.
     suppress_lounge: bool = False
+    # How the last pause was DELIVERED to the device: ("keycode"|"lounge",
+    # video_id) — written by _lounge_pause, consumed by _lounge_play, scoped
+    # to the video it paused. The publish-first ordering means `paused` and
+    # `pause_source` are already CLEARED by the time `_cast_play` runs, so any
+    # resume logic keyed on "how did the pause go out" has to read this record
+    # instead of the live flags — a gate on the flags is dead code through
+    # resume(), which is exactly how the screenless in-place resume silently
+    # regressed to a relaunch.
+    last_pause_delivery: Optional[tuple] = None
+    # When the record above was written (loop.time()). Only the "none" kind
+    # reads it: that record describes an immediate press crossing and is
+    # honoured for ~10s, so an orphaned one cannot swallow a Play pressed
+    # minutes later.
+    last_pause_delivery_at: float = 0.0
 
 
 state = State()
@@ -993,6 +1067,15 @@ async def _wait_for_lounge_connected(timeout: float, poll: float) -> bool:
     # Let a rebind that `request_reconnect_now()` has just scheduled take its
     # first step, so a session being replaced is not read as the one to use.
     await asyncio.sleep(0)
+    # A connect attempt that COMPLETES without binding is a definite answer,
+    # and waiting out the rest of the window for a different one is dead time
+    # the user sees. This closes the failed-attempt door only: a loop blocked
+    # inside subscribe() on a SID pyytlounge has already invalidated runs no
+    # attempt at all, so the counter cannot move and that case still burns the
+    # full window — pyytlounge exposes no hook for it (checked against its API,
+    # 2026-08-31). `is_connected` is still tested FIRST below, so a
+    # teardown-then-reconnect that moves both signals reads as success.
+    attempts0 = getattr(state.lounge_monitor, "connect_attempts", None)
     deadline = asyncio.get_running_loop().time() + timeout
     while asyncio.get_running_loop().time() < deadline:
         mon = state.lounge_monitor
@@ -1009,6 +1092,14 @@ async def _wait_for_lounge_connected(timeout: float, poll: float) -> bool:
                 )
                 return False
             return True
+        if attempts0 is not None:
+            attempts = getattr(mon, "connect_attempts", attempts0)
+            if attempts != attempts0:
+                log.info(
+                    "Lounge tried to bind and did not succeed; not waiting out "
+                    "the rest of the %.0fs window", timeout,
+                )
+                return False
         await asyncio.sleep(poll)
     return False
 
@@ -1055,67 +1146,147 @@ async def _lounge_pause() -> bool:
     is in Netflix must not pause Netflix.
     """
     mon = state.lounge_monitor
-    if mon is None:
-        reason = "Lounge is not paired"
-    elif not mon.is_connected:
-        reason = "no Lounge session"
-    elif getattr(mon, "screen_online", None) is False:
-        reason = "SmartTube is not in the lounge"
-    elif await mon.pause():
-        # The cloud said 200; only the device's own Paused push proves anyone
-        # heard. `screen_online` cannot carry this alone: departures are only
-        # DISCOVERED at the next bind (~5 min apart), arrivals push instantly
-        # — so for up to five minutes after SmartTube silently drops out the
-        # flag still reads True, and a pause taken at the cloud's word in that
-        # window is the original production failure again (hit live from a
-        # phone, 2026-08-24 09:00, departure discovered at the 09:00:41 bind).
-        # A healthy SmartTube pushes the Paused transition in ~0.3s
-        # (measured); waiting for it costs one sub-second beat, and the
-        # keycode fallback is idempotent on an already-paused player, so a
-        # false negative here is a harmless duplicate rather than a wrong
-        # signal. Passive observation only — polling a possibly-backgrounded
-        # SmartTube auto-foregrounds it.
-        cur_at_entry = queue_controller.state.current
-        cur_vid = cur_at_entry.video_id if cur_at_entry else None
-        loop = asyncio.get_running_loop()
-        deadline = loop.time() + PAUSE_VERIFY_TIMEOUT
-        while loop.time() < deadline:
-            obs = mon.observation
-            # Invariant 4: Paused with a real position, about OUR video when
-            # we own one — a Paused ghost without current_time is the dormant
-            # cloud cache, not the device answering.
-            if (obs.state == "Paused" and obs.current_time is not None
-                    and (cur_vid is None or obs.video_id == cur_vid)):
-                return True
-            await asyncio.sleep(PAUSE_VERIFY_POLL)
-        if (queue_controller.has_pending_sends()
-                or queue_controller.state.current is not cur_at_entry):
-            # An add or advance landed inside the verify window; a late
-            # keycode would pause the video that launch is about to start.
-            log.info(
-                "Lounge pause was never confirmed, but a new launch is in "
-                "flight — standing down rather than pausing it"
-            )
+    cur0 = queue_controller.state.current
+    cur_vid0 = cur0.video_id if cur0 else None
+    entered_at = asyncio.get_running_loop().time()
+    async with _transport_lock:
+        if (not queue_controller.state.paused
+                and getattr(queue_controller, "last_resume_at", 0.0)
+                    > getattr(queue_controller, "last_pause_at", 0.0)):
+            # A newer resume press cleared the flag while this pause was in
+            # flight or waiting its turn behind the transport lock: the user
+            # no longer wants a pause, and the device never received one.
+            # PRESS ORDER decides, via the stamps — the flag alone cannot,
+            # because the lounge mirror also moves it and a mirror
+            # correction is not a change of mind. Record "none": the resume
+            # this yields to reads it, knows there is nothing to undo, and
+            # sends nothing instead of spending a verify window and
+            # relaunching.
+            state.last_pause_delivery = ("none", cur_vid0)
+            state.last_pause_delivery_at = asyncio.get_running_loop().time()
+            log.info("Pause superseded before delivery — sending nothing")
             return True
-        reason = "the Lounge pause was not confirmed"
-    else:
-        reason = "the Lounge pause was refused"
-    if state.remote is None:
-        return False
-    blocking = await _foreground_blocks_media_key()
-    if blocking:
-        log.info(
-            "Not sending MEDIA_PAUSE: %s is foreground, not SmartTube (%s)",
-            blocking, reason,
-        )
-        return False
-    try:
-        state.remote.send_key_command("MEDIA_PAUSE")
-        log.info("Paused with the MEDIA_PAUSE keycode (%s)", reason)
-        return True
-    except Exception:
-        log.warning("MEDIA_PAUSE send failed", exc_info=True)
-        return False
+        # Snapshot the frame BEFORE issuing anything: the verify below may
+        # only confirm on evidence NEWER than the command. In a rapid
+        # pause/play/pause the cache still holds the Paused frame the FIRST
+        # pause produced — SmartTube pushes on transitions, and the resume's
+        # Playing push can lag — so the second pause used to find "Paused
+        # with a real position" already sitting there, confirm instantly,
+        # and send nothing: device playing, page saying paused. A frame that
+        # predates the command proves the past, not the present.
+        obs0 = None
+        if mon is not None:
+            _o = mon.observation
+            obs0 = (_o.state, _o.current_time, _o.video_id)
+        if mon is None:
+            reason = "Lounge is not paired"
+        elif not mon.is_connected:
+            reason = "no Lounge session"
+        elif getattr(mon, "screen_online", None) is False:
+            reason = "SmartTube is not in the lounge"
+        elif await mon.pause():
+            # The cloud said 200; only the device's own Paused push proves
+            # anyone heard. `screen_online` cannot carry this alone:
+            # departures are only DISCOVERED at the next bind (~5 min apart),
+            # arrivals push instantly — so for up to five minutes after
+            # SmartTube silently drops out the flag still reads True, and a
+            # pause taken at the cloud's word in that window is the original
+            # production failure again (hit live from a phone, 2026-08-24
+            # 09:00, departure discovered at the 09:00:41 bind). A healthy
+            # SmartTube pushes the Paused transition in ~0.3s (measured);
+            # waiting for it costs one sub-second beat, and the keycode
+            # fallback is idempotent on an already-paused player, so a false
+            # negative here is a harmless duplicate rather than a wrong
+            # signal. Passive observation only — polling a
+            # possibly-backgrounded SmartTube auto-foregrounds it.
+            cur_at_entry = queue_controller.state.current
+            cur_vid = cur_at_entry.video_id if cur_at_entry else None
+            loop = asyncio.get_running_loop()
+            deadline = loop.time() + PAUSE_VERIFY_TIMEOUT
+            while loop.time() < deadline:
+                obs = mon.observation
+                # Invariant 4: Paused with a real position, about OUR video
+                # when we own one — a Paused ghost without current_time is
+                # the dormant cloud cache, not the device answering. And it
+                # must DIFFER from the entry snapshot — see obs0 above.
+                if (obs.state == "Paused" and obs.current_time is not None
+                        and getattr(obs, "available", True)
+                        # A rebind inside the verify window replaces the
+                        # observation with the CLOUD's cached frame, which
+                        # can be Paused-with-ct and differ from the entry
+                        # snapshot — the dormant ghost invariant 4 distrusts.
+                        # Presence keeps that frame from confirming a pause
+                        # nobody received.
+                        and getattr(mon, "screen_online", None) is not False
+                        and (cur_vid is None or obs.video_id == cur_vid)
+                        and (obs.state, obs.current_time,
+                             obs.video_id) != obs0):
+                    state.last_pause_delivery = ("lounge", cur_vid)
+                    return True
+                await asyncio.sleep(PAUSE_VERIFY_POLL)
+            if (queue_controller.has_pending_sends()
+                    or queue_controller.state.current is not cur_at_entry):
+                # An add or advance landed inside the verify window; a late
+                # keycode would pause the video that launch is about to
+                # start.
+                log.info(
+                    "Lounge pause was never confirmed, but a new launch is "
+                    "in flight — standing down rather than pausing it"
+                )
+                return True
+            if (not queue_controller.state.paused
+                    and getattr(queue_controller, "last_resume_at", 0.0)
+                        > entered_at):
+                # A Play pressed inside the verify window is the user's
+                # NEWER intent, and a keycode-paused video now resumes
+                # instantly — so a late MEDIA_PAUSE here re-pauses the video
+                # they just resumed, with the page saying playing. Only a
+                # resume that arrived AFTER this pause began stands it down:
+                # the lounge mirror also clears `paused` on a Playing frame,
+                # but that is the self-correction for a pause that never
+                # landed, not a change of mind, and it moves no resume
+                # stamp. NO "none" record here, deliberately (adversarial
+                # review, 2026-08-31): the pause command WAS issued over
+                # Lounge — only its confirmation is missing, and the verify's
+                # own documented failure mode is a late or lost push from a
+                # live SmartTube. The device may well be paused. A "none"
+                # record made the superseding resume send NOTHING: device
+                # paused, page saying playing, a dead Play button. Leaving
+                # the record unset routes that resume through the Lounge
+                # play path, which is right in both worlds — it confirms if
+                # the device was playing all along, and falls through to a
+                # position-carrying relaunch if it was paused and deaf.
+                # "none" may only be recorded where the pause was never
+                # issued at all (the entry stand-down above).
+                log.info(
+                    "Lounge pause was never confirmed, but a resume "
+                    "superseded it — standing down rather than re-pausing"
+                )
+                return True
+            reason = "the Lounge pause was not confirmed"
+        else:
+            reason = "the Lounge pause was refused"
+        if state.remote is None:
+            return False
+        blocking = await _foreground_blocks_media_key()
+        if blocking:
+            log.info(
+                "Not sending MEDIA_PAUSE: %s is foreground, not SmartTube "
+                "(%s)", blocking, reason,
+            )
+            return False
+        try:
+            state.remote.send_key_command("MEDIA_PAUSE")
+            state.last_pause_delivery = ("keycode", cur_vid0)
+            log.info("Paused with the MEDIA_PAUSE keycode (%s)", reason)
+            if mon is not None:
+                # The frame is all the page has for unowned playback, and a
+                # deaf layer will never push this transition — record it.
+                await mon.note_local_transport("Paused")
+            return True
+        except Exception:
+            log.warning("MEDIA_PAUSE send failed", exc_info=True)
+            return False
 
 
 # How long to wait before RE-READING the foreground app when the first read
@@ -1157,23 +1328,37 @@ RESUME_VERIFY_POLL = 0.2
 PAUSE_VERIFY_TIMEOUT = 3.0
 PAUSE_VERIFY_POLL = 0.2
 
+# Serializes pause/resume DELIVERY (decision + verify), so rapid alternation
+# cannot interleave two verifies over the same stale frames. Reported
+# 2026-08-31: seek forward then rapid play/pause caused multiple bugs — a
+# second pause false-confirming off the first pause's cached frame, and a
+# resume mid-pause-verify finding no delivery record and falling through to a
+# relaunch. Each queued press re-reads the CURRENT flags once it holds the
+# lock, so superseded presses become no-ops instead of stale commands. The
+# lock is released before any tv_play relaunch — a launch can take tens of
+# seconds and must not block the next pause press.
+_transport_lock = asyncio.Lock()
+
 
 async def _lounge_play() -> bool:
     """Resume / start playback. Paths in order of preference:
 
     0. Nothing current, something queued → send NOTHING; resume() launches
        the queued item with its own single play signal.
-    1. SmartTube foreground + Lounge connected AND SmartTube in the lounge →
+    0b. A newer pause superseded this resume (the flag is set again under
+       the transport lock) → send NOTHING; the last press wins.
+    1. The delivery record says the pause went out as a KEYCODE for this
+       same video → the MEDIA_PLAY keycode, in place, instantly — measured
+       (against exactly that deaf screen) to resume where a deep link would
+       restart from zero. This subsumes the old flags-based path 1b, which
+       silently died when resume() started clearing `paused` before
+       `_cast_play` runs; a record of ("none", vid) means the pause was
+       never delivered at all, and the resume sends nothing.
+    1b. SmartTube foreground + Lounge connected AND SmartTube in the lounge →
        Lounge.play() AND verify state actually transitions to Playing within
-       RESUME_VERIFY_TIMEOUT. If verified, in-place unpause is done.
-    1b. SmartTube foreground, current set and paused from OUR page, but
-       SmartTube is NOT in the lounge → the MEDIA_PLAY keycode, which is
-       measured (against exactly that deaf screen) to resume in place. A
-       deep link here restarts the clip from the beginning, which is far
-       worse for a 40-minute video than the residual risk that a player
-       torn down between our own keycode pause and this press swallows the
-       key. Deliberate: changing this back to a deep link, or widening it
-       past pause_source == "ui", is a decision, not a cleanup.
+       RESUME_VERIFY_TIMEOUT — on evidence NEWER than the command, never on
+       a frame that was already in the cache. If verified, in-place unpause
+       is done.
     2. Lounge.play() succeeded HTTPS-wise but state stayed Paused
        (signal: SmartTube's PlaybackActivity was torn down, e.g. user
        paused then hit BACK on the remote) → fall through to tv_play()
@@ -1205,66 +1390,189 @@ async def _lounge_play() -> bool:
             len(queue_controller.state.queue),
         )
         return True
-    smarttube_fg = (_get_current_app() == SMARTTUBE_PACKAGE)
     mon = state.lounge_monitor
-    lounge_ready = (
-        mon is not None
-        and mon.is_connected
-        # A session bound to a lounge SmartTube is not in answers play() with
-        # True and reaches nothing; the verify below would then time out and
-        # fall through to tv_play anyway — but only after RESUME_VERIFY_TIMEOUT
-        # of nothing, and having sent a play to nobody first.
-        and getattr(mon, "screen_online", None) is not False
-    )
-    if smarttube_fg and lounge_ready:
-        if await state.lounge_monitor.play():
-            # Verify Lounge.play() actually resumed playback. Against
-            # a torn-down PlaybackActivity (post-BACK), the call
-            # succeeds HTTPS-wise but state stays Paused indefinitely
-            # — we'd silently return True and the user clicks Play
-            # with no effect.
-            loop = asyncio.get_running_loop()
-            deadline = loop.time() + RESUME_VERIFY_TIMEOUT
-            while loop.time() < deadline:
-                obs = state.lounge_monitor.observation
-                if obs.state == "Playing":
+    async with _transport_lock:
+        # Read the foreground INSIDE the lock: it gates a media keycode and
+        # the request_now_playing polls below, and the wait for the lock can
+        # be several seconds — a read taken before it is a single stale read,
+        # the exact shape _foreground_blocks_media_key exists to avoid.
+        smarttube_fg = (_get_current_app() == SMARTTUBE_PACKAGE)
+        if (queue_controller.state.paused
+                and queue_controller.state.current is not None
+                and getattr(queue_controller, "last_pause_at", 0.0)
+                    > getattr(queue_controller, "last_resume_at", 0.0)):
+            # A newer pause press superseded this resume while it waited its
+            # turn behind the transport lock — resuming would contradict the
+            # newest intent, so send nothing. PRESS ORDER decides, via the
+            # stamps; the flag corroborates (resume() clears it before
+            # calling here, so True means the pause re-set it). The
+            # current-is-set clause keeps the unowned-playback resume
+            # working: there `paused` was never cleared, because the
+            # in-place clearing only runs for an item we own.
+            log.info("Resume superseded by a newer pause — sending nothing")
+            return True
+        # Resume the way you paused. When the pause went out as MEDIA_PAUSE —
+        # which is every pause on deep-link playback, where the Lounge layer
+        # never confirms anything — the player is live and reachable by
+        # keycode, and the Lounge verify below would spend
+        # RESUME_VERIFY_TIMEOUT failing the same way the pause's verify did,
+        # then fall through to a deep link that RESTARTS the clip (measured
+        # live, 2026-08-31 dev log, twice). This must read the DELIVERY
+        # RECORD, not `paused`/`pause_source`: resume() clears those before
+        # `_cast_play` runs (the publish-first ordering), so a gate on the
+        # live flags is dead code through the endpoint — which is exactly how
+        # the old flags-based path 1b silently died. Scoped to the video the
+        # pause was delivered for; the residual risk — a player torn down
+        # between our keycode pause and this press swallows the key — is
+        # accepted for the same reason 1b accepted it: a deep link here
+        # restarts a long video from zero, which is worse.
+        delivery = state.last_pause_delivery
+        cur = queue_controller.state.current
+        if (cur is not None and delivery is not None
+                and delivery[1] == cur.video_id):
+            if delivery[0] == "none":
+                state.last_pause_delivery = None
+                age = (asyncio.get_running_loop().time()
+                       - getattr(state, "last_pause_delivery_at", 0.0))
+                if age <= 10.0:
+                    # The pause this resume answers was never delivered — it
+                    # was superseded before anything reached the device,
+                    # which never stopped playing. Nothing to undo. Honoured
+                    # only briefly: "none" describes an immediate crossing,
+                    # and an ORPHANED one (the racing resume finished before
+                    # the pause even entered, so nothing consumed it) must
+                    # not swallow a Play pressed minutes later after a
+                    # genuine TV-remote pause of the same video.
+                    log.info(
+                        "Resume answers a pause that was never delivered — "
+                        "the device never stopped; sending nothing"
+                    )
                     return True
-                await asyncio.sleep(RESUME_VERIFY_POLL)
+            if (delivery[0] == "keycode" and state.remote is not None
+                    and smarttube_fg):
+                try:
+                    state.remote.send_key_command("MEDIA_PLAY")
+                    state.last_pause_delivery = None
+                    log.info(
+                        "Resumed with the MEDIA_PLAY keycode (the pause was "
+                        "delivered by keycode)"
+                    )
+                    if mon is not None:
+                        await mon.note_local_transport("Playing")
+                    return True
+                except Exception:
+                    log.warning("MEDIA_PLAY send failed; falling through",
+                                exc_info=True)
+        lounge_ready = (
+            mon is not None
+            and mon.is_connected
+            # A session bound to a lounge SmartTube is not in answers play()
+            # with True and reaches nothing; the verify below would then time
+            # out and fall through to tv_play anyway — but only after
+            # RESUME_VERIFY_TIMEOUT of nothing, and having sent a play to
+            # nobody first.
+            and getattr(mon, "screen_online", None) is not False
+        )
+        if smarttube_fg and lounge_ready:
+            # Same freshness rule as the pause verify: a "Playing" frame that
+            # was ALREADY in the cache when this resume was issued proves the
+            # past, not that our play took effect — in a rapid toggle it is
+            # the frame from before the pause, and confirming on it made Play
+            # a silent no-op against a genuinely paused device.
+            _o = mon.observation
+            obs0 = (_o.state, _o.current_time, _o.video_id)
+            if await mon.play():
+                # Verify Lounge.play() actually resumed playback. Against
+                # a torn-down PlaybackActivity (post-BACK), the call
+                # succeeds HTTPS-wise but state stays Paused indefinitely
+                # — we'd silently return True and the user clicks Play
+                # with no effect.
+                loop = asyncio.get_running_loop()
+                deadline = loop.time() + RESUME_VERIFY_TIMEOUT
+                while loop.time() < deadline:
+                    # `mon`, not `state.lounge_monitor`, throughout this
+                    # verify: a re-pair or stop can null/replace the module
+                    # field mid-wait, and dereferencing it raised out of
+                    # /api/resume as a 500.
+                    obs = mon.observation
+                    if (obs.state == "Playing"
+                            and (obs.state, obs.current_time,
+                                 obs.video_id) != obs0):
+                        state.last_pause_delivery = None
+                        return True
+                    # ASK, don't just watch. Nothing refreshes the
+                    # observation during this wait: SmartTube pushes on
+                    # transitions only, and `should_refresh()` is gated on
+                    # `not paused` while `resume()` does not clear `paused`
+                    # until after this returns — so a passive loop here waits
+                    # for evidence it has stopped collecting. When the push
+                    # was late the verify "failed" on a player that was
+                    # already resuming, fell through to a deep link, and the
+                    # video restarted: a visible hiccup, reported from the
+                    # sofa. Same lesson the self-test's finish probe learned
+                    # on hardware. A live player's polled position also MOVES,
+                    # which is what satisfies the freshness test above.
+                    #
+                    # Safe: this path already established SmartTube is
+                    # foreground, which is `request_now_playing`'s documented
+                    # precondition.
+                    try:
+                        await mon.request_now_playing()
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception:
+                        pass
+                    await asyncio.sleep(RESUME_VERIFY_POLL)
+                log.info(
+                    "Lounge.play() did not transition to Playing within "
+                    "%.1fs (state=%s, ct=%s) — player likely torn down, "
+                    "falling through",
+                    RESUME_VERIFY_TIMEOUT,
+                    mon.observation.state,
+                    mon.observation.current_time,
+                )
+        cur = queue_controller.state.current
+    # The transport lock is released here, deliberately: the relaunch below
+    # goes through tv_play, which can spend tens of seconds on a cold device,
+    # and the next pause press must not queue behind that. The stand-down
+    # below re-reads the newest intent instead.
+    if cur and state.remote is not None:
+        if queue_controller.state.paused:
+            # A pause landed while the verify above was running — the user's
+            # NEWER intent. resume() cleared `paused` before calling here, so
+            # True now can only be a fresh pause (or the lounge mirror of a
+            # device that considers itself paused, which contradicts a
+            # relaunch just as hard). Measured live: this fallthrough's deep
+            # link and the superseding pause's keycode landed one millisecond
+            # apart — device restarted and playing, page saying paused.
             log.info(
-                "Lounge.play() did not transition to Playing within %.1fs "
-                "(state=%s, ct=%s) — player likely torn down, falling through",
-                RESUME_VERIFY_TIMEOUT,
-                state.lounge_monitor.observation.state,
-                state.lounge_monitor.observation.current_time,
-            )
-    cur = queue_controller.state.current
-    if (cur is not None and state.remote is not None and smarttube_fg
-            and mon is not None
-            and getattr(mon, "screen_online", None) is False
-            and queue_controller.state.paused
-            and queue_controller.state.pause_source == "ui"):
-        # Path 1b — see the docstring. The pause that got us here went out as
-        # a keycode moments ago (Lounge cannot pause a screenless lounge), so
-        # the player is live and MEDIA_PLAY resumes it IN PLACE where a deep
-        # link would restart from zero.
-        try:
-            state.remote.send_key_command("MEDIA_PLAY")
-            log.info(
-                "Resumed with the MEDIA_PLAY keycode (SmartTube is not in "
-                "the lounge)"
+                "Resume fallthrough superseded by a newer pause — sending "
+                "nothing (a relaunch would unpause and restart the video)"
             )
             return True
-        except Exception:
-            log.warning("MEDIA_PLAY send failed; falling through to tv_play",
-                        exc_info=True)
-    if cur and state.remote is not None:
         try:
             # Through track_send, not inline. `_cancel_in_flight_sends` can
             # only cancel tasks it created, so an inline await here put this
             # play signal outside the guard entirely — a guest's add landing
             # mid-resume could not cancel it, and the TV jumped back to the
             # previously-paused video seconds after starting the new one.
-            await queue_controller.track_send(tv_play(cur.video_id, cur.start_s))
+            # Resume where they paused, not where the URL said to start.
+            # `cur.start_s` is the original `&t=` offset — None for almost
+            # every add — so a long video backed out of and resumed silently
+            # restarted from zero: the button worked, the video played, and
+            # the viewer's place was gone. The paused position is already in
+            # the observation; adopt it when the frame is unambiguously about
+            # our own item and past the dormant-load threshold, which is the
+            # same video_id + ct > 1.0 shape the skip-redundant gate uses.
+            # No extra network call, no new gate, still one play signal.
+            obs = (state.lounge_monitor.observation
+                   if state.lounge_monitor is not None else None)
+            resume_at = cur.start_s
+            if (obs is not None and obs.video_id == cur.video_id
+                    and obs.current_time is not None
+                    and obs.current_time > 1.0):
+                resume_at = int(obs.current_time)
+            await queue_controller.track_send(tv_play(cur.video_id, resume_at))
             return True
         except asyncio.CancelledError:
             # A newer send superseded us. That is the guard working, not a
@@ -1274,6 +1582,15 @@ async def _lounge_play() -> bool:
             log.warning("tv_play during resume failed", exc_info=True)
     if state.remote is None:
         return False
+    if (getattr(queue_controller, "last_pause_at", 0.0)
+            > getattr(queue_controller, "last_resume_at", 0.0)):
+        # The last-resort keycode runs OUTSIDE the transport lock (released
+        # above so a relaunch cannot block the next press), so it needs its
+        # own press-order re-check — the owned-relaunch branch has one, and
+        # this unowned branch was the gap: a MEDIA_PLAY here could land
+        # opposite a MEDIA_PAUSE a queued newer pause is about to send.
+        log.info("Resume superseded by a newer pause — no last-resort keycode")
+        return True
     blocking = await _foreground_blocks_media_key()
     if blocking:
         # Same reasoning as the pause keycode: media keys land on whatever
@@ -1285,6 +1602,11 @@ async def _lounge_play() -> bool:
     try:
         state.remote.send_key_command("MEDIA_PLAY")
         log.info("Resumed with the MEDIA_PLAY keycode")
+        if mon is not None:
+            # Unowned playback renders from the frame alone; on a deaf layer
+            # nothing else will ever say it resumed. Measured: three Play
+            # presses, TV playing, page stuck on PAUSED ON TV at ct=74.291.
+            await mon.note_local_transport("Playing")
         return True
     except Exception:
         log.warning("MEDIA_PLAY send failed", exc_info=True)
@@ -1296,6 +1618,35 @@ async def _lounge_play() -> bool:
 # video_id; replaced whenever Lounge reports a different video.
 _lounge_meta: dict[str, dict] = {}
 _lounge_meta_in_flight: set[str] = set()
+
+
+async def _discover_playback_on_connect() -> None:
+    """One `get_now_playing()` after a fresh Lounge session, if it is safe.
+
+    See the call site for why it exists. Deliberately fire-and-forget and
+    deliberately silent on failure: this is a nicety that makes the page
+    honest sooner, never something a launch or a command depends on.
+    """
+    mon = state.lounge_monitor
+    if mon is None or queue_controller.state.current is not None:
+        return
+    if state.suppress_lounge or not state.last_current_app:
+        return
+    if state.last_current_app != SMARTTUBE_PACKAGE:
+        return
+    if state.remote is None:
+        return
+    try:
+        if not bool(state.remote.is_on):
+            return
+    except Exception:
+        return
+    try:
+        await mon.request_now_playing()
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        log.debug("Could not ask what is on screen after connect", exc_info=True)
 
 
 async def _on_lounge_event(event_type: str, observation: LoungeObservation) -> None:
@@ -1319,6 +1670,26 @@ async def _on_lounge_event(event_type: str, observation: LoungeObservation) -> N
     # recognisable signature instead of looking like our timer misfiring.
     if event_type in ("lounge.connected", "lounge.disconnected"):
         _record_device_event(event_type, state.suppress_lounge and "(suppressed)" or "")
+        if event_type == "lounge.connected":
+            # Ask ONCE what is already on the screen.
+            #
+            # Everything else here learns about playback from SmartTube's own
+            # pushes, and SmartTube pushes on TRANSITIONS — so we hear about a
+            # video that STARTS while we are connected and never about one
+            # already under way when we connect. The periodic poll cannot
+            # bridge that: `_lounge_shows_external_playback` is gated on a
+            # frame that already shows playback, so with a blank observation
+            # there is no poll, and with no poll there is never a frame.
+            #
+            # What the viewer saw was a video on the TV and a page insisting
+            # nothing was playing, for as long as SmartTube stayed quiet —
+            # after a container restart, or just from opening the page late.
+            #
+            # Same safety condition as every other caller: polling a
+            # BACKGROUNDED SmartTube auto-foregrounds it (and can wake a
+            # Shield), so this runs only when the foreground reading says
+            # SmartTube is up. No reading at all counts as "do not".
+            asyncio.create_task(_discover_playback_on_connect())
     elif event_type == "lounge.finished":
         _record_device_event(
             "lounge_finished",
@@ -1331,6 +1702,14 @@ async def _on_lounge_event(event_type: str, observation: LoungeObservation) -> N
         )
         return
     obs_dict = observation.to_dict()
+    # Carried on the frame so the page can judge THIS reading. It renders
+    # unowned playback from the observation alone, and a Paused frame is only
+    # distinguishable from the dormant cloud ghost (invariant 4) by whether
+    # SmartTube is genuinely in the lounge — a question /api/status also
+    # answers, but only as often as the page polls it.
+    obs_dict["screen_online"] = getattr(
+        state.lounge_monitor, "screen_online", None
+    ) if state.lounge_monitor is not None else None
     vid = observation.video_id
     if vid:
         # Prefer the queue item's metadata if we queued this video ourselves.
@@ -1523,7 +1902,15 @@ def _lounge_shows_external_playback() -> bool:
         lng.get("available")
         and lng.get("video_id")
         and lng.get("current_time") is not None
-        and lng.get("state") == "Playing"
+        # Playing — or Paused with SmartTube genuinely in the lounge, the same
+        # discriminator the card and /api/skip use for unowned playback. A
+        # paused unowned video is on the page as PAUSED ON TV, and a resume
+        # made with the TV remote has to be able to reach it: on a deaf layer
+        # only the poll's eventual rebind will. Without the presence clause
+        # this would be the dormant cloud ghost (invariant 4).
+        and (lng.get("state") == "Playing"
+             or (lng.get("state") == "Paused"
+                 and lng.get("screen_online") is True))
     )
 
 
@@ -1542,8 +1929,15 @@ def _should_refresh_lounge() -> bool:
     """
     if state.suppress_lounge:
         return False
-    if (queue_controller.state.current is not None
-            and not queue_controller.state.paused):
+    if queue_controller.state.current is not None:
+        # Paused too, since 2026-08-31. The poll used to stop the moment a
+        # pause was mirrored, which made a resume made with the TV REMOTE
+        # invisible on a deaf deep-link layer until the next five-minute
+        # stream close: nothing pushes, nothing polls, the page says paused
+        # while the TV plays. Polling while paused costs nothing on a healthy
+        # session; the stuck-ct detector uses a slower threshold while the
+        # frame says Paused (a frozen position is EXPECTED then), and its
+        # eventual rebind is precisely what re-reads a deaf layer.
         return True
     return _lounge_shows_external_playback()
 
@@ -1557,36 +1951,181 @@ async def _stop_lounge_monitor() -> None:
         state.lounge_monitor = None
 
 
-async def _lounge_watchdog() -> None:
-    """Periodically verify the Lounge monitor's subscribe task is still
-    alive, and restart the monitor from scratch if it's dead.
+async def _resend_if_the_wake_intent_never_landed(deep_link: str,
+                                                 video_id: str) -> None:
+    """Did the Intent we just fired at a woken device actually land?
 
-    Belt-and-suspenders for the case where the subscribe loop dies
-    silently (e.g. an unhandled exception in pyytlounge's protocol
-    handling) — without this, the UI would just show 'Playback sync:
-    OFFLINE' indefinitely until someone restarts the container. The
-    bulletproof outer wrapper in lounge.py's _subscribe_loop should
-    prevent this in normal operation; this is the safety net if that
-    wrapper somehow doesn't catch a failure mode.
+    Branch A is fire-and-forget by design: Android resolves the deep link to
+    SmartTube's handler, which foregrounds the app and starts playback in one
+    step. On a device that has only just woken, that Intent is sometimes
+    silently dropped — nothing raises, nothing logs, and the now-playing card
+    ticks for a video that never started. `_launch_failed` cannot rescue it
+    either: that check needs Lounge to report OUR video not playing, and a
+    launch that never happened leaves Lounge reporting the last one.
+
+    Re-sending is NOT the double-play regression, and the distinction is the
+    whole reason this is shaped the way it is. Invariant 1 forbids two play
+    signals for one add; a signal that demonstrably reached nothing is not one
+    of them — the same reasoning that lets a `False` from `play_video` be
+    followed by a deep link.
+
+    So the evidence has to be POSITIVE. `current_app` is `""` until
+    androidtvremote2 receives an IME key-inject message, and on a device that
+    never negotiates IME it stays that way for ever; reading that emptiness as
+    "SmartTube is not foreground" would fire a second Intent on every cold add
+    on such a device, and the clip would audibly restart. Silence proves
+    nothing here, exactly as it proves nothing in `_launch_failed`.
+
+    Scoped to launches that followed a wake. That is where the report came
+    from, it is where the device is least ready to service an Intent, and
+    keeping it off the screensaver-dismiss path — the production route for
+    most adds — keeps the blast radius of being wrong small.
     """
-    while True:
-        try:
-            await asyncio.sleep(60)
-        except asyncio.CancelledError:
+    if state.remote is None:
+        return
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + LAUNCH_FOREGROUND_TIMEOUT
+    seen = None
+    while loop.time() < deadline:
+        await asyncio.sleep(LAUNCH_FOREGROUND_POLL)
+        current = _get_current_app()
+        if not current:
+            continue                     # unreadable, not evidence of anything
+        seen = current
+        if current == SMARTTUBE_PACKAGE or current in KNOWN_SMARTTUBE_PACKAGES:
+            # It landed — possibly under a DIFFERENT id than the one we are
+            # configured with, which is normal and works: the deep link is
+            # resolved by Android's intent filter, not by our package name, so
+            # an F-Droid or pre-rename legacy build plays perfectly well while
+            # `smarttube_foreground` is never True. Reading "not the configured
+            # id" as "the Intent was dropped" re-sent it on every cold add for
+            # ever, restarting the clip 8s in — invariant 1, on a working
+            # install. Both clauses are load-bearing: the dict is not a
+            # superset of the configured value, so an operator who points
+            # SMARTTUBE_PACKAGE at an id we do not list still needs the first.
             return
-        mon = state.lounge_monitor
-        if mon is None:
-            continue
-        task = getattr(mon, "_subscribe_task", None)
-        if task is None or not task.done():
-            continue
-        log.warning(
-            "Lounge subscribe task is no longer running; restarting monitor"
+    if seen is None:
+        # The device never named a foreground app. It may well be playing.
+        log.info(
+            "Cannot tell whether the wake-path Intent for %s landed — this "
+            "device reports no foreground app. Leaving it alone rather than "
+            "sending a second play signal.",
+            video_id,
         )
+        return
+    if state.remote is None:
+        return
+    # A screensaver that kicked in after our earlier read swallows Intents of
+    # every kind, which is one way the first one goes missing on a device that
+    # was asleep. Clear it before spending the retry.
+    if seen in SCREENSAVER_PACKAGES:
+        log.info("Screensaver (%s) came up after the launch — dismissing "
+                 "before re-sending", seen)
         try:
-            await _start_lounge_monitor()
+            state.remote.send_key_command(SCREENSAVER_DISMISS_KEY)
+            await asyncio.sleep(SCREENSAVER_DISMISS_DELAY)
         except Exception:
-            log.exception("Lounge watchdog restart failed; will retry next tick")
+            log.warning("Screensaver dismiss key %s could not be sent",
+                        SCREENSAVER_DISMISS_KEY, exc_info=True)
+    log.warning(
+        "SmartTube never came to the foreground within %.0fs of the wake-path "
+        "Intent for %s (foreground is %s) — the Intent was dropped; sending it "
+        "once more",
+        LAUNCH_FOREGROUND_TIMEOUT, video_id, seen,
+    )
+    _record_device_event("launch_resent", video_id)
+    try:
+        state.remote.send_launch_app_command(deep_link)
+    except Exception:
+        log.warning("Re-sent deep link for %s could not be sent", video_id,
+                    exc_info=True)
+
+
+def _frame_is_at_its_end(obs) -> bool:
+    """Is this observation sitting within 5s of its own duration?
+
+    A position at the END of a video is not evidence it is playing; it is
+    evidence it just finished. Both of tv_play's Lounge gates depend on this,
+    and so does the decision about whether refreshing the frame could change
+    anything — hence one definition rather than two.
+    """
+    return (
+        obs is not None
+        and obs.current_time is not None
+        and obs.duration is not None
+        and obs.duration > 0
+        and (obs.duration - obs.current_time) <= 5.0
+    )
+
+
+async def _lounge_frame_is_current() -> bool:
+    """Ask SmartTube where it actually is, and say whether we got an answer.
+
+    Both of tv_play's Lounge gates turn on `obs_at_end`, and `obs_at_end` can
+    only do its job on a CURRENT frame. At end-of-video the cache is
+    systematically behind: SmartTube pushes on transitions only, it stops
+    pushing near the end, `_periodic_refresh_loop` is 3s apart, and
+    `should_refresh()` shuts that poll off completely the moment the ending
+    Paused is mirrored. Measured on hardware, the cache read 10.0 of 19.0 at
+    the instant a 19s clip had finished — nine seconds behind, which puts it
+    outside the 5s window and leaves a stale `Playing` passing every other
+    clause. The queue's own handoff then setPlaylists into a PlaybackActivity
+    that is tearing down: accepted, does nothing, SmartTube drops to the
+    launcher and the item never plays. Reported from production 2026-08-30 as
+    being thrown out of SmartTube when a video ended.
+
+    `_begin_locked` already blanks `state.lounge` against this exact hazard.
+    tv_play reads the monitor's own cache, which nothing blanks, so the
+    defence existed on only one side of the handoff.
+
+    Only a `Playing` frame opens either gate, so only a `Playing` frame is
+    worth the round trip; anything else is returned as-is and costs nothing.
+    A live player's position MOVES between two reads and a dead one's does
+    not, which is the same discriminator the stuck-ct detector uses — so a
+    frame that will not move after being asked is reported as not current, and
+    the caller falls back to the deep link. Being wrong that way costs a
+    PlaybackActivity restart; being wrong the other way strands the queue.
+
+    Safe to poll here: `request_now_playing` must not run against a
+    backgrounded SmartTube (it would auto-foreground it), and this is only
+    ever reached after tv_play has confirmed SmartTube IS foreground.
+    """
+    mon = state.lounge_monitor
+    if mon is None:
+        return False
+    before = mon.observation
+    if before.state != "Playing":
+        return True
+    # Snapshot the VALUES. `observation` hands back the live dataclass, which
+    # the event handler mutates in place, so holding the reference and
+    # comparing it later compares the frame with itself and never sees a
+    # change — which reads as "nothing moved" on a perfectly healthy player.
+    before_frame = (before.current_time, before.state, before.video_id)
+    before_ct, before_vid = before.current_time, before.video_id
+    try:
+        answered = await mon.request_now_playing()
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        log.debug("Could not refresh the Lounge observation", exc_info=True)
+        return False
+    if not answered:
+        return False
+    # The reply arrives on the bind channel rather than as that call's return
+    # value, so wait briefly for the frame to move.
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + LOUNGE_REFRESH_TIMEOUT
+    while loop.time() < deadline:
+        now = mon.observation
+        if (now.current_time, now.state, now.video_id) != before_frame:
+            return True
+        await asyncio.sleep(LOUNGE_REFRESH_POLL)
+    log.info(
+        "Lounge still reports %s at %.1fs after being asked for a fresh "
+        "position — treating the frame as stale, not as live playback",
+        before_vid, before_ct or 0.0,
+    )
+    return False
 
 
 async def tv_play(video_id: str, start_s: Optional[int] = None) -> Optional[float]:
@@ -1597,6 +2136,19 @@ async def tv_play(video_id: str, start_s: Optional[int] = None) -> Optional[floa
     Raises on failure — the queue controller logs but does not roll back state."""
     if state.remote is None:
         raise RuntimeError("not connected to TV")
+
+    # A new launch voids the transport histories. The pause-delivery record
+    # and the seek anchor both describe the PREVIOUS playback, and both are
+    # scoped by video_id alone — which cannot separate two consecutive queue
+    # entries sharing an id (ordinary here; the FINISH_CONSUMED machinery
+    # exists for the same reason). A leftover keycode record would in-place
+    # "resume" the new copy; a leftover seek target near the old copy's end
+    # would let the first press after the handoff throw the new copy hundreds
+    # of seconds forward.
+    global _last_seek_target, _last_seek_vid
+    state.last_pause_delivery = None
+    _last_seek_target = None
+    _last_seek_vid = None
 
     was_off = False
     try:
@@ -1629,6 +2181,9 @@ async def tv_play(video_id: str, start_s: Optional[int] = None) -> Optional[floa
                             exc_info=True)
                 _record_device_event("wake_send_error", WAKE_KEYCODE)
             came_on = await _wait_for_tv_on(WAKE_TIMEOUT, WAKE_POLL)
+            # When the device reported on, as distinct from when we asked it
+            # to. The settle floor below needs both; see POST_ON_SETTLE.
+            came_on_at = loop.time() if came_on else None
             if not came_on:
                 # First POWER didn't take effect. Probable cause: the
                 # androidtvremote2 TLS connection has gone stale — TCP
@@ -1658,6 +2213,8 @@ async def tv_play(video_id: str, start_s: Optional[int] = None) -> Optional[floa
                         # on (maybe the first POWER did take effect, just
                         # not visibly via the dead connection).
                         came_on = bool(state.remote and state.remote.is_on)
+                    if came_on and came_on_at is None:
+                        came_on_at = loop.time()
                 if not came_on:
                     # Two attempts on a fresh connection both went nowhere, so
                     # this is very unlikely to be our side. The usual cause is
@@ -1676,9 +2233,21 @@ async def tv_play(video_id: str, start_s: Optional[int] = None) -> Optional[floa
             # backlight on) before Android is ready for launch intents. On
             # Quick Resume TVs is_on flips ~instantly even while the OS is
             # still booting; the WAKE_DELAY is what bridges that gap.
-            elapsed = loop.time() - wake_started_at
-            if elapsed < WAKE_DELAY:
-                await asyncio.sleep(WAKE_DELAY - elapsed)
+            #
+            # TWO floors, and we wait out whichever still has time on it. The
+            # keypress one is the original and covers the Quick Resume case it
+            # was written for. It is also the only one there was, and it left
+            # a device that answered SLOWLY with no settle at all: by the time
+            # `is_on` flipped, the whole floor had already been spent waiting
+            # for that flip, so the Intent went out immediately — to the
+            # hardware least ready to receive it. POST_ON_SETTLE is measured
+            # from the flip itself, so it cannot be consumed by the wait.
+            now = loop.time()
+            settle = WAKE_DELAY - (now - wake_started_at)
+            if came_on_at is not None:
+                settle = max(settle, POST_ON_SETTLE - (now - came_on_at))
+            if settle > 0:
+                await asyncio.sleep(settle)
         finally:
             # Make sure we always clear the flag — including on raise —
             # otherwise the UI would be stuck on WAKING forever.
@@ -1772,6 +2341,46 @@ async def tv_play(video_id: str, start_s: Optional[int] = None) -> Optional[floa
             current_app,
         )
         state.remote.send_launch_app_command(deep_link)
+        if was_off:
+            await _resend_if_the_wake_intent_never_landed(deep_link, video_id)
+        return
+
+    # We woke this device ourselves, moments ago. Whatever the Lounge cache
+    # says, there is no live PlaybackActivity on the other end to receive a
+    # playlist swap — so send the Intent and skip the Lounge branch entirely.
+    #
+    # This is the cold-boot failure the 2026-08-30 hardware session reproduced
+    # and A/B'd. Sleep the device MID-PLAYBACK and YouTube's cloud goes on
+    # naming the interrupted video as `Playing` at a position nowhere near its
+    # duration, so the smooth-swap gate opened and setPlaylist went into a
+    # dormant player. The cloud ACCEPTED it — the cache even flipped to the new
+    # video at ct 0.5 "Playing" — while the device recorded zero
+    # PlaybackActivity starts. The video never played, the card ticked for 35s,
+    # and the duration timer then advanced off playback that never existed.
+    # Same test with this branch present: the video plays.
+    #
+    # `_lounge_frame_is_current` does NOT cover this, and the reason is worth
+    # keeping: in the reproduction the cached position was ADVANCING while the
+    # device slept (93.3 -> 99.4 -> 107.1), so "did the frame move" answers yes
+    # and the gate opens anyway. A freshness test asks the cloud to certify
+    # itself. This asks us instead: we sent a wake key on this call and waited
+    # for the device to boot. That is invariant 4 applied where we have direct
+    # evidence rather than an inference from a cache we are told not to trust.
+    #
+    # It also makes the cold add FASTER, which is the reason to like it beyond
+    # correctness: it skips the reconnect poke, up to LOUNGE_CONNECT_TIMEOUT of
+    # waiting, the observation poll and the refresh — several seconds, on the
+    # slowest path the user ever sees.
+    if was_off:
+        log.info(
+            "Device was asleep when this add arrived — deep link for %s rather "
+            "than trusting a Lounge frame about a player that cannot be running",
+            video_id,
+        )
+        state.remote.send_launch_app_command(deep_link)
+        log.info("Sent %s%s to %s via deep link (post-wake)",
+                 video_id, f" @ {start_s}s" if start_s else "", state.host)
+        await _resend_if_the_wake_intent_never_landed(deep_link, video_id)
         return
 
     # SmartTube is foreground. Use Lounge for smooth swap / skip-redundant.
@@ -1791,6 +2400,20 @@ async def tv_play(video_id: str, start_s: Optional[int] = None) -> Optional[floa
             if obs_inner.video_id is not None and obs_inner.current_time is not None:
                 break
             await asyncio.sleep(LOUNGE_OBSERVATION_POLL)
+        # Both gates below turn on `obs_at_end`, which can only separate
+        # "playing" from "just finished" on a CURRENT frame — and the frame
+        # sitting in the monitor's cache at end-of-video is systematically
+        # nine seconds behind. Ask before deciding; see _lounge_frame_is_current.
+        #
+        # ...unless the cached frame ALREADY says the video ended, in which
+        # case both gates shut whatever a refresh returns and the round trip is
+        # pure latency on the queue's own hand-off — the commonest path here.
+        # Safe in the direction that matters: were such a frame somehow wrong,
+        # the gates stay shut and we deep link, which always works.
+        obs_is_current = (
+            True if _frame_is_at_its_end(state.lounge_monitor.observation)
+            else await _lounge_frame_is_current()
+        )
         obs = state.lounge_monitor.observation
         # A position sitting at the END of the video is not evidence that it
         # is playing — it is evidence that it just FINISHED. That matters
@@ -1800,14 +2423,15 @@ async def tv_play(video_id: str, start_s: Optional[int] = None) -> Optional[floa
         # every test below passes. tv_play then "skipped" as redundant and
         # sent NOTHING AT ALL, so the second copy never played and everything
         # behind it stranded. Measured 3/3 on hardware with a three-item queue.
-        obs_at_end = (
-            obs.current_time is not None
-            and obs.duration is not None
-            and obs.duration > 0
-            and (obs.duration - obs.current_time) <= 5.0
-        )
+        obs_at_end = _frame_is_at_its_end(obs)
+        # What both gates below actually need: a reading we can reason about.
+        # A frame that is at its end says the video finished; a frame we could
+        # not refresh says nothing at all. Neither is grounds for adopting
+        # playback or for swapping a playlist into a live player.
+        obs_describes_live_playback = obs_is_current and not obs_at_end
         if (obs.video_id == video_id and obs.available
-                and obs.current_time is not None and not obs_at_end):
+                and obs.current_time is not None
+                and obs_describes_live_playback):
             if obs.state == "Playing":
                 log.info("SmartTube already playing %s @ %.1fs — skipping",
                          video_id, obs.current_time)
@@ -1835,6 +2459,21 @@ async def tv_play(video_id: str, start_s: Optional[int] = None) -> Optional[floa
                     verify_deadline = loop.time() + RESUME_VERIFY_TIMEOUT
                     while loop.time() < verify_deadline:
                         obs_check = state.lounge_monitor.observation
+                        if obs_check.state != "Playing":
+                            # Ask, for the same reason as the resume path in
+                            # `_lounge_play`: nothing refreshes this
+                            # observation while we wait, so a passive loop
+                            # times out on a player that is already resuming
+                            # and we deep link over it. Safe here because this
+                            # branch has already established SmartTube is
+                            # foreground.
+                            try:
+                                await state.lounge_monitor.request_now_playing()
+                            except asyncio.CancelledError:
+                                raise
+                            except Exception:
+                                pass
+                            obs_check = state.lounge_monitor.observation
                         if obs_check.state == "Playing":
                             log.info(
                                 "SmartTube has %s loaded but state=Paused @ %.1fs — "
@@ -1877,7 +2516,12 @@ async def tv_play(video_id: str, start_s: Optional[int] = None) -> Optional[floa
             # handoff — the previous video ending is exactly why we are here —
             # so it is the common case, not an edge one. The deep link below
             # kicks playback fresh through Android's Intent system instead.
-            and not obs_at_end
+            #
+            # ...and the frame has to be CURRENT for that clause to mean
+            # anything. A cached position nine seconds behind the truth reads
+            # as mid-video on a clip that has already ended, which is how this
+            # gate opened onto a dying player in production.
+            and obs_describes_live_playback
         )
         if smarttube_actively_playing:
             try:
@@ -2060,13 +2704,6 @@ async def lifespan(_app: FastAPI):
     except Exception:
         log.exception("Lounge monitor failed to start")
 
-    # Watchdog: revive the Lounge monitor if its subscribe task dies.
-    # See _lounge_watchdog for context — without this, an unhandled
-    # exception in the monitor would leave Playback Sync OFFLINE until
-    # someone manually restarts the container — observed in production
-    # after a power outage where the NAS came back before the router did.
-    watchdog_task = asyncio.create_task(_lounge_watchdog())
-
     try:
         yield
     finally:
@@ -2075,9 +2712,6 @@ async def lifespan(_app: FastAPI):
         # further down, after _startup_retry_task has already been dealt with.
         global _shutting_down
         _shutting_down = True
-        watchdog_task.cancel()
-        with contextlib.suppress(BaseException):
-            await watchdog_task
         # Cancel the GLOBALS, not the startup-time locals. /api/tv/address
         # re-arms the retry loop into _startup_retry_task after a failed
         # address change, so the local captured at boot can be a task that
@@ -2624,6 +3258,7 @@ def _diagnostic_environment() -> dict:
             "idle_keycode": IDLE_KEYCODE,
             "wake_keycode": WAKE_KEYCODE,
             "wake_delay": WAKE_DELAY,
+            "post_on_settle": POST_ON_SETTLE,
             "wake_timeout": WAKE_TIMEOUT,
             "lounge_connect_timeout": LOUNGE_CONNECT_TIMEOUT,
             "lounge_observation_timeout": LOUNGE_OBSERVATION_TIMEOUT,
@@ -3136,9 +3771,13 @@ async def _sample_post_wake_readiness(ctx: dict) -> dict:
     `is_on` is a liar on instant-on hardware — it flips within ~1s while the
     OS is still booting, and on pre-9.2 SHIELD Experience the device then
     ignores the network for up to 60s ("remote stops responding for 60 seconds
-    after wake from sleep", NVIDIA's own release notes). Our WAKE_DELAY=15
-    expires inside that window, so a launch sent on schedule is silently
+    after wake from sleep", NVIDIA's own release notes). Neither of our wake
+    floors comes close to that window — `WAKE_DELAY` from the keypress,
+    `POST_ON_SETTLE` from the flip — so a launch sent on schedule is silently
     swallowed and would previously have been misread as a deep-link failure.
+    Don't restate either value here: this docstring said "WAKE_DELAY=15", went
+    stale when the default moved to 16, and was rewritten with 16 and 3 in it
+    hours before both moved again. Name the constants, not the numbers.
 
     Strictly read-only: samples current_app, sends nothing. Breaks out on the
     first non-empty read, so a healthy device costs seconds.
@@ -5037,11 +5676,16 @@ async def get_queue():
 async def add_to_queue(req: AddReq, request: Request):
     _reject_during_self_test()
     _require_paired()
-    _check_rate_limit(request)
     raw = req.url or req.video_id or ""
     vid = extract_video_id(raw)
     if not vid:
         raise HTTPException(400, "could not extract a YouTube video ID from input")
+    # Rate limit AFTER extraction, so the bucket is spent only by a request
+    # that actually schedules a scrape and a launch. Ahead of the extractor it
+    # was also spent by pastes we refuse outright — a playlist link, a channel
+    # link, a typo'd id — so the corrected paste seconds later came back 429
+    # from a service that had done no work for them.
+    _check_rate_limit(request)
     start_s = extract_start_seconds(raw)
     item = await _build_queue_item(vid, start_s=start_s)
     await queue_controller.add(item)
@@ -5089,11 +5733,29 @@ async def skip():
     # state. `Playing` specifically — a cached Paused/Stopped observation is a
     # stale ghost, not playback, and must not trigger the idle sequence.
     lng = queue_controller.state.lounge or {}
-    lounge_playing = bool(
+    # `Playing` OR a PAUSED frame we have positive reason to believe. The
+    # page now renders unowned paused playback and offers a live Skip over
+    # it, and this gate is the other half: without it Skip returned 200,
+    # sent nothing to the TV, and then blanked the card via
+    # `forget_lounge_observation` — so it LOOKED like it had worked while the
+    # video sat frozen on screen.
+    #
+    # `Playing` alone was right when it was written: the cloud cache reports
+    # dormant players as Paused indefinitely (invariant 4) and firing
+    # IDLE_KEYCODE off a ghost would background SmartTube for nothing. What
+    # makes the Paused case safe now is `screen_online` — SmartTube genuinely
+    # in the lounge — the same discriminator the card uses to decide the
+    # frame is a live paused player rather than a ghost.
+    lounge_has_video = bool(
         lng.get("available")
         and lng.get("video_id")
         and lng.get("current_time") is not None
-        and lng.get("state") == "Playing"
+    )
+    lounge_playing = bool(
+        lounge_has_video
+        and (lng.get("state") == "Playing"
+             or (lng.get("state") == "Paused"
+                 and lng.get("screen_online") is True))
     )
     had_playback = queue_controller.state.current is not None or lounge_playing
     await queue_controller.skip()
@@ -5191,6 +5853,43 @@ class SeekReq(BaseModel):
     by: Optional[float] = None
 
 
+# What we last told the device to seek to, what it was reporting when we said
+# so, when that was, and for which video. Only ever read by a FOLLOWING
+# relative seek, and only while the device has said nothing since — see the
+# comment in `seek`. Bounded by SEEK_COALESCE_WINDOW so a stale target cannot
+# anchor a press minutes later.
+_last_seek_target: Optional[float] = None
+_last_seek_base_ct: Optional[float] = None
+_last_seek_at: float = 0.0
+_last_seek_vid: Optional[str] = None
+# Long enough to cover a burst of presses against a device that answers slowly,
+# short enough that an unrelated later press anchors on the device again.
+SEEK_COALESCE_WINDOW = 12.0
+# How far short of the end a seek is allowed to land. One second: close enough
+# to count as "the end", far enough that the device does not treat the target
+# as out of range and drop it.
+SEEK_END_MARGIN = 1.0
+
+# How long a seek will wait out a Lounge rebind before refusing. The session
+# recycles ROUTINELY — YouTube ends the bind stream every ~4.5-5 minutes, and
+# the stuck-ct self-heal rebinds every ~34s while deep-link playback answers
+# position polls with a frozen value — and the gaps measure 130-250ms. Three
+# seconds is margin, not expectation; `_wait_for_lounge_connected` returns
+# early on a definite no, so a genuinely dead session still answers promptly.
+SEEK_RECONNECT_WAIT = 3.0
+# ...and how long a relative seek waits for the rebind's fresh frame after the
+# teardown blanked the observation (measured: it arrives with the connect,
+# ~200ms).
+SEEK_POSITION_WAIT = 2.0
+
+# How far BEHIND our last accepted target (beyond the elapsed play time) a
+# changed frame must be before it is treated as a stale transition push rather
+# than the device speaking. Caught by the transport fuzz on hardware: a resume
+# push carried a pre-seek position, and the next +30 press anchored on it and
+# rewound the video seventy seconds.
+SEEK_STALE_PUSH_SLACK = 3.0
+
+
 @app.post("/api/seek")
 async def seek(req: SeekReq):
     """Seek the currently-playing video. Supply either:
@@ -5202,33 +5901,189 @@ async def seek(req: SeekReq):
     primitive on this hardware (the remote-protocol KEYCODE_MEDIA_*_FF
     keys aren't a thing across TV firmwares)."""
     _reject_during_self_test()
-    if state.lounge_monitor is None or not state.lounge_monitor.is_connected:
+    if state.lounge_monitor is None:
         raise HTTPException(503, "Lounge not connected; can't seek")
+    if not state.lounge_monitor.is_connected:
+        # Ride out a rebind blip instead of bouncing the press. The session
+        # recycles routinely (see SEEK_RECONNECT_WAIT above) and the gaps are
+        # sub-second, but a seek that landed in one was refused outright —
+        # reported from live use as "lounge is occasionally disconnected when
+        # trying to seek", and the dev log shows the 503 stamped the same
+        # millisecond as a stuck-ct teardown. Poke the subscribe loop first so
+        # a backoff sleep cannot outlast the wait.
+        if hasattr(state.lounge_monitor, "request_reconnect_now"):
+            state.lounge_monitor.request_reconnect_now()
+        await _wait_for_lounge_connected(SEEK_RECONNECT_WAIT, 0.05)
+        if state.lounge_monitor is None or not state.lounge_monitor.is_connected:
+            raise HTTPException(503, "Lounge not connected; can't seek")
     if getattr(state.lounge_monitor, "screen_online", None) is False:
         # The cloud would accept the seek and nothing would receive it, and
         # a 200 here re-anchors the duration timer to a position playback
-        # never reached.
+        # never reached. So the refusal reads the RAW flag, deliberately —
+        # during a dip the command really does reach nobody.
+        #
+        # What it SAYS, though, has to read the settled one. A healthy screen
+        # leaves the lounge device list for 32-85s every 4-5 minutes as routine
+        # churn, which is 11-35% of playback time; answering that with "go and
+        # toggle Remote control on your TV" sent people to reconfigure a device
+        # that was fine and would heal itself within the minute. A remedy
+        # offered for a self-healing state is how you train someone to ignore
+        # the remedy that matters. The grace already exists for exactly this
+        # distinction — see the screen_online truth in CLAUDE.md — this just
+        # stops the toast contradicting the header that reads it.
+        if getattr(state.lounge_monitor, "screen_online_settled", None) is False:
+            raise HTTPException(
+                503, "SmartTube is not in the lounge; a seek would reach nothing. "
+                     "On the TV: SmartTube -> Settings -> Remote control, off and on.",
+            )
         raise HTTPException(
-            503, "SmartTube is not in the lounge; a seek would reach nothing. "
-                 "On the TV: SmartTube -> Settings -> Remote control, off and on.",
+            503, "SmartTube's link to YouTube is recycling — seek is unavailable "
+                 "for a few seconds. Try again shortly.",
         )
+
+    global _last_seek_target, _last_seek_base_ct, _last_seek_at, _last_seek_vid
+    now = asyncio.get_running_loop().time()
+    cur_vid = (queue_controller.state.current.video_id
+               if queue_controller.state.current else None)
 
     if req.to is not None:
         target = parse_time_input(req.to)
         if target is None:
             raise HTTPException(400, f"could not parse time {req.to!r}")
     elif req.by is not None:
-        # Relative seek needs a current position to anchor on.
+        # Relative seek needs a current position to anchor on. A self-heal
+        # teardown BLANKS the observation and the rebind delivers a fresh
+        # frame ~200ms later, so an empty position gets a moment to fill in
+        # before it becomes a refusal. And early in a deep-link video the
+        # cache can stay blank for LONGER than any polite wait — measured 18s
+        # after a launch, the first +60 press still got "no current playback
+        # position" — so when the foreground reading says SmartTube is up we
+        # ASK for the frame instead of hoping one arrives. Never without that
+        # reading: request_now_playing against a backgrounded SmartTube
+        # auto-foregrounds it, and on a Shield can wake the device.
+        deadline = asyncio.get_running_loop().time() + SEEK_POSITION_WAIT
+        can_ask = _get_current_app() == SMARTTUBE_PACKAGE
+        asks = 0
+        while (state.lounge_monitor is not None
+               and state.lounge_monitor.observation.current_time is None
+               and asyncio.get_running_loop().time() < deadline):
+            if can_ask and asks < 3:
+                asks += 1
+                try:
+                    # Bounded: request_now_playing is an untimed POST, and
+                    # SEEK_POSITION_WAIT's deadline is only tested between
+                    # iterations — without this, three slow asks could hold
+                    # the HTTP request far past the budget.
+                    await asyncio.wait_for(
+                        state.lounge_monitor.request_now_playing(), 1.0)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    pass
+            await asyncio.sleep(0.15 if can_ask else 0.05)
+        if state.lounge_monitor is None:
+            raise HTTPException(503, "Lounge not connected; can't seek")
         obs = state.lounge_monitor.observation
         if obs.current_time is None:
             raise HTTPException(
                 503, "no current playback position from Lounge; can't seek by offset",
             )
-        target = float(obs.current_time) + float(req.by)
+        base = float(obs.current_time)
+        # ...and the Lounge position is the WRONG anchor for a second press,
+        # because it does not move between them. SmartTube pushes on
+        # transitions and our poll is seconds apart, so after a seek the cache
+        # still holds the OLD position until the device gets round to
+        # mentioning the new one. Every press then computed the same target
+        # from the same stale base: reported from real use as six consecutive
+        # presses all seeking to 205.3s, and — with different buttons — as a
+        # playhead bouncing between two points instead of moving where the
+        # presses pointed.
+        #
+        # So while the device has not reported ANYTHING new since our last
+        # seek, our own last target is the better record of where the playhead
+        # is. The moment the observation changes, it wins again: it is the
+        # device speaking, and this is only a stand-in for its silence.
+        if (_last_seek_target is not None
+                and _last_seek_vid == cur_vid):
+            if obs.current_time == _last_seek_base_ct:
+                # SILENCE: the frame has not changed since our own seek, and
+                # an unchanged frame never wins the anchor back — however
+                # long it sits. This deliberately has NO time limit. The
+                # window was first read as "the device has had every chance
+                # to report by now", and measured reality contradicts it
+                # twice over: on deep-link playback the frame freezes for
+                # ~34s between rebinds, and while paused the refresh poll is
+                # gated off entirely. Re-anchoring on the frozen value
+                # produced the same bounce both ways on hardware — two +30
+                # presses 13s apart both computing 475.2, and a +30 pressed
+                # nine seconds after an unpause REWINDING the video ninety
+                # seconds (target 134.1 off a frame stuck at 104.1 with the
+                # playhead truly at ~203). Silence composes; the device wins
+                # the anchor back by SAYING something, not by staying quiet.
+                base = _last_seek_target
+            elif (now - _last_seek_at <= SEEK_COALESCE_WINDOW
+                  and float(obs.current_time)
+                      < _last_seek_target - (now - _last_seek_at)
+                        - SEEK_STALE_PUSH_SLACK):
+                # A frame can CHANGE and still be stale. Measured by the
+                # transport fuzz: a pause→seek→resume sequence had the resume's
+                # transition push carry a PRE-SEEK position, "the device spoke"
+                # won the anchor back, and the next +30 press rewound the video
+                # seventy seconds. If our accepted seek landed, the playhead
+                # cannot be further back than the target minus the time since —
+                # so a frame that is still keeps composing from the target.
+                # Only INSIDE the window, which is all that remains of it: a
+                # changed frame that still looks implausible can be overridden
+                # for at most SEEK_COALESCE_WINDOW, and past that the device's
+                # word stands however far back it points. Accepted residual: a
+                # backwards seek made on the TV's own remote inside the window
+                # is overridden for one press.
+                base = _last_seek_target
+        target = base + float(req.by)
         if target < 0:
             target = 0.0
     else:
         raise HTTPException(400, "supply either `to` or `by`")
+
+    # Clamp to just short of the end, the symmetric partner of the clamp to 0
+    # above. SmartTube silently IGNORES an out-of-range seek — measured, a seek
+    # to 755s of a 635s video was accepted by us, reported as ok, and did
+    # nothing at all — so without this a guest tapping +30 near the end presses
+    # a button that stops responding while the page tells them it worked. That
+    # became easier to hit the moment successive presses started composing.
+    #
+    # Landing a second short of the end rather than refusing lets the video
+    # simply play out and the queue advance by its normal path, which is what
+    # "skip to the end" should do.
+    #
+    # Never for a livestream: its reported length is a DVR window, not an end,
+    # and clamping would fence the viewer out of the live edge. The queue never
+    # arms a duration timer for one and every sibling check bails on the same
+    # test.
+    cur_item = queue_controller.state.current
+    if not getattr(cur_item, "is_live", False):
+        # Only from a frame that describes the video we are seeking. The
+        # observation is a cache that keeps reporting the PREVIOUS video after
+        # we have moved on, so sizing the clamp from it unconditionally could
+        # cut a seek short against some other video's length — a 60-minute
+        # video clamped to 18s by a leftover 19s frame, reported as success.
+        obs = state.lounge_monitor.observation
+        obs_dur = getattr(obs, "duration", None)
+        obs_is_ours = (
+            cur_item is None                      # unowned: the frame IS the video
+            or getattr(obs, "video_id", None) == cur_item.video_id
+        )
+        known = (obs_dur if (obs_dur and obs_is_ours)
+                 else getattr(cur_item, "duration_s", None))
+        if known and float(known) > SEEK_END_MARGIN:
+            target = min(target, float(known) - SEEK_END_MARGIN)
+
+    # Remember what we asked for and what the device was saying when we asked,
+    # so the next press can tell "it has not answered yet" from "it moved".
+    _last_seek_target = target
+    _last_seek_base_ct = getattr(state.lounge_monitor.observation, "current_time", None)
+    _last_seek_at = now
+    _last_seek_vid = cur_vid
 
     # Capture WHICH video this seek is for, before the round trip. A handoff
     # can land while seek_to is in flight, and re-anchoring the new item to
@@ -5317,11 +6172,16 @@ async def play(req: AddReq, request: Request):
     """
     _reject_during_self_test()
     _require_paired()
-    _check_rate_limit(request)
     raw = req.url or req.video_id or ""
     vid = extract_video_id(raw)
     if not vid:
         raise HTTPException(400, "could not extract a YouTube video ID from input")
+    # Rate limit AFTER extraction, so the bucket is spent only by a request
+    # that actually schedules a scrape and a launch. Ahead of the extractor it
+    # was also spent by pastes we refuse outright — a playlist link, a channel
+    # link, a typo'd id — so the corrected paste seconds later came back 429
+    # from a service that had done no work for them.
+    _check_rate_limit(request)
     start_s = extract_start_seconds(raw)
 
     was_off = False

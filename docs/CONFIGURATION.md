@@ -22,7 +22,8 @@ services:
 | `SMARTTUBE_PACKAGE` | `org.smarttube.stable` | The SmartTube build installed on your TV. Only change this if you installed SmartTube's own beta or F-Droid build — it is unrelated to this app's `:beta` image |
 | `LOG_LEVEL` | `INFO` | Set `DEBUG` when diagnosing something. Case-insensitive; an unrecognised value falls back to `INFO` with a warning rather than failing to start |
 | `RATE_LIMIT_SECONDS` | `10` | Per-IP cool-down between queue submissions |
-| `WAKE_DELAY` | `15.0` | Minimum seconds to wait after the wake key before launching. A floor, not a timeout — instant-on TVs report "on" in ~1s while still booting |
+| `WAKE_DELAY` | `6.0` | Minimum seconds to wait after the wake key before launching. A floor, not a timeout — instant-on TVs report "on" in ~1s while still booting |
+| `POST_ON_SETTLE` | `5.0` | Minimum seconds to wait after the device *reports on*, as opposed to after the key was sent. Covers a device that answers slowly, where `WAKE_DELAY` has already been spent waiting for the answer |
 | `WAKE_TIMEOUT` | `30.0` | Give up waiting for the TV to report on |
 | `WAKE_KEYCODE` | `POWER` | Key sent to wake a sleeping device. `POWER` is a *toggle*; a device that ignores toggles while asleep can never be woken and reports no error. Try `WAKEUP` or `TV_POWER` if yours never wakes — but note `WAKEUP` is silently dropped on Google TV, so only change this if the default has failed |
 | `WAKE_POLL` | `0.5` | How often to re-check while waking |
