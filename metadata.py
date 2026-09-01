@@ -69,6 +69,155 @@ def _fallback(video_id: str) -> Metadata:
     )
 
 
+_SEARCH_URL = "https://www.youtube.com/youtubei/v1/search?prettyPrint=false"
+_SEARCH_CONTEXT = {
+    "context": {"client": {"clientName": "WEB", "clientVersion": "2.20240101.00.00",
+                           "hl": "en", "gl": "US"}},
+}
+
+
+def _parse_length_text(text: str) -> Optional[int]:
+    """'10:35' -> 635, '1:02:03' -> 3723. None for anything else (LIVE, '')."""
+    if not text or ":" not in text:
+        return None
+    parts = text.strip().split(":")
+    if not 2 <= len(parts) <= 3 or not all(p.isdigit() for p in parts):
+        return None
+    total = 0
+    for p in parts:
+        total = total * 60 + int(p)
+    return total if total > 0 else None
+
+
+def _find_video_renderer(node, video_id: str) -> Optional[dict]:
+    """Depth-first search of an InnerTube response for OUR videoRenderer.
+
+    Renderer nesting differs between clients and changes over time; matching
+    on the videoId wherever it sits is what survives that."""
+    if isinstance(node, dict):
+        vr = node.get("videoRenderer")
+        if isinstance(vr, dict) and vr.get("videoId") == video_id:
+            return vr
+        for v in node.values():
+            found = _find_video_renderer(v, video_id)
+            if found is not None:
+                return found
+    elif isinstance(node, list):
+        for v in node:
+            found = _find_video_renderer(v, video_id)
+            if found is not None:
+                return found
+    return None
+
+
+def _runs_text(obj) -> Optional[str]:
+    runs = (obj or {}).get("runs") if isinstance(obj, dict) else None
+    if runs and isinstance(runs, list) and runs[0].get("text"):
+        return runs[0]["text"]
+    simple = (obj or {}).get("simpleText") if isinstance(obj, dict) else None
+    return simple or None
+
+
+async def _search_rescue(
+    video_id: str, client: httpx.AsyncClient,
+) -> Optional[Metadata]:
+    """Full metadata from the InnerTube SEARCH endpoint, keyed by video id.
+
+    Measured live 2026-08-31 while the bot wall was up: the watch page and
+    every InnerTube PLAYER client identity (web, TV, Android, iOS, SmartTube's
+    own Quest identity) answered "Sign in to confirm you're not a bot" — the
+    wall is applied per address on the player surface. The SEARCH surface was
+    not walled, needs no API key, and a query that is just the video id puts
+    the video's own renderer in the results: title, owner, `lengthText` and
+    a LIVE overlay for livestreams. Unlike oEmbed that includes the DURATION,
+    which is what a QUEUED video shows on its card and what arms the
+    auto-advance timer — a queued video has no Lounge frame to correct a
+    600s guess, and the wrong length was reported from the queue within
+    minutes of the wall going up.
+    """
+    try:
+        resp = await client.post(
+            _SEARCH_URL,
+            json={**_SEARCH_CONTEXT, "query": video_id},
+            headers={"User-Agent": USER_AGENT, "Content-Type": "application/json"},
+            timeout=FETCH_TIMEOUT_S,
+        )
+        resp.raise_for_status()
+        vr = _find_video_renderer(resp.json(), video_id)
+        if vr is None:
+            return None
+        title = _runs_text(vr.get("title"))
+        if not title:
+            return None
+        channel = _runs_text(vr.get("ownerText")) or "unknown"
+        live = False
+        for overlay in vr.get("thumbnailOverlays") or []:
+            status = (overlay or {}).get("thumbnailOverlayTimeStatusRenderer") or {}
+            if status.get("style") == "LIVE":
+                live = True
+        duration = None if live else _parse_length_text(
+            _runs_text(vr.get("lengthText")) or "")
+        if not live and duration is None:
+            # A renderer with neither a length nor a live badge is not enough
+            # to trust; let the next tier try.
+            return None
+        return Metadata(
+            video_id=video_id,
+            title=title,
+            channel=channel,
+            duration_s=duration,
+            is_live=live,
+            thumbnail_url=_thumbnail_for(video_id),
+            scrape_ok=True,
+        )
+    except Exception:
+        log.info("search rescue failed for %s", video_id, exc_info=True)
+        return None
+
+
+_OEMBED_URL = "https://www.youtube.com/oembed"
+
+
+async def _oembed_rescue(
+    video_id: str, client: httpx.AsyncClient,
+) -> Optional[Metadata]:
+    """Title and uploader from the oEmbed endpoint, when the watch page fails.
+
+    Hit live 2026-08-31: after a day of heavy fetching from one address,
+    YouTube served the watch page with HTTP 200 and no videoDetails ("Sign in
+    to confirm" — the bot wall), and every card fell back to title=video_id /
+    channel=unknown. oEmbed is not walled the same way and carries exactly
+    the two fields a guest actually reads on the card. It has no duration and
+    no live flag, so the result keeps the documented fallback duration and
+    `scrape_ok=False` — the Lounge-reported duration corrects the
+    auto-advance timer at runtime, as it already does for a wrong scrape.
+    """
+    try:
+        resp = await client.get(
+            _OEMBED_URL,
+            params={"url": f"https://www.youtube.com/watch?v={video_id}",
+                    "format": "json"},
+            timeout=FETCH_TIMEOUT_S,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        title = data.get("title")
+        if not title:
+            return None
+        return Metadata(
+            video_id=video_id,
+            title=title,
+            channel=data.get("author_name") or "unknown",
+            duration_s=DEFAULT_DURATION_S,
+            is_live=False,
+            thumbnail_url=_thumbnail_for(video_id),
+            scrape_ok=False,
+        )
+    except Exception:
+        log.info("oEmbed rescue failed for %s", video_id, exc_info=True)
+        return None
+
+
 def _extract_player_response(html: str) -> Optional[dict]:
     """Find `var ytInitialPlayerResponse = {...}` and return the parsed JSON."""
     m = _PR_PREFIX.search(html)
@@ -147,116 +296,6 @@ def parse_metadata(video_id: str, html: str) -> Metadata:
     )
 
 
-_VIDEO_ID_IN_SEARCH = re.compile(r'"videoId"\s*:\s*"([A-Za-z0-9_-]{11})"')
-
-# Bound on watch-page verification calls per lookup. The cost of a wrong-thumbnail
-# bug is mostly cosmetic, but going past ~5 candidates rarely improves the result.
-MAX_VERIFY_CANDIDATES = 5
-
-
-def _normalize(s: str) -> str:
-    """Casefold + collapse whitespace + strip surrounding punct/space."""
-    if not s:
-        return ""
-    return re.sub(r"\s+", " ", s.casefold()).strip()
-
-
-def _title_channel_matches(md: "Metadata", title: str, channel: str) -> bool:
-    """Bidirectional substring match on normalized strings.
-
-    'bidirectional' because either side may be truncated in real data: Cast
-    sometimes truncates long titles, YouTube sometimes appends/strips
-    suffixes. Channel names are usually exact but we relax the match the
-    same way for safety.
-    """
-    a_t, b_t = _normalize(md.title), _normalize(title)
-    a_c, b_c = _normalize(md.channel), _normalize(channel)
-    title_ok = bool(a_t and b_t) and (a_t in b_t or b_t in a_t)
-    chan_ok = bool(a_c and b_c) and (a_c in b_c or b_c in a_c)
-    return title_ok and chan_ok
-
-
-async def find_video_id_by_title(
-    title: str,
-    *,
-    expected_channel: Optional[str] = None,
-    max_candidates: int = MAX_VERIFY_CANDIDATES,
-    client: Optional[httpx.AsyncClient] = None,
-) -> Optional[str]:
-    """Look up a YouTube video ID by title via the search-results page.
-
-    Two-layer accuracy:
-    1. **Disambiguate the search.** If `expected_channel` is given, it's
-       added to the query (e.g. 'Live Stream HANA' instead of just
-       'Live Stream'). This dramatically improves the first-page hit rate
-       for generic titles.
-    2. **Verify each candidate.** With `expected_channel`, we fetch the
-       top N candidates' watch pages and compare title+channel before
-       accepting one. Without `expected_channel` (no verification signal)
-       we trust the first search result — best-effort.
-
-    Returns None if no candidate verifies, in which case callers should
-    show a placeholder rather than a possibly-wrong thumbnail.
-    """
-    if not title:
-        return None
-
-    query = f"{title} {expected_channel}".strip() if expected_channel else title
-    url = "https://www.youtube.com/results"
-    headers = {
-        "User-Agent": USER_AGENT,
-        "Accept-Language": "en-US,en;q=0.9",
-    }
-    params = {"search_query": query}
-
-    own_client = client is None
-    if own_client:
-        client = httpx.AsyncClient(
-            timeout=FETCH_TIMEOUT_S,
-            follow_redirects=True,
-            max_redirects=3,
-        )
-    try:
-        try:
-            resp = await client.get(
-                url, headers=headers, params=params, timeout=FETCH_TIMEOUT_S,
-            )
-            resp.raise_for_status()
-        except httpx.HTTPError as e:
-            log.warning("YouTube search failed for %r: %s", title, e)
-            return None
-
-        # Dedupe while preserving order — same video may appear multiple times
-        # (in main results + a "from same channel" rail).
-        candidates = list(dict.fromkeys(_VIDEO_ID_IN_SEARCH.findall(resp.text)))
-        candidates = candidates[:max_candidates]
-        if not candidates:
-            return None
-
-        # No channel signal → trust the first result, no verification possible.
-        if not expected_channel:
-            return candidates[0]
-
-        # Verify by fetching each candidate's watch page until one matches.
-        for vid in candidates:
-            try:
-                md = await fetch_metadata(vid, client=client)
-            except Exception:
-                log.debug("Verify fetch raised for %s; skipping", vid, exc_info=True)
-                continue
-            if md.scrape_ok and _title_channel_matches(md, title, expected_channel):
-                return vid
-        log.info("No candidate verified for title=%r channel=%r", title, expected_channel)
-        return None
-    finally:
-        if own_client:
-            await client.aclose()
-
-
-def thumbnail_url_for(video_id: str) -> str:
-    return _thumbnail_for(video_id)
-
-
 async def fetch_metadata(
     video_id: str,
     *,
@@ -290,9 +329,22 @@ async def fetch_metadata(
             # nothing on the only path the app actually takes.
             resp = await client.get(url, headers=headers, timeout=FETCH_TIMEOUT_S)
             resp.raise_for_status()
-            return parse_metadata(video_id, resp.text)
+            md = parse_metadata(video_id, resp.text)
+            if not md.scrape_ok:
+                # The page came back but the parse fell back — the bot wall,
+                # a layout change, an age gate. Search still carries the full
+                # card including the duration; oEmbed at least names it.
+                rescued = (await _search_rescue(video_id, client)
+                           or await _oembed_rescue(video_id, client))
+                if rescued is not None:
+                    return rescued
+            return md
         except httpx.HTTPError as e:
             log.warning("metadata fetch failed for %s: %s", video_id, e)
+            rescued = (await _search_rescue(video_id, client)
+                       or await _oembed_rescue(video_id, client))
+            if rescued is not None:
+                return rescued
             return _fallback(video_id)
     finally:
         if own_client:
