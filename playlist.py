@@ -461,6 +461,15 @@ class QueueController:
         # that silently produced nothing looks identical to one still in
         # progress until this flips. See LAUNCH_CONFIRM_TIMEOUT.
         self._playback_confirmed = False
+        # The video_id we ADVANCED AWAY FROM to reach the current item, or
+        # None if the current item was started by an add rather than a
+        # hand-off. Set only in `_advance`, cleared in `_begin_locked`, so it
+        # names the predecessor for exactly as long as the successor is
+        # current. Read by `_verify_external_switch` to tell "the device never
+        # followed our hand-off" (Lounge still reporting the predecessor, and
+        # the successor never seen playing) from a genuine external switch —
+        # the former must NOT cede, or the queue strands. See the cede guard.
+        self._handed_off_from_vid: Optional[str] = None
         # Consecutive launches that never started. See LAUNCH_FAILURE_LIMIT.
         self._consecutive_launch_failures = 0
         self._launch_check_task: Optional[asyncio.Task] = None
@@ -1355,6 +1364,68 @@ class QueueController:
                 # Lounge moved on — either back to our video, or somewhere
                 # else (which will retrigger the now_playing handler).
                 return
+            # Is this a hand-off the device never FOLLOWED, rather than a
+            # person choosing something else? When `_advance` starts the next
+            # item it sends one deep link and returns; on an NVIDIA Shield (and
+            # any device whose Lounge registration flaps — issues #3881, #5951)
+            # that link is sometimes dropped, leaving SmartTube parked on the
+            # PREVIOUS video's end screen. A rebind then re-reports that
+            # predecessor, and this check runs with `observed_vid` equal to the
+            # video we just handed off from and the successor never seen
+            # playing. Ceding here clears the successor and strands the rest of
+            # the queue — reported as "with 4+ videos it won't queue the next
+            # one" (four-plus items just means enough hand-offs for one to be
+            # dropped). This is NOT invariant 4's stale-cache-during-our-launch
+            # case: that is covered by the in-flight stand-off above and needs
+            # `has_pending_sends()`, whereas the drop is only visible once our
+            # send has completed. Re-send the launch instead of ceding — a
+            # signal the device never received is not one invariant 1 forbids,
+            # the same reasoning as `_resend_if_the_wake_intent_never_landed`.
+            unfollowed_handoff = (
+                not self._playback_confirmed
+                and self._handed_off_from_vid is not None
+                and observed_vid == self._handed_off_from_vid
+            )
+            relaunch_item = None
+            give_up = False
+            stalled_title = None
+            if unfollowed_handoff:
+                self._consecutive_launch_failures += 1
+                give_up = (self._consecutive_launch_failures
+                           >= LAUNCH_FAILURE_LIMIT)
+                relaunch_item = cur
+                stalled_title = cur.title
+        if unfollowed_handoff:
+            if give_up:
+                # Bounded by the same counter and limit as the launch rescue:
+                # a device that keeps dropping the hand-off is not going to
+                # start this item. Stop re-sending, clear `current` so nothing
+                # pretends to play, and KEEP the queue so Play retries it.
+                log.error(
+                    "Hand-off to %s was never followed by the device %d times "
+                    "in a row (Lounge still reports the previous video %s) — "
+                    "giving up rather than re-sending, keeping %d queued "
+                    "item(s)",
+                    relaunch_item.video_id, self._consecutive_launch_failures,
+                    observed_vid, len(self.state.queue),
+                )
+                # Set BEFORE the call: _end_current snapshots inside its own
+                # lock, so a notice written afterwards misses the published
+                # snapshot. Same pattern as the launch rescue.
+                self.state.launch_notice = {"kind": "stalled",
+                                            "title": stalled_title}
+                await self._end_current(reason="handoff_never_followed")
+            else:
+                log.warning(
+                    "Lounge reports %s, the video we handed off FROM, while %s "
+                    "has never been seen playing — the device did not follow "
+                    "our hand-off. Re-sending its launch (attempt %d) rather "
+                    "than ceding, which would strand the queue",
+                    observed_vid, relaunch_item.video_id,
+                    self._consecutive_launch_failures,
+                )
+                self._send_to_tv(relaunch_item)
+            return
         # Confirmed: user is playing a different video externally. Cede
         # — cancel our duration timer for the old video, clear current.
         # Queue is preserved: if the user-picked video ends, _advance
@@ -1659,6 +1730,10 @@ class QueueController:
         self._playhead_origin_at = None
         # And this item has not been seen playing yet, whatever the last one did.
         self._playback_confirmed = False
+        # Cleared here and set again by `_advance` immediately after, so an
+        # add-started item never inherits a stale predecessor and only a real
+        # hand-off names one. See the field's definition and the cede guard.
+        self._handed_off_from_vid = None
         # Nor does the previous one's Lounge frame, which is still sitting in
         # state.lounge parked at ITS end — that is why we advanced. The
         # video_id guard normally separates them, but two queue entries can
@@ -2200,6 +2275,13 @@ class QueueController:
                 self.state.paused = False
                 self.state.pause_source = None
                 self._begin_locked(next_item)
+                # Record which video we handed off FROM, AFTER _begin_locked
+                # (which clears it). The device may not follow the hand-off —
+                # it can sit on the previous video's end screen while our deep
+                # link is dropped — and then a rebind re-reports that
+                # predecessor, which the cede would otherwise read as the user
+                # choosing it and clear the successor, stranding the queue.
+                self._handed_off_from_vid = leaving
                 event = "item_started"
             else:
                 self._forget_current_locked()
