@@ -94,7 +94,7 @@ You don't need to go looking for any folder in it. The next step works from wher
 **4. Paste this one line and press Enter.**
 
 ```
-docker run -d --name smarttube-playlist --restart unless-stopped -p 38420:8000 -v smarttube-data:/data ghcr.io/alice-sabrina-ivy/smarttube-playlist:latest
+docker run -d --name smarttube-playlist --restart unless-stopped -p 38420:8000 -v smarttube-data:/data ghcr.io/alice-sabrina-ivy/smarttube-playlist:beta
 ```
 
 It downloads for a minute or two, then prints a long line of letters and numbers. That's the container's ID, and it means it worked. Check the **Containers** tab — `smarttube-playlist` should be there, green, marked *Running*.
@@ -109,7 +109,7 @@ That's the whole install.
 - `--restart unless-stopped` — bring it back after a reboot
 - `-p 38420:8000` — reach it at port 38420 on this computer
 - `-v smarttube-data:/data` — keep the TV pairing in storage Docker manages, so it survives updates. Deliberately not a folder on your PC: Windows paths are the single most common thing to get wrong here.
-- the last part is the app itself, the `:latest` build
+- the last part is the app itself, the `:beta` build
 
 </details>
 
@@ -243,9 +243,9 @@ storage — so it survives all of this.
 **Option A** — in the Docker Desktop terminal:
 
 ```
-docker pull ghcr.io/alice-sabrina-ivy/smarttube-playlist:latest
+docker pull ghcr.io/alice-sabrina-ivy/smarttube-playlist:beta
 docker rm -f smarttube-playlist
-docker run -d --name smarttube-playlist --restart unless-stopped -p 38420:8000 -v smarttube-data:/data ghcr.io/alice-sabrina-ivy/smarttube-playlist:latest
+docker run -d --name smarttube-playlist --restart unless-stopped -p 38420:8000 -v smarttube-data:/data ghcr.io/alice-sabrina-ivy/smarttube-playlist:beta
 ```
 
 - **Updating?** That's all three lines. The `docker pull` is the part that

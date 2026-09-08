@@ -8,7 +8,7 @@ You don't need ADB or a terminal on the TV. The beta build collects most of the 
 
 ## Get the beta build
 
-**Starting from scratch?** Follow [Option A in the README](../README.md#option-a--docker-desktop-windows-or-macos), changing the very end of the pasted command from `:latest` to `:beta`. That one word is the entire difference — the beta image is the same app with the diagnostics turned on.
+**Starting from scratch?** Follow [Option A in the README](../README.md#option-a--docker-desktop-windows-or-macos) — on the beta branch its command already ends in `:beta`. That one word is the entire difference from stable — the beta image is the same app with the diagnostics turned on.
 
 **Already running the stable version?** Two ways, depending on how you installed it:
 
@@ -17,7 +17,7 @@ You don't need ADB or a terminal on the TV. The beta build collects most of the 
 
 Either way your TV pairing is kept.
 
-**How to tell it worked:** the bottom of the page gains a **🔬 Run device self-test** button. That button is the only visible difference, so if it isn't there, the switch didn't take — check the two things above rather than assuming the feature is broken. (Don't go by the version number: stable and beta both report `1.01`.)
+**How to tell it worked:** the bottom of the page gains a **🔬 Run device self-test** button. That button is the only visible difference, so if it isn't there, the switch didn't take — check the two things above rather than assuming the feature is broken. (Don't go by the version number — it won't reliably tell the beta build from stable; go by the button.)
 
 ## The easy way: one button
 
