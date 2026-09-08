@@ -5,6 +5,24 @@ here matches a version on the [releases page](https://github.com/Alice-Sabrina-I
 
 ---
 
+## v1.05
+
+A fix for a queue that could stop advancing on some devices — the NVIDIA
+Shield most of all.
+
+**With several videos queued, the next one sometimes never started.** When one
+video ended and the app started the next, some devices quietly dropped that
+start and stayed on the finished video's screen. The app then mistook the
+video still showing for one you had picked yourself on the TV remote, cleared
+what it was trying to play, and left the rest of the queue waiting with nothing
+running. It now recognises a hand-off the device didn't follow and sends it
+again, so the next video starts; if a device keeps refusing, the app stops
+after a few tries and keeps your queue, so pressing Play picks it back up. This
+turned up on a Shield with four or more videos queued — the number only
+mattered because more videos mean more hand-offs for one to be dropped.
+
+---
+
 ## v1.04
 
 A reliability release. Every change below is something that used to go
