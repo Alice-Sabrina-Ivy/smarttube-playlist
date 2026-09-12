@@ -21,6 +21,28 @@ after a few tries and keeps your queue, so pressing Play picks it back up. This
 turned up on a Shield with four or more videos queued — the number only
 mattered because more videos mean more hand-offs for one to be dropped.
 
+**A video you queued could vanish when something else started playing on the TV.**
+If a video began on the TV that the app hadn't queued — you picked it yourself, or
+SmartTube brought one back on its own — the app correctly stepped aside so its timer
+wouldn't cut across what you were watching. But stepping aside also threw away the
+video it had been about to play, with no message, and the rest of the queue then sat
+there doing nothing. The video is now put back at the top of Up next instead of being
+lost. The app still steps aside, and it still won't interrupt what you're watching —
+it just doesn't cost you a video any more. It doesn't restart by itself; press Play
+when you're ready.
+
+**"Press Play to try again" now actually retries the video it's talking about.**
+When several videos in a row failed to start, the message that appeared said the queue
+was still there — but Play skipped past the video that had stalled, and if that was the
+last one, nothing happened at all.
+
+**A bad patch no longer counts against you for the rest of the session.** The app keeps
+a count of videos that failed to start, and gave up once it reached a few in a row — but
+that count was only ever cleared by a video actually playing, which on a device that
+isn't reporting playback never happens. So a couple of failures early on could make it
+give up on something much later at the first sign of trouble. Adding a video or pressing
+Play now clears it.
+
 ---
 
 ## v1.04

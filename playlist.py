@@ -595,6 +595,15 @@ class QueueController:
             # one: if this video fails as well the rescue will say so again,
             # and leaving the old message up puts it over a healthy card.
             self.state.launch_notice = None
+            # And the strike budget with it. `_consecutive_launch_failures` is
+            # otherwise reset in exactly ONE place — a Lounge frame naming our
+            # own current item as playing — which on a device whose Lounge
+            # registration is deaf never arrives. That made it a
+            # container-lifetime accumulator: two stalled hand-offs an hour ago
+            # could give up on this item at its FIRST failure, with no re-send.
+            # Somebody pasting a URL is positive evidence that the earlier run
+            # of failures is not the situation being judged any more.
+            self._consecutive_launch_failures = 0
             if adopted is not None:
                 lng = self.state.lounge or {}
                 position = float(lng.get("current_time") or 0.0)
@@ -745,6 +754,13 @@ class QueueController:
                 # idempotence check, so a second impatient press cannot leave
                 # the message standing.
                 self.state.launch_notice = None
+                # And the strike budget goes with it, for the same reason: Play
+                # is a deliberate retry. Also ahead of the idempotence check —
+                # the budget describes the DEVICE refusing to start anything,
+                # and someone pressing Play is fresh evidence about that
+                # whether or not this press has something to resume. See add()
+                # for why the budget has to be cleared by hand at all.
+                self._consecutive_launch_failures = 0
                 if not self.state.paused and self.state.current is not None:
                     return
                 # Clear it and TELL THE PAGE first, for the in-place case —
@@ -1414,7 +1430,14 @@ class QueueController:
                 # snapshot. Same pattern as the launch rescue.
                 self.state.launch_notice = {"kind": "stalled",
                                             "title": stalled_title}
-                await self._end_current(reason="handoff_never_followed")
+                # Keep the stalled item, at the head. The notice this sets
+                # renders as "Several videos in a row didn't start. The queue
+                # is still here — press Play to try again", and Play starts
+                # `queue[0]` — so without the requeue the banner sent people to
+                # a button that skipped PAST the video that failed, or with
+                # nothing behind it did nothing at all.
+                await self._end_current(reason="handoff_never_followed",
+                                        requeue_unplayed=True)
             else:
                 log.warning(
                     "Lounge reports %s, the video we handed off FROM, while %s "
@@ -1428,8 +1451,14 @@ class QueueController:
             return
         # Confirmed: user is playing a different video externally. Cede
         # — cancel our duration timer for the old video, clear current.
-        # Queue is preserved: if the user-picked video ends, _advance
-        # will pick up our queue's next item normally.
+        #
+        # The queue is preserved, but NOT in the way this comment used to
+        # claim: "_advance will pick up our queue's next item when the
+        # user-picked video ends" is false and always was. `_on_lounge_finished`
+        # returns when `expected_video is None`, `_maybe_advance_at_end_of_video`
+        # returns when `cur is None`, and the duration timer was just cancelled
+        # — so nothing re-advances on its own. The queue waits for a human to
+        # press Play or Skip, or to add something.
         log.info(
             "External-switch confirmed: Lounge=%s, ours=%s — clearing state.current",
             observed_vid, expected_our_vid,
@@ -1439,6 +1468,28 @@ class QueueController:
             # Re-check under lock — state could've changed in the gap.
             if self.state.current is None or self.state.current.video_id != expected_our_vid:
                 return
+            # Ceding is a decision to stop owning the SCREEN. It is not a
+            # decision to discard a QUEUE ENTRY, and until this line it was
+            # both: `_advance` has already popped the item and
+            # `_forget_current_locked` never touches `state.queue`, so the video
+            # a guest queued was destroyed outright, silently — no
+            # `launch_notice` is written on this path at all — with the rest of
+            # the queue stranded behind it.
+            #
+            # Reported on an NVIDIA Shield as "pulled a random video after my
+            # 3rd queued video fell off". The foreign video was genuinely on the
+            # TV, so ceding was RIGHT — our duration timer must not launch over
+            # a video somebody is watching. Only the loss was wrong. Putting the
+            # item back is the fix that holds however the foreign video got
+            # there, which matters because we cannot tell: a dormant cloud
+            # cache (invariant 4) and a live paused player produce an identical
+            # frame.
+            #
+            # Scoped to an item we never saw play — a video the viewer genuinely
+            # watched is not owed a replay from zero. Read BEFORE
+            # `_forget_current_locked`, which clears the flag at 1720.
+            if not self._playback_confirmed:
+                self.state.queue.insert(0, self.state.current)
             self._forget_current_locked()
             self.state.current_started_at = None
             # Also clear paused. Without this, a leftover paused=True
@@ -2316,11 +2367,22 @@ class QueueController:
         if next_item:
             self._send_to_tv(next_item)
 
-    async def _end_current(self, reason: str) -> None:
-        """Clear `current` without advancing. Used for paused-timer-fire and kill-switch."""
+    async def _end_current(self, reason: str, *,
+                           requeue_unplayed: bool = False) -> None:
+        """Clear `current` without advancing. Used for paused-timer-fire and kill-switch.
+
+        `requeue_unplayed` puts an item we never saw play back at the head of
+        the queue rather than destroying it. Opt-in per call site, NOT the
+        default, because the launch rescue's sibling path deliberately drops a
+        video that will not start — requeueing there would retry the same dud
+        for ever. Set it where the page already promises the queue survives.
+        """
         async with self._lock:
             if self.state.current is None:
                 return
+            # Before `_forget_current_locked`, which clears the flag.
+            if requeue_unplayed and not self._playback_confirmed:
+                self.state.queue.insert(0, self.state.current)
             self._forget_current_locked()
             # Same reasoning as _advance's empty-queue branch: a `paused`
             # that outlives the item it described wedges every later add. So
